@@ -1,3 +1,4 @@
+from datetime import datetime
 import os
 import discord
 import discord.app_commands as app_commands
@@ -53,7 +54,7 @@ async def get_vn_month(interaction: discord.Interaction, month: str | None) -> s
     if month is None:
         return discord.utils.utcnow().strftime("%Y-%m")
     try:
-        discord.utils.parse_time(month, "%Y-%m")
+        datetime.strptime(month, "%Y-%m")
         return month
     except ValueError:
         await interaction.followup.send(
