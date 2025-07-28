@@ -1,0 +1,15 @@
+services:
+  vn-club-bot:
+    build: .
+    image: discord-vn-club-bot
+    container_name: discord-vn-club-bot-container
+    environment:
+      - TOKEN
+      - COMMAND_PREFIX
+      - PATH_TO_DB
+      - AUTHORIZED_USERS
+      - DB_BACKUP_CHANNEL
+      - VN_MANAGER_USER_IDS
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

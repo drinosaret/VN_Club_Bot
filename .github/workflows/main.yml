@@ -1,0 +1,46 @@
+name: Deploy Discord Bot
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  TOKEN: ${{ secrets.TOKEN }}
+  COMMAND_PREFIX: ${{ vars.COMMAND_PREFIX }}
+  PATH_TO_DB: ${{ vars.PATH_TO_DB }}
+  AUTHORIZED_USERS: ${{ vars.AUTHORIZED_USERS }}
+  DB_BACKUP_CHANNEL: ${{ vars.DB_BACKUP_CHANNEL }}
+  VN_MANAGER_USER_IDS: ${{ vars.VN_MANAGER_USER_IDS }}
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Stop and remove existing container
+        run: |
+          docker compose down || true
+
+      - name: Create persistent data directory and symlink
+        run: |
+          sudo mkdir -p /usr/src/vn_club_bot/data
+          sudo chown $USER:$USER /usr/src/vn_club_bot/data
+          rm -rf ./data
+          ln -s /usr/src/vn_club_bot/data ./data
+
+      - name: Build Docker image
+        run: |
+          docker build -t discord-vn_club_bot .
+
+      - name: Run Docker container
+        run: |
+          docker compose up -d
+
+      - name: Clean up unused Docker images
+        run: |
+          docker image prune -f
