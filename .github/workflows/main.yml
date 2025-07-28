@@ -35,7 +35,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t discord-vn_club_bot .
+          docker build -t discord-vn-club-bot .
 
       - name: Run Docker container
         run: |
