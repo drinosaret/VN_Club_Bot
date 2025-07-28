@@ -44,8 +44,7 @@ async def fill_vn_database(bot: VNClubBot):
 
 
 async def vns_autocomplete(interaction: discord.Interaction, current: str):
-    if not CURRENT_VN_DATABASE:
-        await fill_vn_database(interaction.client)
+    await fill_vn_database(interaction.client)
     if not current:
         return [
             discord.app_commands.Choice(name=name, value=value)
