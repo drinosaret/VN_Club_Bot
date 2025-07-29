@@ -13,6 +13,7 @@ env:
   AUTHORIZED_USERS: ${{ vars.AUTHORIZED_USERS }}
   DB_BACKUP_CHANNEL: ${{ vars.DB_BACKUP_CHANNEL }}
   VN_MANAGER_USER_IDS: ${{ vars.VN_MANAGER_USER_IDS }}
+  VN_MANAGER_ROLE_IDS: ${{ vars.VN_MANAGER_ROLE_IDS }}
 
 jobs:
   deploy:
@@ -26,21 +27,21 @@ jobs:
         run: |
           docker compose down || true
 
-      - name: Create persistent data directory and symlink
-        run: |
-          sudo mkdir -p /usr/src/vn_club_bot/data
-          sudo chown $USER:$USER /usr/src/vn_club_bot/data
-          rm -rf ./data
-          ln -s /usr/src/vn_club_bot/data ./data
+      # - name: Create persistent data directory and symlink
+      #   run: |
+      #     sudo mkdir -p /usr/src/vn_club_bot/data
+      #     sudo chown $USER:$USER /usr/src/vn_club_bot/data
+      #     rm -rf ./data
+      #     ln -s /usr/src/vn_club_bot/data ./data
 
-      - name: Build Docker image
-        run: |
-          docker build -t discord-vn-club-bot .
+      # - name: Build Docker image
+      #   run: |
+      #     docker build -t discord-vn-club-bot .
 
-      - name: Run Docker container
-        run: |
-          docker compose up -d
+      # - name: Run Docker container
+      #   run: |
+      #     docker compose up -d
 
-      - name: Clean up unused Docker images
-        run: |
-          docker image prune -f
+      # - name: Clean up unused Docker images
+      #   run: |
+      #     docker image prune -f

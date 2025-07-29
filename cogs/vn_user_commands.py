@@ -4,7 +4,7 @@ import logging
 import discord
 from discord.ext import commands
 from discord.ext import tasks
-from cogs.vn_title_management import GET_ALL_VN_QUERY
+from cogs.vn_title_management import GET_ALL_MONTHLY_VN_QUERY
 from lib.bot import VNClubBot
 from .username_fetcher import get_username_db
 
@@ -39,7 +39,7 @@ CURRENT_VN_DATABASE = None
 async def fill_vn_database(bot: VNClubBot):
     global CURRENT_VN_DATABASE
     if CURRENT_VN_DATABASE is None:
-        CURRENT_VN_DATABASE = await bot.GET(GET_ALL_VN_QUERY)
+        CURRENT_VN_DATABASE = await bot.GET(GET_ALL_MONTHLY_VN_QUERY)
     return CURRENT_VN_DATABASE
 
 

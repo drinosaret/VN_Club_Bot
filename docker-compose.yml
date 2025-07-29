@@ -10,6 +10,7 @@ services:
       - AUTHORIZED_USERS
       - DB_BACKUP_CHANNEL
       - VN_MANAGER_USER_IDS
+      - VN_MANAGER_ROLE_IDS
     volumes:
       - ./data:/app/data
     restart: unless-stopped
