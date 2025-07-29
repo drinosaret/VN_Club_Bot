@@ -91,17 +91,10 @@ async def validate_user(interaction: discord.Interaction):
     return True
 
 
-async def vn_exists(bot: VNClubBot, vndb_id: str) -> bool:
-    result = await bot.GET_ONE(GET_A_SINGLE_MONTHLY_VN, (vndb_id,))
-    if result:
-        return True
-    return False
-
-
 async def check_if_already_exists(
     interaction: discord.Interaction, vndb_id: str
 ) -> bool:
-    result = await vn_exists(interaction.client, vndb_id)
+    result = await interaction.client.GET_ONE(GET_A_SINGLE_MONTHLY_VN, (vndb_id,))
     if result:
         await interaction.followup.send(
             f"VN title with ID `{vndb_id}` already exists in the database."
