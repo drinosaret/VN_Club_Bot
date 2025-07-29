@@ -20,7 +20,7 @@ class DatabasePoster(commands.Cog):
     @tasks.loop(hours=24)
     async def post_database(self):
         """Post the database file to the target channel once daily."""
-        await asyncio.sleep(60)
+        await asyncio.sleep(1200)
         try:
             channel = self.bot.get_channel(self.target_channel_id)
             if not channel:

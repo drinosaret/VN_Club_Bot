@@ -158,6 +158,15 @@ class VNUserCommands(commands.Cog):
         rating="Your personal rating for the VN (1-5) 1=Terrible; 5=Masterpiece.",
     )
     @app_commands.autocomplete(vndb_id=vns_autocomplete)
+    @app_commands.choices(
+        rating=[
+            app_commands.Choice(name="1 - Terrible", value=1),
+            app_commands.Choice(name="2 - Bad", value=2),
+            app_commands.Choice(name="3 - Average", value=3),
+            app_commands.Choice(name="4 - Good", value=4),
+            app_commands.Choice(name="5 - Masterpiece", value=5),
+        ]
+    )
     @app_commands.guild_only()
     async def finish_vn(
         self, interaction: discord.Interaction, vndb_id: str, comment: str, rating: int
