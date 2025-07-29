@@ -4,8 +4,9 @@ import logging
 import discord
 from discord.ext import commands
 from discord.ext import tasks
-from cogs.vn_title_management import GET_ALL_MONTHLY_VN_QUERY
+from cogs.vn_title_management import vn_exists, get_single_monthly_vn
 from lib.bot import VNClubBot
+from lib.vndb_api import from_vndb_id, VN_Entry
 from .username_fetcher import get_username_db
 
 _log = logging.getLogger(__name__)
@@ -13,83 +14,36 @@ _log = logging.getLogger(__name__)
 CREATE_READING_LOGS_TABLE = """
 CREATE TABLE IF NOT EXISTS reading_logs (
     user_id INTEGER NOT NULL,
-    vndb_id TEXT NOT NULL,
-    read_month TEXT NOT NULL,
-    read_in_month BOOLEAN DEFAULT FALSE,
+    vndb_id TEXT,
+    reward_reason TEXT,
+    reward_month TEXT NOT NULL,
+    points INTEGER NOT NULL,
     comment TEXT,
-    logged_in_guild INTEGER,
-    PRIMARY KEY (user_id, vndb_id)
+    logged_in_guild INTEGER
 );"""
 
 ADD_READING_LOG_QUERY = """
-INSERT INTO reading_logs (user_id, vndb_id, read_month, read_in_month, comment, logged_in_guild)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO reading_logs (user_id, vndb_id, reward_reason, reward_month, points, comment, logged_in_guild)
+VALUES (?, ?, ?, ?, ?, ?, ?);
 """
 
 GET_ONE_READING_LOG_QUERY = """
 SELECT * FROM reading_logs WHERE user_id = ? AND vndb_id = ?;
 """
 
-GET_ALL_USER_LOGS = """SELECT * FROM reading_logs ORDER BY read_month DESC;
+GET_ALL_USER_LOGS = """SELECT * FROM reading_logs ORDER BY reward_month DESC;
 """
 
-CURRENT_VN_DATABASE = None
+VN_AUTOCOMPLETE_QUERY = """
+SELECT vn.vndb_id, vndb.title_ja FROM vn_titles vn 
+INNER JOIN vndb_cache vndb ON vndb.vndb_id = vn.vndb_id
+"""
 
 
-async def fill_vn_database(bot: VNClubBot):
-    global CURRENT_VN_DATABASE
-    if CURRENT_VN_DATABASE is None:
-        CURRENT_VN_DATABASE = await bot.GET(GET_ALL_MONTHLY_VN_QUERY)
-    return CURRENT_VN_DATABASE
-
-
-async def vns_autocomplete(interaction: discord.Interaction, current: str):
-    await fill_vn_database(interaction.client)
-    if not current:
-        return [
-            discord.app_commands.Choice(name=name, value=value)
-            for (value, name, _, _, _, _) in CURRENT_VN_DATABASE
-        ][:25]
-    else:
-        return [
-            discord.app_commands.Choice(name=name, value=value)
-            for (value, name, _, _, _, _) in CURRENT_VN_DATABASE
-            if current.lower() in name.lower() or current.lower() in value.lower()
-        ][:25]
-
-
-async def verify_vn_exists(interaction: discord.Interaction, vndb_id: str) -> bool:
-    vndb_id = vndb_id.strip()
-    if not CURRENT_VN_DATABASE:
-        await fill_vn_database(interaction.client)
-    for row in CURRENT_VN_DATABASE:
-        if row[0] == vndb_id:
-            return True
-    await interaction.followup.send(
-        f"VN with ID `{vndb_id}` does not exist in the database."
-    )
-    return False
-
-
-async def determine_if_current_vn_month(
-    interaction: discord.Interaction, vndb_id: str
+async def is_current_month(
+    current_month: str, start_month: str, end_month: str
 ) -> bool:
-    current_month = interaction.created_at.strftime("%Y-%m")
-    if not CURRENT_VN_DATABASE:
-        await fill_vn_database(interaction.client)
-    for row in CURRENT_VN_DATABASE:
-        if row[0] == vndb_id and row[2] == current_month:
-            return True
-    return False
-
-
-async def get_vn_name(interaction: discord.Interaction, vndb_id: str) -> str:
-    if not CURRENT_VN_DATABASE:
-        await fill_vn_database(interaction.client)
-    for row in CURRENT_VN_DATABASE:
-        if row[0] == vndb_id:
-            return row[1]
-    return "Unknown VN"
+    return start_month <= current_month <= end_month
 
 
 async def log_already_exists(
@@ -99,22 +53,51 @@ async def log_already_exists(
         GET_ONE_READING_LOG_QUERY, (user_id, vndb_id)
     )
     if result:
-        await interaction.followup.send(
-            f"You have already logged this VN with ID `{vndb_id}`."
-        )
+        await interaction.followup.send("You have already logged reading this VN!")
         return True
     return False
+
+
+async def create_finished_vn_embed(
+    interaction: discord.Interaction, vn_info: VN_Entry, comment: str
+) -> discord.Embed:
+    username = interaction.user.name
+    link = await vn_info.get_vndb_link()
+
+    embed = discord.Embed(
+        title=f"Finished reading **{vn_info.title_ja}**",
+        color=discord.Color.green(),
+    )
+    embed.set_author(name=username, icon_url=interaction.user.display_avatar.url)
+    embed.set_thumbnail(url=vn_info.thumbnail_url)
+    embed.add_field(
+        name="VNDB Link", value=f"[{vn_info.title_ja}]({link})", inline=False
+    )
+    embed.add_field(name="Comment", value=comment, inline=False)
+    return embed
+
+
+async def vns_autocomplete(interaction: discord.Interaction, current: str):
+    current_vns = await interaction.client.GET(VN_AUTOCOMPLETE_QUERY)
+    if not current:
+        return [
+            discord.app_commands.Choice(name=f"{name} ({value})", value=value)
+            for (value, name) in current_vns
+        ][:25]
+    else:
+        return [
+            discord.app_commands.Choice(name=f"{name} ({value})", value=value)
+            for (value, name) in current_vns
+            if current.lower() in name.lower() or current.lower() in value.lower()
+        ][:25]
 
 
 class VNUserCommands(commands.Cog):
     def __init__(self, bot: VNClubBot):
         self.bot = bot
 
-    @commands.Cog.listener()
-    async def on_ready(self):
+    async def cog_load(self):
         await self.bot.RUN(CREATE_READING_LOGS_TABLE)
-        if not self.task_refresh_vn_database.is_running():
-            self.task_refresh_vn_database.start()
 
     @app_commands.command(name="finish_vn", description="Mark a VN as finished.")
     @app_commands.describe(
@@ -127,49 +110,49 @@ class VNUserCommands(commands.Cog):
         self, interaction: discord.Interaction, vndb_id: str, comment: str
     ):
         await interaction.response.defer()
-        await fill_vn_database(self.bot)
-        if not await verify_vn_exists(interaction, vndb_id):
+
+        result = await get_single_monthly_vn(interaction.client, vndb_id)
+        if not result:
+            await interaction.followup.send(
+                f"VN with ID `{vndb_id}` does not exist in the database."
+            )
             return
 
-        user_id = interaction.user.id
-        is_current_month = await determine_if_current_vn_month(interaction, vndb_id)
+        vndb_id, start_month, end_month, is_monthly_points = result
+        vn_info: VN_Entry = await from_vndb_id(self.bot, vndb_id)
 
-        if await log_already_exists(interaction, user_id, vndb_id):
+        current_month = discord.utils.utcnow().strftime("%Y-%m")
+        read_in_monthly = await is_current_month(current_month, start_month, end_month)
+
+        if await log_already_exists(interaction, interaction.user.id, vndb_id):
             return
 
-        current_month = interaction.created_at.strftime("%Y-%m")
+        if read_in_monthly:
+            reward_points = is_monthly_points
+            reward_reason = "As Monthly VN"
+        else:
+            reward_points = await vn_info.get_points_not_monthly()
+            reward_reason = "As Non-Monthly VN"
 
-        await self.bot.RUN(
+        await interaction.client.RUN(
             ADD_READING_LOG_QUERY,
             (
-                user_id,
+                interaction.user.id,
                 vndb_id,
+                reward_reason,
                 current_month,
-                is_current_month,
+                reward_points,
                 comment,
                 interaction.guild.id,
             ),
         )
 
-        _log.info(
-            f"User {interaction.user.name} marked VN with ID {vndb_id} as finished."
-        )
-
-        vn_name = await get_vn_name(interaction, vndb_id)
-
-        if is_current_month:
-            await interaction.followup.send(
-                f"You finished this months VN giving you 3 points: {vn_name} - {comment}"
-            )
-        else:
-            await interaction.followup.send(
-                f"You finished a VN giving you 1 point: {vn_name} - {comment}"
-            )
+        embed = await create_finished_vn_embed(interaction, vn_info, comment)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="vn_leaderboard", description="Print the leaderboard.")
     async def vn_leaderboard(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        await fill_vn_database(self.bot)
 
         results = await self.bot.GET(GET_ALL_USER_LOGS)
 
@@ -179,9 +162,16 @@ class VNUserCommands(commands.Cog):
 
         leaderboard = {}
         for row in results:
-            user_id, vndb_id, read_month, read_in_month, comment, logged_in_guild = row
+            (
+                user_id,
+                vndb_id,
+                reward_reason,
+                reward_month,
+                points,
+                comment,
+                logged_in_guild,
+            ) = row
             username = await get_username_db(self.bot, user_id)
-            points = 3 if read_in_month else 1
             if username not in leaderboard:
                 leaderboard[username] = 0
             leaderboard[username] += points
@@ -199,11 +189,6 @@ class VNUserCommands(commands.Cog):
         embed.description = "\n".join(description_strings)
 
         await interaction.followup.send(embed=embed)
-
-    @tasks.loop(minutes=1)
-    async def task_refresh_vn_database(self):
-        await asyncio.sleep(30)
-        await fill_vn_database(self.bot)
 
 
 async def setup(bot: VNClubBot):

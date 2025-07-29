@@ -26,7 +26,7 @@ VALUES (?, ?, ?, ?);
 """
 
 GET_A_SINGLE_MONTHLY_VN = """
-SELECT * FROM vn_titles WHERE vndb_id = ?;
+SELECT vndb_id, start_month, end_month, is_monthly_points FROM vn_titles WHERE vndb_id = ?;
 """
 
 GET_ALL_MONTHLY_VN_QUERY = """
@@ -57,6 +57,13 @@ def user_is_allowed(user_id: int, role_ids: list[int]) -> bool:
     return is_manager
 
 
+async def get_single_monthly_vn(bot: VNClubBot, vndb_id: str):
+    result = await bot.GET_ONE(GET_A_SINGLE_MONTHLY_VN, (vndb_id,))
+    if result:
+        return result
+    return None
+
+
 async def get_vn_month(interaction: discord.Interaction, month: str | None) -> str:
     if month is None:
         return discord.utils.utcnow().strftime("%Y-%m")
@@ -84,10 +91,17 @@ async def validate_user(interaction: discord.Interaction):
     return True
 
 
+async def vn_exists(bot: VNClubBot, vndb_id: str) -> bool:
+    result = await bot.GET_ONE(GET_A_SINGLE_MONTHLY_VN, (vndb_id,))
+    if result:
+        return True
+    return False
+
+
 async def check_if_already_exists(
     interaction: discord.Interaction, vndb_id: str
 ) -> bool:
-    result = await interaction.client.GET_ONE(GET_A_SINGLE_MONTHLY_VN, (vndb_id,))
+    result = await vn_exists(interaction.client, vndb_id)
     if result:
         await interaction.followup.send(
             f"VN title with ID `{vndb_id}` already exists in the database."
@@ -316,7 +330,7 @@ class VNTitleManagement(commands.Cog):
 
             link = await vn_info.get_vndb_link()
 
-            description_string = f"**{start_month} TO {end_month}**: [{vn_info.title_ja}]({link}) (ID: {vndb_id})"
+            description_string = f"**{start_month} TO {end_month}**: [{vn_info.title_ja}]({link}) (ID: {vndb_id}) (M: {is_monthly_points}点 | NM: {await vn_info.get_points_not_monthly()}点)"
 
             description_strings.append(description_string)
 
