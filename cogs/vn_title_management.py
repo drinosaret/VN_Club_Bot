@@ -50,13 +50,6 @@ ALLOWED_ROLE_IDS = [
 ]
 
 
-def user_is_allowed(user_id: int, role_ids: list[int]) -> bool:
-    if user_id in ALLOWED_USER_IDS:
-        return True
-    is_manager = any(role_id in ALLOWED_ROLE_IDS for role_id in role_ids)
-    return is_manager
-
-
 async def get_single_monthly_vn(bot: VNClubBot, vndb_id: str):
     result = await bot.GET_ONE(GET_A_SINGLE_MONTHLY_VN, (vndb_id,))
     if result:
@@ -79,6 +72,13 @@ async def get_vn_month(interaction: discord.Interaction, month: str | None) -> s
         await interaction.followup.send(
             "Invalid month format. Please use YYYY-MM format.",
         )
+
+
+def user_is_allowed(user_id: int, role_ids: list[int]) -> bool:
+    if user_id in ALLOWED_USER_IDS:
+        return True
+    is_manager = any(role_id in ALLOWED_ROLE_IDS for role_id in role_ids)
+    return is_manager
 
 
 async def validate_user(interaction: discord.Interaction):
