@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS reading_logs (
     log_id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     vndb_id TEXT,
+    user_rating INTEGER,
     reward_reason TEXT NOT NULL,
     reward_month TEXT NOT NULL,
     points INTEGER NOT NULL,
@@ -22,8 +23,8 @@ CREATE TABLE IF NOT EXISTS reading_logs (
 );"""
 
 ADD_READING_LOG_QUERY = """
-INSERT INTO reading_logs (user_id, vndb_id, reward_reason, reward_month, points, comment, logged_in_guild)
-VALUES (?, ?, ?, ?, ?, ?, ?);
+INSERT INTO reading_logs (user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 GET_ONE_VNDB_READING_LOG_QUERY = """
@@ -42,7 +43,7 @@ GET_ALL_USER_LOGS = """SELECT user_id, vndb_id, reward_reason, reward_month, poi
 """
 
 GET_ONE_USER_LOGS = """
-SELECT user_id, vndb_id, reward_reason, reward_month, points, comment, logged_in_guild FROM reading_logs WHERE user_id = ? ORDER BY reward_month DESC;
+SELECT user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild FROM reading_logs WHERE user_id = ? ORDER BY reward_month DESC;
 """
 
 REWARD_USER_POINTS = """INSERT INTO reading_logs (user_id, reward_reason, reward_month, points, logged_in_guild)
@@ -84,6 +85,7 @@ async def create_finished_vn_embed(
     comment: str,
     current_total: int,
     new_total: int,
+    rating: int,
 ) -> discord.Embed:
     username = interaction.user.name
     link = await vn_info.get_vndb_link()
@@ -101,6 +103,7 @@ async def create_finished_vn_embed(
     embed.add_field(
         name="Points", value=f"**{current_total}** ➔ **{new_total}**", inline=False
     )
+    embed.add_field(name="Rating", value=f"**{rating}/5**", inline=False)
     return embed
 
 
@@ -152,13 +155,20 @@ class VNUserCommands(commands.Cog):
     @app_commands.describe(
         vndb_id="The VNDB ID of the title you finished.",
         comment="Short comment about your experience with the VN.",
+        rating="Your personal rating for the VN (1-5) 1=Terrible; 5=Masterpiece.",
     )
     @app_commands.autocomplete(vndb_id=vns_autocomplete)
     @app_commands.guild_only()
     async def finish_vn(
-        self, interaction: discord.Interaction, vndb_id: str, comment: str
+        self, interaction: discord.Interaction, vndb_id: str, comment: str, rating: int
     ):
         await interaction.response.defer()
+
+        if not rating or rating < 1 or rating > 5:
+            await interaction.followup.send(
+                "Please provide a valid rating between 1 and 5."
+            )
+            return
 
         current_month = discord.utils.utcnow().strftime("%Y-%m")
 
@@ -199,6 +209,7 @@ class VNUserCommands(commands.Cog):
             (
                 interaction.user.id,
                 vndb_id,
+                rating,
                 reward_reason,
                 current_month,
                 reward_points,
@@ -210,7 +221,12 @@ class VNUserCommands(commands.Cog):
         new_total_points = current_total_points + reward_points
 
         embed = await create_finished_vn_embed(
-            interaction, vn_info, comment, current_total_points, new_total_points
+            interaction,
+            vn_info,
+            comment,
+            current_total_points,
+            new_total_points,
+            rating,
         )
         await interaction.followup.send(embed=embed)
 
@@ -278,6 +294,7 @@ class VNUserCommands(commands.Cog):
             (
                 user_id,
                 vndb_id,
+                user_rating,
                 reward_reason,
                 reward_month,
                 points,
@@ -290,7 +307,7 @@ class VNUserCommands(commands.Cog):
                 link = await vn_info.get_vndb_link()
                 description_strings.append(
                     f"**{reward_month}**: [{vn_info.title_ja}]({link}) - {points}点 ({reward_reason})\n"
-                    f"Comment: {comment or 'No comment provided.'}"
+                    f"Comment: {comment or 'No comment provided.'} | Rating: {user_rating or 'No rating provided.'}/5"
                 )
             else:
                 description_strings.append(

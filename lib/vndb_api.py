@@ -150,7 +150,7 @@ class VN_Entry:
 
         image = vn.get("image") or {}
         thumbnail_url = image.get("url", "")
-        thumbnail_is_nsfw = image.get("sexual", 0) > 0
+        thumbnail_is_nsfw = image.get("sexual", 0) > 1
 
         length_minutes = vn.get("length_minutes")
         length_rating = vn.get("length")
