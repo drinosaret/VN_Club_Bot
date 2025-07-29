@@ -283,6 +283,60 @@ class VNUserCommands(commands.Cog):
 
         await interaction.followup.send(embed=embed)
 
+    @app_commands.command(
+        name="vn_server_leaderboard",
+        description="Print the leaderboard for each server.",
+    )
+    async def vn_server_leaderboard(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        results = await self.bot.GET(GET_ALL_USER_LOGS)
+
+        if not results:
+            await interaction.followup.send("No reading logs found.")
+            return
+
+        leaderboard = {}
+        for row in results:
+            (
+                user_id,
+                vndb_id,
+                reward_reason,
+                reward_month,
+                points,
+                comment,
+                logged_in_guild,
+            ) = row
+
+            username = await get_username_db(self.bot, user_id)
+            if logged_in_guild not in leaderboard:
+                leaderboard[logged_in_guild] = {}
+            if username not in leaderboard[logged_in_guild]:
+                leaderboard[logged_in_guild][username] = 0
+            leaderboard[logged_in_guild][username] += points
+
+        embed = discord.Embed(
+            title="📚 Visual Novel Server Leaderboard",
+            color=discord.Color.blue(),
+        )
+
+        description_strings = []
+        for guild_id, users in leaderboard.items():
+            guild = self.bot.get_guild(guild_id)
+            guild_total = sum(users.values())
+            if guild is None:
+                continue
+            description_strings.append(f"**{guild.name}**: Total {guild_total}点")
+            for i, (username, points) in enumerate(
+                sorted(users.items(), key=lambda x: x[1], reverse=True)[:10], start=1
+            ):
+                description_strings.append(f"{i}. **{username}**: {points}点")
+            description_strings.append("\n")
+
+        embed.description = "\n".join(description_strings)
+
+        await interaction.followup.send(embed=embed)
+
     @app_commands.command(name="user_logs", description="View your reading logs.")
     @app_commands.describe(member="The member whose logs you want to view.")
     async def user_logs(
