@@ -39,6 +39,10 @@ GET_USER_TOTAL_POINTS = """
 SELECT SUM(points) FROM reading_logs WHERE user_id = ?;
 """
 
+GET_USER_RATINGS = """
+SELECT user_id, vndb_id, user_rating, comment FROM reading_logs WHERE user_id = ? AND vndb_id = ?;
+"""
+
 GET_ALL_USER_LOGS = """SELECT user_id, vndb_id, reward_reason, reward_month, points, comment, logged_in_guild FROM reading_logs ORDER BY reward_month DESC;
 """
 
@@ -298,6 +302,8 @@ class VNUserCommands(commands.Cog):
             title=f"📚 Reading Logs for {member.name}", color=discord.Color.blue()
         )
 
+        embed.set_author(name=member.name, icon_url=member.display_avatar.url)
+
         description_strings = []
         for row in results:
             (
@@ -400,6 +406,40 @@ class VNUserCommands(commands.Cog):
             f"**Points:** {points}\n"
             f"**Comment:** {comment or 'No comment provided.'}"
         )
+
+    @app_commands.command(name="user_ratings", description="View ratings for a VN.")
+    @app_commands.describe(
+        vndb_id="The VNDB ID of the title you want to view ratings for."
+    )
+    @app_commands.autocomplete(vndb_id=vns_autocomplete)
+    async def user_ratings(self, interaction: discord.Interaction, vndb_id: str):
+        await interaction.response.defer()
+
+        ratings = await self.bot.GET(GET_USER_RATINGS, (interaction.user.id, vndb_id))
+
+        if not ratings:
+            await interaction.followup.send("No ratings found.")
+            return
+
+        vn_info: VN_Entry = await from_vndb_id(self.bot, vndb_id)
+        if not vn_info:
+            await interaction.followup.send("VNDB ID not found or invalid.")
+            return
+
+        embed = discord.Embed(
+            title=f"User Ratings for **{vn_info.title_ja}**", color=discord.Color.blue()
+        )
+
+        description_strings = []
+        for user_id, vndb_id, user_rating, comment in ratings:
+            user_name = await get_username_db(self.bot, user_id)
+            description_strings.append(
+                f"**{user_name}**: {user_rating}/5\n"
+                f"Comment: {comment or 'No comment provided.'}\n"
+            )
+
+        embed.description = "\n".join(description_strings)
+        await interaction.followup.send(embed=embed)
 
 
 async def setup(bot: VNClubBot):
