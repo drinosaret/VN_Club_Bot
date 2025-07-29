@@ -160,18 +160,21 @@ class VNUserCommands(commands.Cog):
     ):
         await interaction.response.defer()
 
-        result = await get_single_monthly_vn(interaction.client, vndb_id)
-        if not result:
-            await interaction.followup.send(
-                f"VN with ID `{vndb_id}` does not exist in the database."
-            )
-            return
-
-        vndb_id, start_month, end_month, is_monthly_points = result
-        vn_info: VN_Entry = await from_vndb_id(self.bot, vndb_id)
-
         current_month = discord.utils.utcnow().strftime("%Y-%m")
-        read_in_monthly = await is_current_month(current_month, start_month, end_month)
+
+        result = await get_single_monthly_vn(interaction.client, vndb_id)
+        if result:
+            _, start_month, end_month, is_monthly_points = result
+            read_in_monthly = await is_current_month(
+                current_month, start_month, end_month
+            )
+        else:
+            read_in_monthly = False
+
+        vn_info: VN_Entry = await from_vndb_id(self.bot, vndb_id)
+        if not vn_info:
+            await interaction.followup.send("VNDB ID not found or invalid.")
+            return
 
         if await log_already_exists(interaction, interaction.user.id, vndb_id):
             return

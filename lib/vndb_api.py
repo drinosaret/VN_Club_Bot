@@ -96,12 +96,15 @@ class VN_Entry:
     async def get_vndb_link(self) -> str:
         return f"https://vndb.org/{self.vndb_id}"
 
-    async def get_normalized_description(self) -> str:
+    async def get_normalized_description(self, max_length=1000) -> str:
         """Get a normalized description for the VN."""
         desc = self.description.strip()
         if not desc:
             return "No description available."
         desc = replace_bbcode(desc)
+
+        if len(desc) > max_length:
+            desc = desc[:max_length].rsplit(" ", 1)[0] + "..."
         return desc
 
     @staticmethod
