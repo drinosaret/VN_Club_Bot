@@ -217,6 +217,12 @@ class VNUserCommands(commands.Cog):
         else:
             current_total_points = current_total_points[0] or 0
 
+        _log.info(
+            f"Adding reading log for user {interaction.user.id} ({interaction.user.name}) - "
+            f"VNDB ID: {vndb_id}, Rating: {rating}, Reward Reason: {reward_reason}, "
+            f"Reward Month: {current_month}, Points: {reward_points}, Comment: {comment}"
+        )
+
         await self.bot.RUN(
             ADD_READING_LOG_QUERY,
             (
@@ -451,6 +457,11 @@ class VNUserCommands(commands.Cog):
         ) = result
 
         # Delete the log
+        _log.info(
+            f"Deleting log {log_id} for user {member.id} ({member.name}) - "
+            f"VNDB ID: {vndb_id}, Reward Reason: {reward_reason}, "
+            f"Reward Month: {reward_month}, Points: {points}, Comment: {comment}"
+        )
         await self.bot.RUN("DELETE FROM reading_logs WHERE log_id = ?", (log_id,))
         await interaction.followup.send(
             f"Deleted the following log for {member.mention}:\n"

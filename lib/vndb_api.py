@@ -85,9 +85,8 @@ class VN_Entry:
 
     async def get_points_not_monthly(self) -> int:
         if self.length_minutes:
-            points = self.length_minutes // 600
-            if points < 1:
-                points = 1
+            reading_hours = round(self.length_minutes / 600) * 10
+            points = (reading_hours // 10) + 1
             return points
         elif self.length_rating:
             return self.length_rating
