@@ -89,7 +89,7 @@ class VN_Entry:
             points = (reading_hours // 10) + 1
             return points
         elif self.length_rating:
-            return self.length_rating
+            return int(self.length_rating)
         return 1
 
     async def get_vndb_link(self) -> str:
