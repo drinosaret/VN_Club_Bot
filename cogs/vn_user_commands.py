@@ -99,7 +99,8 @@ async def create_finished_vn_embed(
         color=discord.Color.green(),
     )
     embed.set_author(name=username, icon_url=interaction.user.display_avatar.url)
-    embed.set_thumbnail(url=vn_info.thumbnail_url)
+    if not vn_info.thumbnail_is_nsfw:
+        embed.set_thumbnail(url=vn_info.thumbnail_url)
     embed.add_field(
         name="VNDB Link", value=f"[{vn_info.title_ja}]({link})", inline=False
     )
