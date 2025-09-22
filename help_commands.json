@@ -1,0 +1,60 @@
+{
+  "commands": [
+    {
+      "name": "/finish_vn",
+      "usage": "/finish_vn vndb_id:<VNDB_ID> comment:<your_comment> rating:<1-5>",
+      "description": "Mark a Visual Novel as finished and log your completion. This will award you points based on whether it's a current monthly VN or not.",
+      "parameters": "• `vndb_id`: The VNDB ID of the VN (autocomplete available)\n• `comment`: Your review/thoughts (max 1000 characters)\n• `rating`: Your rating from 1-5 (1=Terrible, 5=Masterpiece)",
+      "example": "/finish_vn vndb_id:v11 comment:Amazing story! rating:5"
+    },
+    {
+      "name": "/vn_leaderboard",
+      "usage": "/vn_leaderboard [month:<YYYY-MM>] [server:<server_name>]",
+      "description": "Display the leaderboard showing users ranked by their total points earned from reading Visual Novels. Optionally filter by specific month and/or server.",
+      "parameters": "• `month`: Optional - Filter by specific month (e.g., '2025-09')\n• `server`: Optional - Filter by specific server (autocomplete available)",
+      "example": "/vn_leaderboard month:2025-09"
+    },
+    {
+      "name": "/vn_server_leaderboard",
+      "usage": "/vn_server_leaderboard",
+      "description": "Display server-specific leaderboards showing the top servers ranked by total points, with the top 5 contributors from each server.",
+      "parameters": "No parameters required.",
+      "example": "/vn_server_leaderboard"
+    },
+    {
+      "name": "/user",
+      "usage": "/user [member:<@user>]",
+      "description": "View comprehensive user statistics including total points, VN completions, monthly entries, most active server, and recent activity chart.",
+      "parameters": "• `member`: Optional - The user whose profile you want to view (defaults to yourself)",
+      "example": "/user member:@JohnDoe"
+    },
+    {
+      "name": "/user_logs",
+      "usage": "/user_logs [member:<@user>]",
+      "description": "View reading logs for yourself or another user. Shows all completed VNs, ratings, comments, and points earned.",
+      "parameters": "• `member`: Optional - The user whose logs you want to view (defaults to yourself)",
+      "example": "/user_logs member:@JohnDoe"
+    },
+    {
+      "name": "/ratings",
+      "usage": "/ratings vndb_id:<VNDB_ID>",
+      "description": "View ratings and comments for a specific VN from all users who have rated it.",
+      "parameters": "• `vndb_id`: The VNDB ID of the VN you want to check (autocomplete available)",
+      "example": "/ratings vndb_id:v11"
+    },
+    {
+      "name": "/list_vns",
+      "usage": "/list_vns",
+      "description": "Display all Visual Novels in the club's database. Current monthly VNs are shown first, followed by others sorted by start date.",
+      "parameters": "No parameters required.",
+      "example": "/list_vns"
+    },
+    {
+      "name": "/get_current_monthly",
+      "usage": "/get_current_monthly",
+      "description": "Show detailed information about the current month's featured Visual Novels, including points, descriptions, and VNDB links.",
+      "parameters": "No parameters required.",
+      "example": "/get_current_monthly"
+    }
+  ]
+}
