@@ -19,6 +19,7 @@ class VNClubBot(commands.Bot):
 
     async def on_ready(self):
         print(f"Logged in as {self.user}")
+        await self.change_presence(activity=discord.Game(name="装甲悪鬼村正"))
 
     async def setup_hook(self):
         self.tree.on_error = self.on_application_command_error
