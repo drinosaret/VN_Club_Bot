@@ -13,4 +13,5 @@ services:
       - VN_MANAGER_ROLE_IDS
     volumes:
       - ./data:/app/data
+      - ./hikaru_bot.log:/app/hikaru_bot.log
     restart: unless-stopped
