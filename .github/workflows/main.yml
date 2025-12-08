@@ -34,6 +34,14 @@ jobs:
           rm -rf ./data
           ln -s /usr/src/vn_club_bot/data ./data
 
+      - name: Create log file if not exists
+        run: |
+          if [ ! -f ./hikaru_bot.log ]; then
+            rm -rf ./hikaru_bot.log
+            touch ./hikaru_bot.log
+            chmod 666 ./hikaru_bot.log
+          fi
+
       - name: Build Docker image
         run: |
           docker build -t discord-vn-club-bot .
