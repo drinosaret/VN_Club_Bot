@@ -21,6 +21,13 @@ class VNClubBot(commands.Bot):
         print(f"Logged in as {self.user}")
         await self.change_presence(activity=discord.Game(name="装甲悪鬼村正"))
 
+        # Auto-sync commands globally
+        try:
+            synced = await self.tree.sync()
+            print(f"Synced {len(synced)} command(s) globally")
+        except Exception as e:
+            _log.error(f"Failed to sync commands: {e}")
+
     async def setup_hook(self):
         self.tree.on_error = self.on_application_command_error
 
@@ -36,6 +43,13 @@ class VNClubBot(commands.Bot):
         async with aiosqlite.connect(self.path_to_db) as db:
             await db.execute(query, params)
             await db.commit()
+
+    async def RUN_RETURNING_ID(self, query: str, params: tuple = ()) -> int:
+        """Execute a query and return the last inserted row id."""
+        async with aiosqlite.connect(self.path_to_db) as db:
+            cursor = await db.execute(query, params)
+            await db.commit()
+            return cursor.lastrowid
 
     async def GET(self, query: str, params: tuple = ()):
         async with aiosqlite.connect(self.path_to_db) as db:
@@ -65,41 +79,36 @@ class VNClubBot(commands.Bot):
         interaction: discord.Interaction,
         error: discord.app_commands.AppCommandError,
     ):
-        if isinstance(error, discord.app_commands.MissingAnyRole):
-            await interaction.response.send_message(
-                "You do not have the permission to use this command.", ephemeral=True
-            )
-            return
+        # Import here to avoid circular imports
+        from lib.utils import BotError
+
+        # Unwrap the original exception if wrapped
+        original = getattr(error, 'original', error)
+
+        # Handle known error types
+        if isinstance(original, BotError):
+            message = original.user_message
+        elif isinstance(error, discord.app_commands.MissingAnyRole):
+            message = "You do not have the permission to use this command."
         elif isinstance(error, discord.app_commands.CommandOnCooldown):
-            await interaction.response.send_message(
-                f"This command is currently on cooldown. You can use this command again after {int(error.retry_after)} seconds.",
-                ephemeral=True,
-            )
-            return
-
-        command = interaction.command
-        if command is not None:
-            if command._has_any_error_handlers():
-                return
-
-            _log.error("Ignoring exception in command %r", command.name, exc_info=error)
+            message = f"This command is currently on cooldown. Try again in {int(error.retry_after)} seconds."
         else:
-            _log.error("Ignoring exception in command tree", exc_info=error)
+            message = "An unexpected error occurred. Please try again later."
+            # Log unexpected errors for debugging
+            command = interaction.command
+            if command is not None:
+                _log.error("Unhandled error in command %r: %s", command.name, error, exc_info=error)
+            else:
+                _log.error("Unhandled error in command tree: %s", error, exc_info=error)
 
-        error_embed = discord.Embed(
-            title="Error",
-            description=f"```{str(error)[:4000]}```",
-            color=discord.Color.red(),
-        )
-
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
-                "An error occurred while processing your command:", embed=error_embed
-            )
-        else:
-            await interaction.followup.send(
-                "An error occurred while processing your command:", embed=error_embed
-            )
+        # Send ephemeral error message
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"❌ {message}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ {message}", ephemeral=True)
+        except Exception as e:
+            _log.error(f"Failed to send error message: {e}")
 
     async def on_error(self, event_method, *args, **kwargs):
         _log.exception("Ignoring exception in %s", event_method)

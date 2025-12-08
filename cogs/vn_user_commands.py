@@ -8,7 +8,7 @@ from lib.bot import VNClubBot
 from lib.vndb_api import from_vndb_id, VN_Entry
 from lib.pagination import BasePaginationView, GenericPaginationView
 from lib.utils import (
-    DatabaseQueries, 
+    DatabaseQueries,
     get_current_month,
     is_month_in_range,
     validate_user_permission,
@@ -21,8 +21,10 @@ from lib.utils import (
     MAX_DISCORD_MESSAGE,
     MAX_EMBED_DESCRIPTION,
     EMBED_DESCRIPTION_BUFFER,
+    DEFAULT_TIMEOUT,
     create_base_embed,
-    add_pagination_footer
+    add_pagination_footer,
+    resolve_vn_from_input
 )
 from lib.embeds import EmbedBuilder
 from lib.autocomplete import vn_autocomplete, user_logs_autocomplete, month_autocomplete, server_autocomplete, RATING_CHOICES
@@ -163,6 +165,67 @@ class VNRatingsView(BasePaginationView):
         return embed
 
 
+class UndoLogView(discord.ui.View):
+    """View with Undo button and VNDB link for VN completion embed."""
+
+    def __init__(self, log_id: int, user_id: int, vndb_url: str, bot: VNClubBot):
+        super().__init__(timeout=DEFAULT_TIMEOUT)  # 5 minute timeout
+        self.log_id = log_id
+        self.user_id = user_id
+        self.bot = bot
+        self.message = None
+
+        # Add VNDB link button
+        self.add_item(discord.ui.Button(
+            label="Open on VNDB",
+            style=discord.ButtonStyle.link,
+            url=vndb_url
+        ))
+
+    @discord.ui.button(label="Undo Log", style=discord.ButtonStyle.danger, emoji="↩️")
+    async def undo_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle the undo button press."""
+        # Check if the user pressing the button is the one who created the log
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "You can only undo your own logs!",
+                ephemeral=True
+            )
+            return
+
+        # Delete the log
+        await self.bot.RUN(DatabaseQueries.DELETE_LOG_BY_ID, (self.log_id,))
+
+        _log.info(
+            f"Log #{self.log_id} undone via button by user {interaction.user.name} ({interaction.user.id})"
+        )
+
+        # Disable the button and update label
+        button.disabled = True
+        button.label = "Undone"
+        button.style = discord.ButtonStyle.secondary
+        button.emoji = None
+
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            f"Log #{self.log_id} has been deleted.",
+            ephemeral=True
+        )
+
+    async def on_timeout(self):
+        """Disable the button when the view times out."""
+        for item in self.children:
+            if isinstance(item, discord.ui.Button) and item.style != discord.ButtonStyle.link:
+                item.disabled = True
+                item.style = discord.ButtonStyle.secondary
+
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.NotFound:
+                pass
+
+
 # ==================== HELPER FUNCTIONS ====================
 
 
@@ -218,19 +281,24 @@ class VNUserCommands(commands.Cog):
 
     @app_commands.command(name="finish_vn", description="Mark a VN as finished.")
     @app_commands.describe(
-        vndb_id="The VNDB ID of the title you finished.",
+        title="Search for a VN by title (type at least 2 characters).",
         comment="Your comment/review about the VN (max 1000 characters).",
         rating="Your personal rating for the VN (1-5) 1=Terrible; 5=Masterpiece.",
     )
-    @app_commands.autocomplete(vndb_id=vn_autocomplete)
+    @app_commands.autocomplete(title=vn_autocomplete)
     @app_commands.choices(rating=RATING_CHOICES)
     @app_commands.guild_only()
     async def finish_vn(
-        self, interaction: discord.Interaction, vndb_id: str, comment: str, rating: int
+        self, interaction: discord.Interaction, title: str, comment: str, rating: int
     ):
         await interaction.response.defer()
 
         try:
+            # Resolve VN ID from various input formats (autocomplete value, display format, raw ID)
+            vndb_id = await resolve_vn_from_input(title)
+            if not vndb_id:
+                raise ValidationError("Could not determine VN from input. Please try selecting from the autocomplete dropdown.")
+
             # Validate inputs
             await validate_comment_length(comment)
             await validate_rating_input(rating)
@@ -274,8 +342,8 @@ class VNUserCommands(commands.Cog):
                 f"Reward Month: {current_month}, Points: {reward_points}, Comment: {comment}"
             )
 
-            # Add log to database
-            await self.bot.RUN(
+            # Add log to database and get the log_id
+            log_id = await self.bot.RUN_RETURNING_ID(
                 DatabaseQueries.ADD_READING_LOG,
                 (
                     interaction.user.id,
@@ -291,7 +359,7 @@ class VNUserCommands(commands.Cog):
 
             new_total_points = current_total_points + reward_points
 
-            # Create and send embed
+            # Create embed with log_id
             embed = await EmbedBuilder.create_vn_completion_embed(
                 interaction.user,
                 vn_info,
@@ -299,8 +367,14 @@ class VNUserCommands(commands.Cog):
                 current_total_points,
                 new_total_points,
                 rating,
+                log_id,
             )
-            await interaction.followup.send(embed=embed)
+
+            # Create view with undo button and VNDB link
+            vndb_url = await vn_info.get_vndb_link()
+            view = UndoLogView(log_id, interaction.user.id, vndb_url, self.bot)
+            message = await interaction.followup.send(embed=embed, view=view)
+            view.message = message
 
         except BotError as e:
             await handle_command_error(interaction, e)
@@ -448,55 +522,68 @@ class VNUserCommands(commands.Cog):
             color=discord.Color.gold(),
         )
 
-        for rank, (guild_id, guild_total) in enumerate(server_totals, start=1):
+        # Discord embeds have a limit of 25 fields - limit to 24 to leave room for overflow message
+        max_servers = 24
+        for rank, (guild_id, guild_total) in enumerate(server_totals[:max_servers], start=1):
             users_data = sorted_server_data[guild_id]
             guild = self.bot.get_guild(guild_id)
             guild_name = guild.name if guild else f"Server {guild_id}"
-            
+
+            # Truncate guild name if too long for field name (256 char limit)
+            display_name = truncate_text(guild_name, 50)
+
             # Get top 5 users for this server
             sorted_users = sorted(users_data.items(), key=lambda x: x[1], reverse=True)
             top_users = sorted_users[:5]
-            
+
             # Create user list
             user_lines = []
             for i, (username, points) in enumerate(top_users, start=1):
                 user_lines.append(f"`{i}.` {username} — {points}点")
-            
+
             user_list = "\n".join(user_lines)
-            
+
             # Add as embed field
             embed.add_field(
-                name=f"#{rank} {guild_name} — {guild_total}点",
+                name=f"#{rank} {display_name} — {guild_total}点",
                 value=user_list,
+                inline=False
+            )
+
+        # Show overflow message if there are more servers
+        if len(server_totals) > max_servers:
+            embed.add_field(
+                name="...",
+                value=f"And {len(server_totals) - max_servers} more servers",
                 inline=False
             )
 
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="user", description="View user statistics and profile.")
-    @app_commands.describe(member="The member whose profile you want to view (defaults to yourself).")
+    @app_commands.command(name="profile", description="View user statistics and profile.")
+    @app_commands.describe(user="The user whose profile you want to view (can be a mention or user ID).")
     async def user_profile(
-        self, interaction: discord.Interaction, member: discord.Member = None
+        self, interaction: discord.Interaction, user: discord.User = None
     ):
         await interaction.response.defer()
 
-        if member is None:
-            member = interaction.user
+        if user is None:
+            user = interaction.user
 
         # Get basic user statistics
-        stats_result = await self.bot.GET_ONE(DatabaseQueries.GET_USER_STATS, (member.id,))
+        stats_result = await self.bot.GET_ONE(DatabaseQueries.GET_USER_STATS, (user.id,))
         if not stats_result:
-            await interaction.followup.send(f"No data found for {member.name}.")
+            await interaction.followup.send(f"No data found for {user.name}.")
             return
 
         total_entries, total_points, monthly_entries, vn_entries = stats_result
 
         if total_entries == 0:
-            await interaction.followup.send(f"{member.name} has no reading logs yet.")
+            await interaction.followup.send(f"{user.name} has no reading logs yet.")
             return
 
         # Get most active server
-        most_active_server_result = await self.bot.GET_ONE(DatabaseQueries.GET_USER_MOST_ACTIVE_SERVER, (member.id,))
+        most_active_server_result = await self.bot.GET_ONE(DatabaseQueries.GET_USER_MOST_ACTIVE_SERVER, (user.id,))
         most_active_server = "Unknown"
         most_active_count = 0
         if most_active_server_result:
@@ -506,10 +593,10 @@ class VNUserCommands(commands.Cog):
             most_active_server = guild.name if guild else f"Server {guild_id}"
 
         # Get recent activity (last 6 months)
-        recent_activity = await self.bot.GET(DatabaseQueries.GET_USER_RECENT_ACTIVITY, (member.id,))
+        recent_activity = await self.bot.GET(DatabaseQueries.GET_USER_RECENT_ACTIVITY, (user.id,))
 
         # Get user's average rating
-        avg_rating_result = await self.bot.GET_ONE(DatabaseQueries.GET_USER_AVERAGE_RATING, (member.id,))
+        avg_rating_result = await self.bot.GET_ONE(DatabaseQueries.GET_USER_AVERAGE_RATING, (user.id,))
         average_rating = 0.0
         rating_count = 0
         if avg_rating_result and avg_rating_result[0] is not None:
@@ -518,10 +605,10 @@ class VNUserCommands(commands.Cog):
 
         # Calculate additional statistics
         non_monthly_entries = vn_entries - monthly_entries
-        
+
         # Create the embed using EmbedBuilder
         embed = EmbedBuilder.create_user_profile_embed(
-            member,
+            user,
             total_entries,
             total_points,
             monthly_entries,
@@ -535,25 +622,26 @@ class VNUserCommands(commands.Cog):
 
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="user_logs", description="View your reading logs.")
-    @app_commands.describe(member="The member whose logs you want to view.")
+    @app_commands.command(name="logs", description="View your reading logs.")
+    @app_commands.describe(user="The user whose logs you want to view (can be a mention or user ID).")
     async def user_logs(
-        self, interaction: discord.Interaction, member: discord.Member = None
+        self, interaction: discord.Interaction, user: discord.User = None
     ):
         await interaction.response.defer()
 
-        if member is None:
-            member = interaction.user
+        if user is None:
+            user = interaction.user
 
-        results = await self.bot.GET(DatabaseQueries.GET_USER_LOGS, (member.id,))
+        results = await self.bot.GET(DatabaseQueries.GET_USER_LOGS, (user.id,))
         if not results:
-            await interaction.followup.send(f"No reading logs found for {member.name}.")
+            await interaction.followup.send(f"No reading logs found for {user.name}.")
             return
 
         # Process logs into formatted strings
         log_entries = []
         for row in results:
             (
+                log_id,
                 user_id,
                 vndb_id,
                 user_rating,
@@ -566,26 +654,31 @@ class VNUserCommands(commands.Cog):
 
             if vndb_id:
                 vn_info: VN_Entry = await from_vndb_id(self.bot, vndb_id)
-                link = await vn_info.get_vndb_link()
-                
-                # Display full comment - length validation prevents overly long comments
                 display_comment = comment or 'No comment provided.'
-                # Prioritize Japanese title, fallback to English title, or generic text if both are empty
-                display_title = vn_info.title_ja or vn_info.title_en or "View on VNDB"
-                
-                log_entry = (
-                    f"**{reward_month}**: [{display_title}]({link}) - {points}点 ({reward_reason})\n"
-                    f"Comment: {display_comment} | Rating: {user_rating or 'No rating provided.'}/5"
-                )
+
+                if vn_info:
+                    link = await vn_info.get_vndb_link()
+                    # Prioritize Japanese title, fallback to English title, or generic text if both are empty
+                    display_title = vn_info.title_ja or vn_info.title_en or "View on VNDB"
+                    log_entry = (
+                        f"`#{log_id}` **{reward_month}**: [{display_title}]({link}) - {points}点 ({reward_reason})\n"
+                        f"Comment: {display_comment} | Rating: {user_rating or 'No rating provided.'}/5"
+                    )
+                else:
+                    # VN info failed to load - show vndb_id as fallback
+                    log_entry = (
+                        f"`#{log_id}` **{reward_month}**: {vndb_id} - {points}点 ({reward_reason})\n"
+                        f"Comment: {display_comment} | Rating: {user_rating or 'No rating provided.'}/5"
+                    )
             else:
                 # Display full comment for non-VN entries too
                 display_comment = comment or 'No comment provided.'
-                    
+
                 log_entry = (
-                    f"**{reward_month}**: No VN specified - {points}点 ({reward_reason})\n"
+                    f"`#{log_id}` **{reward_month}**: No VN specified - {points}点 ({reward_reason})\n"
                     f"Comment: {display_comment}"
                 )
-            
+
             log_entries.append(log_entry)
 
         # Create paginated view for logs (5 per page)
@@ -595,16 +688,16 @@ class VNUserCommands(commands.Cog):
         if len(log_entries) <= 5 and len(combined_description) <= 4090:
             # Show all logs without pagination
             embed = discord.Embed(
-                title=f"📚 Reading Logs for {member.name}", color=discord.Color.blue()
+                title=f"📚 Reading Logs for {user.name}", color=discord.Color.blue()
             )
-            embed.set_author(name=member.name, icon_url=member.display_avatar.url)
-            
+            embed.set_author(name=user.name, icon_url=user.display_avatar.url)
+
             embed.description = combined_description
             embed.set_footer(text=f"{len(log_entries)} total logs")
             await interaction.followup.send(embed=embed)
         else:
             # Use pagination for more than 5 logs OR if description is too long
-            view = ReadingLogsView(log_entries, member, per_page=5)
+            view = ReadingLogsView(log_entries, user, per_page=5)
             embed = view.create_embed()
             await interaction.followup.send(embed=embed, view=view)
 
@@ -644,29 +737,26 @@ class VNUserCommands(commands.Cog):
             f"Rewarded **{points}** points to {member.mention} for the following reason: `{truncated_reason}`"
         )
 
-    @app_commands.command(name="delete_log", description="Delete a reading log.")
+    @app_commands.command(name="log_undo", description="Delete a reading log.")
     @app_commands.describe(
-        member="The member whose log you want to delete.",
         log_id="The ID of the log to delete.",
     )
     @app_commands.autocomplete(log_id=user_logs_autocomplete)
     async def delete_log(
-        self, interaction: discord.Interaction, member: discord.Member, log_id: int
+        self, interaction: discord.Interaction, log_id: int
     ):
         await interaction.response.defer()
-
-        if not await validate_user_permission(interaction):
-            return
 
         # Check if the log exists
         result = await self.bot.GET_ONE(DatabaseQueries.GET_LOG_BY_ID, (log_id,))
         if not result:
-            await interaction.followup.send("Log not found.")
+            await interaction.followup.send("❌ Log not found.")
             return
 
         (
             user_id,
             vndb_id,
+            _user_rating,  # Not used in delete
             reward_reason,
             reward_month,
             points,
@@ -674,50 +764,48 @@ class VNUserCommands(commands.Cog):
             logged_in_guild,
         ) = result
 
+        # Check permissions: user can delete their own logs, or admins can delete any log
+        is_own_log = user_id == interaction.user.id
+        if not is_own_log:
+            await validate_user_permission(interaction, "You can only delete your own logs.")
+
+        # Get VN title for display if available
+        display_title = vndb_id or "N/A"
+        if vndb_id:
+            vn_info = await from_vndb_id(self.bot, vndb_id)
+            if vn_info:
+                display_title = vn_info.title_ja or vn_info.title_en or vndb_id
+
         # Delete the log
+        deleted_by = "owner" if is_own_log else "admin"
         _log.info(
-            f"Deleting log {log_id} for user {member.id} ({member.name}) - "
-            f"VNDB ID: {vndb_id}, Reward Reason: {reward_reason}, "
-            f"Reward Month: {reward_month}, Points: {points}, Comment: {comment}"
+            f"Log #{log_id} deleted by {deleted_by} {interaction.user.name} ({interaction.user.id}) - "
+            f"Log owner: {user_id}, VNDB ID: {vndb_id}, Reward Reason: {reward_reason}, "
+            f"Reward Month: {reward_month}, Points: {points}"
         )
         await self.bot.RUN(DatabaseQueries.DELETE_LOG_BY_ID, (log_id,))
-        
-        # Truncate comment to ensure message doesn't exceed Discord's 2000 char limit
-        display_comment = comment or 'No comment provided.'
-        # Calculate remaining space for comment after other content
-        base_message = (
-            f"Deleted the following log for {member.mention}:\n"
-            f"**VNDB ID:** {vndb_id}\n"
-            f"**Reward Reason:** {reward_reason}\n"
-            f"**Reward Month:** {reward_month}\n"
-            f"**Points:** {points}\n"
-            f"**Comment:** "
-        )
-        max_comment_length = 1990 - len(base_message)  # Leave some buffer
-        truncated_comment = truncate_text(display_comment, max_comment_length)
-        
-        # Add indicator if comment was truncated
-        comment_display = truncated_comment
-        if len(display_comment) > max_comment_length:
-            comment_display += f" *[Comment truncated - was {len(display_comment)} characters]*"
-        
+
+        # Truncate all display values to ensure message doesn't exceed Discord's 2000 char limit
+        display_title = truncate_text(display_title, 200)
+        display_reason = truncate_text(reward_reason or "N/A", 200)
+        display_comment = truncate_text(comment or 'No comment provided.', 500)
+
         try:
             await interaction.followup.send(
-                f"Deleted the following log for {member.mention}:\n"
-                f"**VNDB ID:** {vndb_id}\n"
-                f"**Reward Reason:** {reward_reason}\n"
+                f"✅ Deleted log #{log_id} for <@{user_id}>:\n"
+                f"**Title:** {display_title}\n"
+                f"**Reward Reason:** {display_reason}\n"
                 f"**Reward Month:** {reward_month}\n"
                 f"**Points:** {points}\n"
-                f"**Comment:** {comment_display}"
+                f"**Comment:** {display_comment}"
             )
         except discord.HTTPException as e:
             if e.code == 50035:  # Invalid Form Body (message too long)
                 # Fallback with minimal information
                 _log.error(f"Discord message length error in delete_log: {e}")
                 await interaction.followup.send(
-                    f"✅ Successfully deleted log {log_id} for {member.mention}.\n"
-                    f"VNDB ID: {vndb_id} | Month: {reward_month} | Points: {points}\n"
-                    f"*Note: Comment was too long to display.*"
+                    f"✅ Deleted log #{log_id} for <@{user_id}>.\n"
+                    f"Title: {display_title} | Month: {reward_month} | Points: {points}"
                 )
             else:
                 # Re-raise other HTTP exceptions
@@ -726,25 +814,119 @@ class VNUserCommands(commands.Cog):
             _log.error(f"Unexpected error in delete_log: {e}")
             raise
 
-    @app_commands.command(name="ratings", description="View ratings for a VN.")
+    @app_commands.command(name="log_edit", description="Edit a reading log's comment or rating.")
     @app_commands.describe(
-        vndb_id="The VNDB ID of the title you want to view ratings for."
+        log_id="The ID of the log to edit.",
+        comment="New comment (max 1000 characters). Leave empty to keep current.",
+        rating="New rating (1-5). Leave empty to keep current.",
     )
-    @app_commands.autocomplete(vndb_id=vn_autocomplete)
-    async def ratings(self, interaction: discord.Interaction, vndb_id: str):
+    @app_commands.autocomplete(log_id=user_logs_autocomplete)
+    @app_commands.choices(rating=RATING_CHOICES)
+    async def log_edit(
+        self,
+        interaction: discord.Interaction,
+        log_id: int,
+        comment: str = None,
+        rating: int = None,
+    ):
         await interaction.response.defer()
 
         try:
-            # Get VN info first
+            # Check if at least one field is being updated
+            if comment is None and rating is None:
+                await interaction.followup.send("❌ You must provide at least a new comment or rating to update.")
+                return
+
+            # Check if the log exists
+            result = await self.bot.GET_ONE(DatabaseQueries.GET_LOG_BY_ID, (log_id,))
+            if not result:
+                await interaction.followup.send("❌ Log not found.")
+                return
+
+            (
+                user_id,
+                vndb_id,
+                current_rating,
+                reward_reason,
+                reward_month,
+                points,
+                current_comment,
+                logged_in_guild,
+            ) = result
+
+            # Check that the user owns this log
+            if user_id != interaction.user.id:
+                await interaction.followup.send("❌ You can only edit your own logs.")
+                return
+
+            # Validate comment length if provided
+            if comment is not None:
+                await validate_comment_length(comment)
+
+            # Use current values for fields not being updated
+            new_comment = comment if comment is not None else current_comment
+            new_rating = rating if rating is not None else current_rating
+
+            # Update the log
+            await self.bot.RUN(
+                DatabaseQueries.UPDATE_LOG_COMMENT_RATING,
+                (new_comment, new_rating, log_id),
+            )
+
+            # Log the edit
+            edit_details = []
+            if comment is not None:
+                edit_details.append(f"comment changed")
+            if rating is not None:
+                edit_details.append(f"rating: {current_rating} -> {rating}")
+            _log.info(
+                f"Log #{log_id} edited by {interaction.user.name} ({interaction.user.id}) - "
+                f"VNDB ID: {vndb_id}, Changes: {', '.join(edit_details)}"
+            )
+
+            # Build response message
+            updates = []
+            if comment is not None:
+                updates.append(f"**Comment:** {truncate_text(comment, 200)}")
+            if rating is not None:
+                updates.append(f"**Rating:** {rating}/5")
+
+            await interaction.followup.send(
+                f"✅ Updated log #{log_id}:\n" + "\n".join(updates)
+            )
+
+        except BotError as e:
+            await handle_command_error(interaction, e)
+        except Exception as e:
+            _log.error(f"Unexpected error in log_edit: {e}")
+            await handle_command_error(interaction, e, "An error occurred while editing the log.")
+            raise
+
+    @app_commands.command(name="ratings", description="View ratings for a VN.")
+    @app_commands.describe(
+        title="Search for a VN by title (type at least 2 characters)."
+    )
+    @app_commands.autocomplete(title=vn_autocomplete)
+    async def ratings(self, interaction: discord.Interaction, title: str):
+        await interaction.response.defer()
+
+        try:
+            # Resolve VN ID from various input formats (autocomplete value, display format, raw ID)
+            vndb_id = await resolve_vn_from_input(title)
+            if not vndb_id:
+                raise ValidationError("Could not determine VN from input. Please try selecting from the autocomplete dropdown.")
+
+            # Get VN info
             vn_info: VN_Entry = await from_vndb_id(self.bot, vndb_id)
             if not vn_info:
-                raise ValidationError("VNDB ID not found or invalid.")
+                raise ValidationError("VN not found or invalid.")
 
             # Get all ratings for this VN
-            ratings = await self.bot.GET(DatabaseQueries.GET_ALL_VN_RATINGS, (vndb_id,))
+            ratings = await self.bot.GET(DatabaseQueries.GET_ALL_VN_RATINGS, (vn_info.vndb_id,))
 
             if not ratings:
-                await interaction.followup.send(f"No ratings found for **{vn_info.title_ja}**.")
+                display_title = vn_info.title_ja or vn_info.title_en or vn_info.vndb_id
+                await interaction.followup.send(f"No ratings found for **{display_title}**.")
                 return
 
             # Process ratings into formatted strings
@@ -782,10 +964,10 @@ class VNUserCommands(commands.Cog):
                     color=discord.Color.blue()
                 )
                 
-                # Add VN thumbnail if not NSFW
-                if not vn_info.thumbnail_is_nsfw:
+                # Add VN thumbnail if not NSFW and available
+                if not vn_info.thumbnail_is_nsfw and vn_info.thumbnail_url:
                     embed.set_thumbnail(url=vn_info.thumbnail_url)
-                
+
                 embed.set_footer(text=f"{len(rating_entries)} total ratings")
                 await interaction.followup.send(embed=embed)
             else:
@@ -793,9 +975,9 @@ class VNUserCommands(commands.Cog):
                 display_title = vn_info.title_ja or vn_info.title_en or "VN"
                 view = VNRatingsView(rating_entries, display_title, average_rating, total_ratings, per_page=10)
                 embed = view.create_embed()
-                
-                # Add VN thumbnail if not NSFW
-                if not vn_info.thumbnail_is_nsfw:
+
+                # Add VN thumbnail if not NSFW and available
+                if not vn_info.thumbnail_is_nsfw and vn_info.thumbnail_url:
                     embed.set_thumbnail(url=vn_info.thumbnail_url)
                 
                 await interaction.followup.send(embed=embed, view=view)

@@ -28,11 +28,12 @@ class EmbedBuilder:
         comment: str,
         current_points: int,
         new_points: int,
-        rating: int
+        rating: int,
+        log_id: int
     ) -> discord.Embed:
         """
         Create embed for VN completion.
-        
+
         Args:
             user: Discord user who completed the VN
             vn_info: VN information
@@ -40,48 +41,44 @@ class EmbedBuilder:
             current_points: User's points before completion
             new_points: User's points after completion
             rating: User's rating (1-5)
-            
+            log_id: Database log entry ID
+
         Returns:
             Configured embed for VN completion
         """
-        link = await vn_info.get_vndb_link()
-        
+        display_title = vn_info.title_ja or vn_info.title_en or vn_info.vndb_id
         embed = create_base_embed(
-            title=f"Finished reading **{vn_info.title_ja}**",
+            title=f"Finished reading **{display_title}**",
             color=discord.Color.green(),
             author_name=user.name,
             author_icon=user.display_avatar.url
         )
-        
-        if not vn_info.thumbnail_is_nsfw:
+
+        if not vn_info.thumbnail_is_nsfw and vn_info.thumbnail_url:
             embed.set_thumbnail(url=vn_info.thumbnail_url)
-        
-        # Prioritize Japanese title, fallback to English title, or generic text if both are empty
-        display_title = vn_info.title_ja or vn_info.title_en or "View on VNDB"
+
         embed.add_field(
-            name="VNDB Link", 
-            value=f"[{display_title}]({link})", 
+            name="Comment",
+            value=truncate_text(comment, MAX_EMBED_FIELD),
             inline=False
         )
-        
+
         embed.add_field(
-            name="Comment", 
-            value=truncate_text(comment, MAX_EMBED_FIELD), 
+            name="Points",
+            value=format_points_display(current_points, new_points),
             inline=False
         )
-        
+
         embed.add_field(
-            name="Points", 
-            value=format_points_display(current_points, new_points), 
+            name="Rating",
+            value=f"**{rating}/5**",
             inline=False
         )
-        
-        embed.add_field(
-            name="Rating", 
-            value=f"**{rating}/5**", 
-            inline=False
-        )
-        
+
+        # Set timestamp and footer
+        embed.timestamp = discord.utils.utcnow()
+        embed.set_footer(text=f"Log #{log_id}")
+
         return embed
 
     @staticmethod
@@ -109,8 +106,9 @@ class EmbedBuilder:
         """
         vndb_link = await vn_info.get_vndb_link()
         points_not_monthly = await vn_info.get_points_not_monthly()
-        
-        title = f"{title_prefix}{vn_info.title_ja}" if title_prefix else vn_info.title_ja
+
+        display_title = vn_info.title_ja or vn_info.title_en or vn_info.vndb_id
+        title = f"{title_prefix}{display_title}" if title_prefix else display_title
         embed = create_base_embed(title=title, color=color)
         
         embed.add_field(name="VNDB ID", value=vn_info.vndb_id, inline=True)
@@ -123,7 +121,7 @@ class EmbedBuilder:
         description = await vn_info.get_normalized_description()
         embed.add_field(name="Description", value=description, inline=False)
         
-        if not vn_info.thumbnail_is_nsfw:
+        if not vn_info.thumbnail_is_nsfw and vn_info.thumbnail_url:
             embed.set_thumbnail(url=vn_info.thumbnail_url)
         
         embed.set_footer(text="Visual Novel Club")
@@ -131,7 +129,7 @@ class EmbedBuilder:
 
     @staticmethod
     def create_user_profile_embed(
-        member: discord.Member,
+        user: discord.User,
         total_entries: int,
         total_points: int,
         monthly_entries: int,
@@ -144,9 +142,9 @@ class EmbedBuilder:
     ) -> discord.Embed:
         """
         Create embed for user profile display.
-        
+
         Args:
-            member: Discord member
+            user: Discord user or member
             total_entries: Total number of entries
             total_points: Total points earned
             monthly_entries: Number of monthly VN entries
@@ -156,18 +154,20 @@ class EmbedBuilder:
             recent_activity: List of recent activity data
             average_rating: User's average rating across all VNs
             rating_count: Number of VNs the user has rated
-            
+
         Returns:
             Configured embed for user profile
         """
+        # display_name works for both User and Member
+        display_name = getattr(user, 'display_name', user.name)
         embed = create_base_embed(
-            title=f"📊 User Profile: {member.name}",
+            title=f"📊 User Profile: {user.name}",
             color=discord.Color.blue(),
-            author_name=member.display_name,
-            author_icon=member.display_avatar.url
+            author_name=display_name,
+            author_icon=user.display_avatar.url
         )
-        
-        embed.set_thumbnail(url=member.display_avatar.url)
+
+        embed.set_thumbnail(url=user.display_avatar.url)
         
         # Main statistics
         embed.add_field(
@@ -190,7 +190,6 @@ class EmbedBuilder:
         
         # Average rating field
         if rating_count > 0:
-            rating_stars = "⭐" * int(round(average_rating))
             embed.add_field(
                 name="⭐ Average Rating",
                 value=f"```\n{average_rating:.1f}/5\n```",
@@ -228,9 +227,13 @@ class EmbedBuilder:
                     inline=False
                 )
         
-        # Footer with join date
-        join_date = member.joined_at.strftime('%B %Y') if member.joined_at else 'Unknown'
-        embed.set_footer(text=f"Member since {join_date}")
+        # Footer with join date (only available for Members, not Users)
+        joined_at = getattr(user, 'joined_at', None)
+        if joined_at:
+            join_date = joined_at.strftime('%B %Y')
+            embed.set_footer(text=f"Member since {join_date}")
+        else:
+            embed.set_footer(text="Visual Novel Club")
         
         return embed
 

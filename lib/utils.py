@@ -3,6 +3,7 @@ Shared utilities and constants for the VN Club Bot.
 """
 
 import os
+import re
 import discord
 import logging
 from typing import Optional, Union, List, Tuple, Any
@@ -149,6 +150,68 @@ def split_text_for_discord(text: str, max_length: int = MAX_DISCORD_MESSAGE) -> 
     return chunks
 
 
+# ==================== VN INPUT RESOLUTION ====================
+
+
+async def resolve_vn_from_input(raw_value: str) -> str | None:
+    """
+    Resolve a VN ID from various input formats.
+
+    Handles:
+    - Autocomplete value format: ${vndb|v11:jp}
+    - Autocomplete display format (user clicked back on field): "Title — YYYY-MM-DD • rating/10"
+    - Raw VNDB ID: v11 or 11
+
+    Returns:
+        VNDB ID string (e.g., "v11") or None if not found
+    """
+    # Import here to avoid circular imports
+    from lib.vndb_search import parse_autocomplete_value, search_visual_novel
+
+    if not raw_value:
+        return None
+
+    raw_value = raw_value.strip()
+
+    # Try to parse as autocomplete value format first
+    parsed = parse_autocomplete_value(raw_value)
+    if parsed:
+        vndb_id = parsed[0]  # (item_id, field, source)
+        if vndb_id and not vndb_id.startswith("v"):
+            vndb_id = f"v{vndb_id}"
+        return vndb_id
+
+    # Check if this looks like an autocomplete display value that Discord sent
+    # Format: "Title — YYYY-MM-DD • rating/10" or "Title — YYYY-MM-DD" or "Title — rating/10"
+    has_em_dash = " — " in raw_value
+    has_badge_chars = "•" in raw_value or "/" in raw_value
+    has_date_pattern = bool(re.search(r'\d{4}-\d{2}-\d{2}', raw_value))
+    if has_em_dash and (has_badge_chars or has_date_pattern):
+        # Extract the title part before the " — " separator
+        title_part = raw_value.split(" — ")[0].strip()
+        if title_part:
+            try:
+                # Search VNDB for this exact title
+                search_results = await search_visual_novel(title_part, limit=5)
+                if search_results:
+                    # Use the first result (best match)
+                    first_match = search_results[0]
+                    vndb_id = first_match.get("id")
+                    if vndb_id:
+                        _log.info(f"Recovered VN from autocomplete display format: {title_part} -> {vndb_id}")
+                        if not vndb_id.startswith("v"):
+                            vndb_id = f"v{vndb_id}"
+                        return vndb_id
+            except Exception as e:
+                _log.warning(f"Failed to recover VN from display format: {e}")
+
+    # Treat as raw VNDB ID
+    vndb_id = raw_value
+    if vndb_id and not vndb_id.startswith("v"):
+        vndb_id = f"v{vndb_id}"
+    return vndb_id
+
+
 # ==================== ERROR HANDLING UTILITIES ====================
 
 class BotError(Exception):
@@ -199,25 +262,26 @@ async def handle_command_error(
 
 # ==================== VALIDATION HELPERS ====================
 
-async def validate_user_permission(interaction: discord.Interaction) -> bool:
+async def validate_user_permission(interaction: discord.Interaction, custom_message: str = None) -> bool:
     """
     Validate if user has permission to use management commands.
-    
+
     Args:
         interaction: Discord interaction
-        
+        custom_message: Custom error message to show user if validation fails
+
     Returns:
         True if user has permission
-        
+
     Raises:
         ValidationError: If user lacks permission
     """
     role_ids = [role.id for role in interaction.user.roles] if hasattr(interaction.user, 'roles') else []
-    
+
     if not user_has_permission(interaction.user.id, role_ids):
         raise ValidationError(
             f"User {interaction.user.id} lacks permission",
-            "You are not authorized to use this command."
+            custom_message or "You are not authorized to use this command."
         )
     return True
 
@@ -359,7 +423,7 @@ class DatabaseQueries:
     """
     
     GET_LOG_BY_ID = """
-    SELECT user_id, vndb_id, reward_reason, reward_month, points, comment, logged_in_guild 
+    SELECT user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild
     FROM reading_logs WHERE log_id = ?;
     """
     
@@ -368,8 +432,8 @@ class DatabaseQueries:
     """
     
     GET_USER_LOGS = """
-    SELECT user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild 
-    FROM reading_logs WHERE user_id = ? ORDER BY reward_month DESC;
+    SELECT log_id, user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild
+    FROM reading_logs WHERE user_id = ? ORDER BY reward_month DESC, log_id DESC;
     """
     
     GET_ALL_LOGS = """
@@ -400,7 +464,11 @@ class DatabaseQueries:
     DELETE_LOG_BY_ID = """
     DELETE FROM reading_logs WHERE log_id = ?;
     """
-    
+
+    UPDATE_LOG_COMMENT_RATING = """
+    UPDATE reading_logs SET comment = ?, user_rating = ? WHERE log_id = ?;
+    """
+
     GET_USER_RATINGS = """
     SELECT user_id, vndb_id, user_rating, comment FROM reading_logs WHERE user_id = ? AND vndb_id = ?;
     """
@@ -463,8 +531,11 @@ class DatabaseQueries:
     """
     
     USER_LOGS_AUTOCOMPLETE = """
-    SELECT log_id, vndb_id, reward_month, reward_reason, points FROM reading_logs
-    WHERE user_id = ? ORDER BY reward_month DESC;
+    SELECT rl.log_id, rl.vndb_id, rl.reward_month, rl.reward_reason, rl.points,
+           COALESCE(vc.title_ja, vc.title_en) as vn_title
+    FROM reading_logs rl
+    LEFT JOIN vndb_cache vc ON vc.vndb_id = rl.vndb_id OR vc.vndb_id = 'v' || rl.vndb_id
+    WHERE rl.user_id = ? ORDER BY rl.log_id DESC;
     """
     
     # Statistics queries

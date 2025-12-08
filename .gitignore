@@ -9,3 +9,6 @@ data
 poetry.lock
 *.toml
 *.DS_Store
+run.bat
+reference
+*.log

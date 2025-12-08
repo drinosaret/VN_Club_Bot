@@ -15,9 +15,11 @@ from lib.utils import (
     is_month_in_range,
     BotError,
     ValidationError,
-    DEFAULT_MONTHLY_POINTS
+    DEFAULT_MONTHLY_POINTS,
+    resolve_vn_from_input
 )
 from lib.embeds import EmbedBuilder
+from lib.autocomplete import vn_autocomplete, vn_pool_autocomplete
 from math import ceil
 
 _log = logging.getLogger(__name__)
@@ -151,28 +153,34 @@ class VNTitleManagement(commands.Cog):
         name="add_vn", description="Add a new VN title to the database."
     )
     @app_commands.describe(
-        vndb_id="The VNDB ID of the title to add.",
+        title="Search for a VN by title (type at least 2 characters).",
         start_month="The month the title should be added to. Format: YYYY-MM (optional, defaults to current month).",
         end_month="The month the title should end. Format: YYYY-MM (optional, defaults to start month).",
         is_monthly_points="How many points to receive if read during the specified period (optional, defaults to 10).",
     )
+    @app_commands.autocomplete(title=vn_autocomplete)
     @app_commands.guild_only()
     async def add_vn(
         self,
         interaction: discord.Interaction,
-        vndb_id: str,
+        title: str,
         start_month: str = None,
         end_month: str = None,
         is_monthly_points: int = DEFAULT_MONTHLY_POINTS,
     ):
-        _log.info(
-            f"User {interaction.user.name} is trying to add a VN title with ID {vndb_id}."
-        )
-
         await interaction.response.defer()
 
         try:
             await validate_user_permission(interaction)
+
+            # Resolve VN ID from various input formats (autocomplete value, display format, raw ID)
+            vndb_id = await resolve_vn_from_input(title)
+            if not vndb_id:
+                raise ValidationError("Could not determine VN from input. Please try selecting from the autocomplete dropdown.")
+
+            _log.info(
+                f"User {interaction.user.name} is trying to add a VN title with ID {vndb_id}."
+            )
 
             if await check_if_already_exists(interaction, vndb_id):
                 return
@@ -200,7 +208,7 @@ class VNTitleManagement(commands.Cog):
             _log.info(f"The following VN was added as a monthly title: {vn_info}")
 
             embed = await EmbedBuilder.create_vn_info_embed(
-                vn_info, start_month, end_month, is_monthly_points, 
+                vn_info, start_month, end_month, is_monthly_points,
                 title_prefix="VN Added: ", color=discord.Color.green()
             )
 
@@ -214,17 +222,25 @@ class VNTitleManagement(commands.Cog):
     @app_commands.command(
         name="remove_vn", description="Remove a VN title from the database."
     )
-    @app_commands.describe(vndb_id="The VNDB ID of the title to remove.")
+    @app_commands.describe(title="Select a VN from the pool to remove.")
+    @app_commands.autocomplete(title=vn_pool_autocomplete)
     @app_commands.guild_only()
-    async def remove_vn(self, interaction: discord.Interaction, vndb_id: str):
-        _log.info(
-            f"User {interaction.user.name} is trying to remove a VN title with ID {vndb_id}."
-        )
-
+    async def remove_vn(self, interaction: discord.Interaction, title: str):
         await interaction.response.defer()
 
         try:
             await validate_user_permission(interaction)
+
+            # The autocomplete returns the vndb_id directly, but handle other formats too
+            vndb_id = (title or "").strip()
+            if not vndb_id:
+                raise ValidationError("Could not determine VN from input. Please try selecting from the autocomplete dropdown.")
+            if not vndb_id.startswith("v"):
+                vndb_id = f"v{vndb_id}"
+
+            _log.info(
+                f"User {interaction.user.name} is trying to remove a VN title with ID {vndb_id}."
+            )
 
             if await check_if_not_exists(interaction, vndb_id):
                 return
@@ -245,7 +261,7 @@ class VNTitleManagement(commands.Cog):
         except Exception as e:
             await handle_command_error(interaction, e)
 
-    @app_commands.command(name="list_vns", description="List all VN titles.")
+    @app_commands.command(name="vnpool", description="List all VN titles.")
     @app_commands.guild_only()
     async def list_vns(self, interaction: discord.Interaction):
         await interaction.response.defer()

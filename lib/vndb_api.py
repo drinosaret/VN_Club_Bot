@@ -97,6 +97,8 @@ class VN_Entry:
 
     async def get_normalized_description(self, max_length=1000) -> str:
         """Get a normalized description for the VN."""
+        if not self.description:
+            return "No description available."
         desc = self.description.strip()
         if not desc:
             return "No description available."

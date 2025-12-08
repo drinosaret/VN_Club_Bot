@@ -1,6 +1,10 @@
 import asyncio
+import discord
+import logging
 from lib.bot import VNClubBot
 from discord.ext import commands
+
+_log = logging.getLogger(__name__)
 
 CREATE_USERS_TABLE = """
 CREATE TABLE IF NOT EXISTS users (
@@ -32,12 +36,19 @@ async def get_username_db(bot: VNClubBot, user_id: int) -> str:
     if user_name:
         return user_name[0]
     async with FETCH_LOCK:
-        await asyncio.sleep(1)
-        user = await bot.fetch_user(user_id)
-        if user:
-            await bot.RUN(INSERT_USER_QUERY, (user.id, user.display_name))
-            return user.display_name
-        else:
+        await asyncio.sleep(1)  # Rate limit protection
+        try:
+            user = await bot.fetch_user(user_id)
+            if user:
+                await bot.RUN(INSERT_USER_QUERY, (user.id, user.display_name))
+                return user.display_name
+            else:
+                return "Unknown User"
+        except discord.NotFound:
+            _log.warning(f"User {user_id} not found on Discord")
+            return "Unknown User"
+        except discord.HTTPException as e:
+            _log.error(f"HTTP error fetching user {user_id}: {e}")
             return "Unknown User"
 
 
