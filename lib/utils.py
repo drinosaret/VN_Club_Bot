@@ -182,7 +182,16 @@ async def resolve_vn_from_input(raw_value: str) -> str | None:
         return vndb_id
 
     # Check if this looks like an autocomplete display value that Discord sent
-    # Format: "Title — YYYY-MM-DD • rating/10" or "Title — YYYY-MM-DD" or "Title — rating/10"
+    # Format: "Title — YYYY-MM-DD • rating/10 [vXXXXX]"
+
+    # First try to extract VN ID from [vXXXXX] pattern (most reliable)
+    vn_id_match = re.search(r'\[v(\d+)\]', raw_value)
+    if vn_id_match:
+        vndb_id = f"v{vn_id_match.group(1)}"
+        _log.info(f"Recovered VN ID from display format: {vndb_id}")
+        return vndb_id
+
+    # Fall back to title search for legacy autocomplete values without [vXXXXX]
     has_em_dash = " — " in raw_value
     has_badge_chars = "•" in raw_value or "/" in raw_value
     has_date_pattern = bool(re.search(r'\d{4}-\d{2}-\d{2}', raw_value))

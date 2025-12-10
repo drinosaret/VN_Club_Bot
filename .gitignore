@@ -12,3 +12,4 @@ poetry.lock
 run.bat
 reference
 *.log
+tests

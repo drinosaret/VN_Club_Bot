@@ -77,11 +77,23 @@ async def vn_autocomplete(interaction: discord.Interaction, current: str) -> Lis
         if isinstance(rating, (int, float)) and rating > 0:
             badge_parts.append(f"{rating / 10:.1f}/10")
 
+        # Build label with VN ID suffix to survive Discord token replacement
+        vn_id_suffix = f" [{vn_id}]"
         if badge_parts:
-            choice_label = f"{display_title} — {' • '.join(badge_parts)}"
+            choice_label = f"{display_title} — {' • '.join(badge_parts)}{vn_id_suffix}"
+        else:
+            choice_label = f"{display_title}{vn_id_suffix}"
 
+        # Truncate title if needed, but preserve the VN ID suffix
         if len(choice_label) > 100:
-            choice_label = choice_label[:97] + "…"
+            if badge_parts:
+                badge_str = f" — {' • '.join(badge_parts)}"
+                available_for_title = 100 - len(badge_str) - len(vn_id_suffix) - 1
+                truncated_title = display_title[:available_for_title] + "…"
+                choice_label = f"{truncated_title}{badge_str}{vn_id_suffix}"
+            else:
+                truncated_title = display_title[:100 - len(vn_id_suffix) - 1] + "…"
+                choice_label = f"{truncated_title}{vn_id_suffix}"
 
         value = create_autocomplete_value(vn_id, field_key, source="vndb")
         choices.append(discord.app_commands.Choice(name=choice_label, value=value))
