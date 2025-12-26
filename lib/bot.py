@@ -1,8 +1,10 @@
 import os
+import sys
+import time
 import discord
 import aiosqlite
 import logging
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 _log = logging.getLogger(__name__)
 
@@ -12,12 +14,14 @@ class VNClubBot(commands.Bot):
         super().__init__(command_prefix=command_prefix, intents=discord.Intents.all())
         self.cog_folder = cog_folder
         self.path_to_db = path_to_db
+        self._last_heartbeat = time.time()
 
         db_directory = os.path.dirname(self.path_to_db)
         if not os.path.exists(db_directory):
             os.makedirs(db_directory)
 
     async def on_ready(self):
+        self._last_heartbeat = time.time()
         print(f"Logged in as {self.user}")
         await self.change_presence(activity=discord.Game(name="装甲悪鬼村正"))
 
@@ -30,6 +34,20 @@ class VNClubBot(commands.Bot):
 
     async def setup_hook(self):
         self.tree.on_error = self.on_application_command_error
+        self._connection_watchdog.start()
+
+    async def on_resumed(self):
+        self._last_heartbeat = time.time()
+        _log.info("Connection resumed")
+
+    @tasks.loop(seconds=60)
+    async def _connection_watchdog(self):
+        if not self.is_ready():
+            elapsed = time.time() - self._last_heartbeat
+            if elapsed > 300:  # 5 minutes
+                _log.error(f"Connection lost for {elapsed:.0f}s, exiting for restart")
+                await self.close()
+                sys.exit(1)
 
     async def load_cogs(self):
         cogs = [cog for cog in os.listdir(self.cog_folder) if cog.endswith(".py")]
