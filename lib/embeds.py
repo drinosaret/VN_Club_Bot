@@ -47,6 +47,8 @@ class EmbedBuilder:
             Configured embed for VN completion
         """
         display_title = vn_info.title_ja or vn_info.title_en or vn_info.vndb_id
+        points_earned = new_points - current_points
+
         embed = create_base_embed(
             title=f"Finished reading **{display_title}**",
             color=discord.Color.green(),
@@ -63,21 +65,8 @@ class EmbedBuilder:
             inline=False
         )
 
-        embed.add_field(
-            name="Points",
-            value=format_points_display(current_points, new_points),
-            inline=False
-        )
-
-        embed.add_field(
-            name="Rating",
-            value=f"**{rating}/5**",
-            inline=False
-        )
-
-        # Set timestamp and footer
+        embed.set_footer(text=f"⭐ {rating}/5 • +{points_earned:,} pts • Log #{log_id}")
         embed.timestamp = discord.utils.utcnow()
-        embed.set_footer(text=f"Log #{log_id}")
 
         return embed
 
