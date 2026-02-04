@@ -1,17 +1,10 @@
 services:
-  vn-club-bot:
+  hikaru:
     build: .
-    image: discord-vn-club-bot
-    container_name: discord-vn-club-bot-container
-    environment:
-      - TOKEN
-      - COMMAND_PREFIX
-      - PATH_TO_DB
-      - AUTHORIZED_USERS
-      - DB_BACKUP_CHANNEL
-      - VN_MANAGER_USER_IDS
-      - VN_MANAGER_ROLE_IDS
+    container_name: hikaru
+    restart: unless-stopped
+    env_file:
+      - .env
     volumes:
       - ./data:/app/data
       - ./hikaru_bot.log:/app/hikaru_bot.log
-    restart: unless-stopped

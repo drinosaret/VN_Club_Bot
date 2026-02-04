@@ -1,4 +1,4 @@
-name: Deploy Discord Bot
+name: Deploy Hikaru
 
 on:
   push:
@@ -17,38 +17,83 @@ env:
 
 jobs:
   deploy:
+    name: Deploy Hikaru
     runs-on: self-hosted
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Stop and remove existing container
+      - name: Data Protection
         run: |
-          docker compose down || true
+          echo "=== STARTING DATA PROTECTION ==="
 
-      - name: Create persistent data directory and symlink
-        run: |
-          sudo mkdir -p /usr/src/vn_club_bot/data
-          sudo chown $USER:$USER /usr/src/vn_club_bot/data
-          rm -rf ./data
-          ln -s /usr/src/vn_club_bot/data ./data
+          BACKUP_DIR=~/backups/hikaru_$(date +%Y%m%d_%H%M%S)
+          mkdir -p "$BACKUP_DIR"
 
-      - name: Create log file if not exists
-        run: |
-          if [ ! -f ./hikaru_bot.log ]; then
-            rm -rf ./hikaru_bot.log
-            touch ./hikaru_bot.log
-            chmod 666 ./hikaru_bot.log
+          if [ -d ~/bots/hikaru/data ]; then
+            cp -r ~/bots/hikaru/data "$BACKUP_DIR/data.backup"
+            echo "✓ data folder backed up"
           fi
 
-      - name: Build Docker image
-        run: |
-          docker build -t discord-vn-club-bot .
+          if [ -f ~/bots/hikaru/hikaru_bot.log ]; then
+            cp ~/bots/hikaru/hikaru_bot.log "$BACKUP_DIR/hikaru_bot.log.backup"
+            echo "✓ log file backed up"
+          fi
 
-      - name: Run Docker container
+          echo "=== DATA PROTECTION COMPLETE ==="
+
+      - name: Deploy Code
         run: |
+          echo "=== DEPLOYING CODE ==="
+
+          mkdir -p ~/bots/hikaru/data
+
+          # Sync new code, preserving data and log
+          rsync -av --exclude='data/' --exclude='hikaru_bot.log' --exclude='.env' . ~/bots/hikaru/
+
+          # Write .env from GitHub secrets/vars
+          printf '%s\n' \
+            "TOKEN=${TOKEN}" \
+            "COMMAND_PREFIX=${COMMAND_PREFIX}" \
+            "PATH_TO_DB=${PATH_TO_DB}" \
+            "AUTHORIZED_USERS=${AUTHORIZED_USERS}" \
+            "DB_BACKUP_CHANNEL=${DB_BACKUP_CHANNEL}" \
+            "VN_MANAGER_USER_IDS=${VN_MANAGER_USER_IDS}" \
+            "VN_MANAGER_ROLE_IDS=${VN_MANAGER_ROLE_IDS}" \
+            > ~/bots/hikaru/.env
+
+          # Ensure log file exists
+          touch ~/bots/hikaru/hikaru_bot.log
+
+          # Verify data directory exists
+          if [ ! -d ~/bots/hikaru/data ]; then
+            echo "❌ CRITICAL: data folder missing!"
+            exit 1
+          fi
+          echo "✓ data folder preserved"
+
+          echo "=== DEPLOYMENT COMPLETE ==="
+
+      - name: Rebuild and Restart
+        run: |
+          cd ~/bots/hikaru
+
+          docker compose down || true
+          docker compose build
           docker compose up -d
+
+          # Verify container is running
+          sleep 5
+          if docker compose ps | grep -q "Up"; then
+            echo "✓ Hikaru is running"
+          else
+            echo "❌ Hikaru failed to start! Checking logs..."
+            docker compose logs --tail=50
+            exit 1
+          fi
+
+          echo "=== DEPLOYMENT COMPLETE ==="
 
       - name: Clean up unused Docker images
         run: |
