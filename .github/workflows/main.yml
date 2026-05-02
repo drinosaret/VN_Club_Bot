@@ -41,6 +41,31 @@ jobs:
             echo "✓ log file backed up"
           fi
 
+          # Rotate: keep only the 5 most recent deploy-created backups so
+          # the backup directory doesn't grow unbounded.
+          # Glob: hikaru_[0-9]* matches the deploy's hikaru_YYYYMMDD_*
+          # naming exactly, so any manually-named backup (e.g.
+          # hikaru_pre_migration) is never touched, and entries under any
+          # other prefix are not matched.
+          # ls -1dt sorts by mtime newest-first; tail -n +6 skips the
+          # first 5 so only the 6th-and-older are deleted.
+          # || true: GitHub Actions runs bash with -eo pipefail; if the
+          # glob ever yields zero matches, ls exits non-zero and pipefail
+          # would crash the step. The trailing || true makes that case a
+          # no-op (OLD_BACKUPS stays empty, else-branch runs).
+          # xargs -d '\n': split only on newlines so paths with spaces
+          # (none in our naming, but defensive) aren't accidentally
+          # split-deleted.
+          KEEP=5
+          OLD_BACKUPS=$(ls -1dt ~/backups/hikaru_[0-9]* 2>/dev/null | tail -n +$((KEEP+1)) || true)
+          if [ -n "$OLD_BACKUPS" ]; then
+            REMOVED=$(echo "$OLD_BACKUPS" | wc -l)
+            echo "$OLD_BACKUPS" | xargs -d '\n' rm -rf
+            echo "✓ Rotated: kept $KEEP most recent, removed $REMOVED older"
+          else
+            echo "✓ Rotation: no backups beyond cap of $KEEP"
+          fi
+
           echo "=== DATA PROTECTION COMPLETE ==="
 
       - name: Deploy Code
