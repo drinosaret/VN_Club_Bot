@@ -1,5 +1,6 @@
 """Utility client for VNDB's JSON API."""
 
+import asyncio
 import aiohttp
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -21,12 +22,16 @@ class VNDBClient:
 
     async def __aenter__(self):
         """Async context manager entry"""
+        # Tight timeout because this client is hit from autocomplete handlers,
+        # which have to ack within Discord's 3s budget. 8s total leaves the
+        # caller room to format results; 5s connect bound caps DNS/handshake
+        # stalls. Total<30s avoids exceeding the original budget on slow paths.
         self.session = aiohttp.ClientSession(
             headers={
                 "User-Agent": f"{self.client_name}/{self.client_version}",
                 "Content-Type": "application/json"
             },
-            timeout=aiohttp.ClientTimeout(total=30)
+            timeout=aiohttp.ClientTimeout(total=8, connect=5)
         )
         return self
 
@@ -53,7 +58,11 @@ class VNDBClient:
                         history=response.history,
                         status=response.status
                     )
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # aiohttp's `total` timeout fires plain asyncio.TimeoutError,
+            # which is not a ClientError subclass — without catching it,
+            # the autocomplete path silently hangs the full timeout
+            # window every time VNDB stalls.
             logger.error(f"Network error when contacting VNDB: {e}")
             raise
 

@@ -11,11 +11,23 @@ _log = logging.getLogger(__name__)
 class DatabasePoster(commands.Cog):
     def __init__(self, bot: VNClubBot):
         self.bot = bot
-        self.target_channel_id = int(os.getenv("DB_BACKUP_CHANNEL"))
-        self.post_database.start()
+        # `DB_BACKUP_CHANNEL` is optional. Missing/blank/non-numeric/0 disables
+        # the feature instead of crashing cog load. The README documents `=0`
+        # as the explicit "off" value.
+        raw = os.getenv("DB_BACKUP_CHANNEL", "").strip()
+        try:
+            self.target_channel_id = int(raw) if raw else 0
+        except ValueError:
+            _log.warning("DB_BACKUP_CHANNEL=%r is not a valid integer — backups disabled", raw)
+            self.target_channel_id = 0
+        if self.target_channel_id:
+            self.post_database.start()
+        else:
+            _log.info("DB_BACKUP_CHANNEL unset/0 — database backup loop disabled")
 
     def cog_unload(self):
-        self.post_database.cancel()
+        if self.target_channel_id:
+            self.post_database.cancel()
 
     async def send_backup(self, backup_type: str = "Daily") -> bool:
         """Send a database backup to the target channel.
@@ -50,13 +62,15 @@ class DatabasePoster(commands.Cog):
             )
             return True
 
-        except Exception as e:
-            _log.error(f"Failed to post {backup_type.lower()} database backup: {e}")
+        except Exception:
+            _log.exception("Failed to post %s database backup", backup_type.lower())
             return False
 
     @commands.Cog.listener()
     async def on_ready(self):
         """Send a backup immediately when the bot starts/restarts."""
+        if not self.target_channel_id:
+            return
         await self.send_backup("Startup")
 
     @tasks.loop(hours=6)

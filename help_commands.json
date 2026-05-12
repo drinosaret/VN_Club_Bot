@@ -1,74 +1,202 @@
 {
   "commands": [
     {
-      "name": "/finish_vn",
-      "usage": "/finish_vn title:<VN_title> comment:<your_comment> rating:<1-5>",
-      "description": "Mark a Visual Novel as finished and log your completion. This will award you points based on whether it's a current monthly VN or not.",
-      "parameters": "• `title`: Search for a VN by title (type at least 2 characters to search VNDB)\n• `comment`: Your review/thoughts (max 1000 characters)\n• `rating`: Your rating from 1-5 (1=Terrible, 5=Masterpiece)",
-      "example": "/finish_vn title:Muramasa comment:Amazing story! rating:5"
-    },
-    {
-      "name": "/vn_leaderboard",
-      "usage": "/vn_leaderboard [month:<YYYY-MM>] [server:<server_name>]",
-      "description": "Display the leaderboard showing users ranked by their total points earned from reading Visual Novels. Optionally filter by specific month and/or server.",
-      "parameters": "• `month`: Optional - Filter by specific month (e.g., '2025-09')\n• `server`: Optional - Filter by specific server (autocomplete available)",
-      "example": "/vn_leaderboard month:2025-09"
-    },
-    {
-      "name": "/vn_server_leaderboard",
-      "usage": "/vn_server_leaderboard",
-      "description": "Display server-specific leaderboards showing the top servers ranked by total points, with the top 5 contributors from each server.",
-      "parameters": "No parameters required.",
-      "example": "/vn_server_leaderboard"
-    },
-    {
-      "name": "/profile",
-      "usage": "/profile [user:<@user or user_id>]",
-      "description": "View comprehensive user statistics including total points, VN completions, monthly entries, most active server, and recent activity chart. You can use a mention or user ID (works even for users not in the server).",
-      "parameters": "• `user`: Optional - The user whose profile you want to view (defaults to yourself)",
-      "example": "/profile user:@JohnDoe"
+      "name": "/finish",
+      "category": "reading",
+      "short_description": "Log a VN as finished. Awards more points if it's in the active server pool.",
+      "usage": "/finish title:<title> comment:<your_comment> rating:<1-5>",
+      "description": "Mark a VN as finished and log your completion. Awards more points if the VN is currently in this server's pool (monthly/seasonal/special). The reward_reason recorded on the log reflects the kind: 'As Monthly VN', 'As Seasonal VN', 'As Special VN', or 'As Normal VN' (not in pool / outside its active window). The exact completion timestamp is recorded. You can log the same VN again in a different month for re-reads — only same-month duplicates are rejected.",
+      "parameters": "• `title`: Search for a VN by title (type at least 2 characters to search VNDB)\n• `comment`: Your review/thoughts (max 2000 characters)\n• `rating`: Your rating from 1-5 (1=Terrible, 5=Masterpiece)",
+      "example": "/finish title:Muramasa comment:Amazing story! rating:5"
     },
     {
       "name": "/logs",
+      "category": "reading",
+      "short_description": "View reading history for yourself or another user.",
       "usage": "/logs [user:<@user or user_id>]",
       "description": "View reading logs for yourself or another user. Shows all completed VNs, ratings, comments, and points earned. You can use a mention or user ID (works even for users not in the server).",
       "parameters": "• `user`: Optional - The user whose logs you want to view (defaults to yourself)",
       "example": "/logs user:@JohnDoe"
     },
     {
-      "name": "/ratings",
-      "usage": "/ratings title:<VN_title>",
-      "description": "View ratings and comments for a specific VN from all users who have rated it.",
-      "parameters": "• `title`: Search for a VN by title (type at least 2 characters to search VNDB)",
-      "example": "/ratings title:Muramasa"
+      "name": "/log_edit",
+      "category": "reading",
+      "short_description": "Edit the comment or rating on a reading log.",
+      "usage": "/log_edit log_id:<log_id> [comment:<new_comment>] [rating:<1-5>]",
+      "description": "Edit the comment or rating on a reading log. You can edit your own logs; admins can edit any user's log.",
+      "parameters": "• `log_id`: The ID of the log to edit (autocomplete shows your logs)\n• `comment`: Optional - New comment (max 2000 characters)\n• `rating`: Optional - New rating from 1-5",
+      "example": "/log_edit log_id:123 comment:Updated my thoughts! rating:4"
     },
     {
       "name": "/log_undo",
+      "category": "reading",
+      "short_description": "Delete one of your reading logs.",
       "usage": "/log_undo log_id:<log_id>",
       "description": "Delete one of your reading logs. You can only delete your own logs unless you have admin permissions.",
       "parameters": "• `log_id`: The ID of the log to delete (autocomplete shows your logs)",
       "example": "/log_undo log_id:123"
     },
     {
-      "name": "/log_edit",
-      "usage": "/log_edit log_id:<log_id> [comment:<new_comment>] [rating:<1-5>]",
-      "description": "Edit the comment or rating on one of your reading logs. You can only edit your own logs.",
-      "parameters": "• `log_id`: The ID of the log to edit (autocomplete shows your logs)\n• `comment`: Optional - New comment (max 1000 characters)\n• `rating`: Optional - New rating from 1-5",
-      "example": "/log_edit log_id:123 comment:Updated my thoughts! rating:4"
+      "name": "/ratings",
+      "category": "reading",
+      "short_description": "View all user ratings and comments for a specific VN.",
+      "usage": "/ratings title:<VN_title>",
+      "description": "View ratings and comments for a specific VN from all users who have rated it.",
+      "parameters": "• `title`: Search for a VN by title (type at least 2 characters to search VNDB)",
+      "example": "/ratings title:Muramasa"
     },
     {
-      "name": "/vnpool",
-      "usage": "/vnpool",
-      "description": "Display all Visual Novels in the club's database. Current monthly VNs are shown first, followed by others sorted by start date.",
-      "parameters": "No parameters required.",
-      "example": "/vnpool"
+      "name": "/profile",
+      "category": "stats",
+      "short_description": "User stats card image (points, completions, avg rating, badges, activity).",
+      "usage": "/profile [user:<@user or user_id>] [embed:<true|false>]",
+      "description": "View comprehensive user statistics. By default returns an image card (avatar, total points, VN/monthly completions, average rating, most-active server, badges strip showing earned/total + latest 3, 6-month activity chart). Pass `embed:true` to also receive the legacy text embed alongside the image.",
+      "parameters": "• `user`: Optional - The user whose profile you want to view (defaults to yourself)\n• `embed`: Optional - Send the legacy text embed alongside the image card (default: false)",
+      "example": "/profile user:@JohnDoe embed:true"
     },
     {
-      "name": "/get_current_monthly",
-      "usage": "/get_current_monthly",
-      "description": "Show detailed information about the current month's featured Visual Novels, including points, descriptions, and VNDB links.",
-      "parameters": "No parameters required.",
-      "example": "/get_current_monthly"
+      "name": "/badges",
+      "category": "stats",
+      "short_description": "Achievements grid image — 19 badges across 5 categories.",
+      "usage": "/badges [user:<@user or user_id>]",
+      "description": "Show the achievements grid for a user — 19 badges across 5 categories: VOLUME (1/10/25/50/100 VNs finished), POOL PICKS (1/5/12 monthlies in window, 1/4 seasonals in window), ENGAGEMENT (special pick + voter + nominator + tastemaker), SEASON LEADERBOARD (top 10 / podium / champion in completed seasons), and CONSISTENCY (6 / 12 distinct months logged). Computed live from existing logs and votings, so historical reading retroactively counts. Unlocked badges fill with the accent color; locked ones are dimmed. The `/finish` command also announces newly earned badges inline.",
+      "parameters": "• `user`: Optional - whose badges to show (defaults to yourself).",
+      "example": "/badges user:@JohnDoe"
+    },
+    {
+      "name": "/club_stats",
+      "category": "stats",
+      "short_description": "Server-wide stats dashboard image (or global across all servers).",
+      "usage": "/club_stats [scope:<server|global>]",
+      "description": "Server-wide stats dashboard rendered as a 1200x720 image. Shows total points, total completions, unique VNs, active members, rating distribution, top 5 contributors, and a 12-month completion-trend chart. Pass `scope:global` to aggregate across every server hikaru is in.",
+      "parameters": "• `scope`: Optional - `server` (default) for this server only, or `global` for every server combined.",
+      "example": "/club_stats scope:global"
+    },
+    {
+      "name": "/leaderboard",
+      "category": "stats",
+      "short_description": "Top users by total points. Filter by month, season, or server.",
+      "usage": "/leaderboard [month:<YYYY-MM>] [season:<season>] [year:<YYYY>] [server:<server_name>]",
+      "description": "Show the leaderboard ranking users by total points. Filter by month, season (Winter/Spring/Summer/Fall), and/or server. Season boundaries: Winter Jan–Mar, Spring Apr–Jun, Summer Jul–Sep, Fall Oct–Dec.",
+      "parameters": "• `month`: Optional - Filter by specific month (e.g., '2025-09'). Cannot be combined with `season`.\n• `season`: Optional - Filter by season (3-month range). Cannot be combined with `month`.\n• `year`: Optional - Year for the season filter. Defaults to the current calendar year. Requires `season` to be set.\n• `server`: Optional - Filter by specific server (autocomplete available)",
+      "example": "/leaderboard season:Spring year:2025"
+    },
+    {
+      "name": "/server_leaderboard",
+      "category": "stats",
+      "short_description": "Servers ranked by total points, with the top 5 contributors per server.",
+      "usage": "/server_leaderboard [month:<YYYY-MM>] [season:<season>] [year:<YYYY>]",
+      "description": "Show server-specific leaderboards ranking the top servers by total points, with the top 5 contributors from each. Filter by month or by season (3-month range).",
+      "parameters": "• `month`: Optional - Filter by specific month (e.g., '2025-09'). Cannot be combined with `season`.\n• `season`: Optional - Filter by season. Cannot be combined with `month`.\n• `year`: Optional - Year for the season filter. Defaults to the current calendar year. Requires `season` to be set.",
+      "example": "/server_leaderboard season:Winter"
+    },
+    {
+      "name": "/pool",
+      "category": "pool",
+      "short_description": "Browse picks + nominations for a given month with prev/next navigation.",
+      "usage": "/pool [month:<1-12>] [year:<YYYY>] [filter:<all|monthly|seasonal|special|nominations>] [all_servers:<true|false>]",
+      "description": "Browse this server's pool entries for a target month. Defaults to the current month. The pool now holds every entry — admin-curated picks (`[monthly]`/`[seasonal]`/`[special]`) AND user nominations from voting cycles (`[nominating]`/`[voting]`/`[won vote]`/`[lost vote]`). All share one ID space; use `/pool_entry id:N` to drill into any of them. Use the prev/next buttons under the embed to browse other months; the filter and scope persist. Use `all_servers:true` to aggregate across every server (each entry annotated with its source server).",
+      "parameters": "• `month`: Optional - Target month 1-12. Defaults to current month.\n• `year`: Optional - Target year. Defaults to current year.\n• `filter`: Optional - `all` (default), `monthly`, `seasonal`, `special` (status sub-filters for picks), or `nominations` (nominations only).\n• `all_servers`: Optional - Include entries from every server (default: false → this server only).",
+      "example": "/pool month:5 year:2026 filter:nominations"
+    },
+    {
+      "name": "/pool_entry",
+      "category": "pool",
+      "short_description": "Show full detail for a pool entry by ID.",
+      "usage": "/pool_entry id:<int>",
+      "description": "Show full detail for a single pool entry — cover, description, status tag, period, points, voting lineage if applicable, nominator if applicable, and recent completions in this server. Works for any pool entry regardless of status (admin-set picks, active nominations, voting winners, voting losers). Use the autocomplete on `id` to pick from this server's entries.",
+      "parameters": "• `id`: The pool entry ID (autocomplete suggests entries from this server).",
+      "example": "/pool_entry id:5"
+    },
+    {
+      "name": "/monthly",
+      "category": "pool",
+      "short_description": "Banner card for this server's current monthly VN(s).",
+      "usage": "/monthly [embed:<true|false>]",
+      "description": "Post a banner card for this server's current `monthly`-kind pool entries (seasonal/special picks live in the pool but aren't shown here — see `/seasonal`). The 1200x480 image shows cover, title, length, total characters, difficulty, VNDB score, unique kanji, dialogue %, and chars/day for the full month, with VNDB and jiten.moe link buttons attached. Pass `embed:true` to switch to the legacy text embed instead.",
+      "parameters": "• `embed`: Optional - Switch to the legacy text embed instead of the banner image (default: false → banner)",
+      "example": "/monthly embed:true"
+    },
+    {
+      "name": "/seasonal",
+      "category": "pool",
+      "short_description": "Banner card for this server's current seasonal VN(s).",
+      "usage": "/seasonal [embed:<true|false>]",
+      "description": "Post a banner card for this server's current `seasonal`-kind pool entries. Same visual as /monthly but the eyebrow reads VN OF THE SEASON, the period label shows the season (e.g., 'Spring 2026'), and chars/day is computed across the full 3-month season. VNDB and jiten.moe link buttons attached. Pass `embed:true` to switch to the legacy text embed instead.",
+      "parameters": "• `embed`: Optional - Switch to the legacy text embed instead of the banner image (default: false → banner)",
+      "example": "/seasonal"
+    },
+    {
+      "name": "/season_overview",
+      "category": "pool",
+      "short_description": "Composite image: seasonal banner on top + each month's monthly picks.",
+      "usage": "/season_overview [season:<season>] [year:<YYYY>]",
+      "description": "Composite image for a whole season — the seasonal VN banner on top, then a 3-cell strip below listing each month's monthly VN(s). Multiple monthlies in the same month stack inside the cell. Defaults to the current season; pass `season` (+ optional `year`) to overview a different period. Falls back to a text response if no seasonal pick is set for the period. VNDB + jiten.moe buttons attached for the seasonal pick.",
+      "parameters": "• `season`: Optional - Winter / Spring / Summer / Fall. Defaults to the current season.\n• `year`: Optional - Year for the season. Defaults to the current calendar year. Requires `season` to be set.",
+      "example": "/season_overview season:Spring year:2026"
+    },
+    {
+      "name": "/nominate",
+      "category": "voting",
+      "short_description": "Nominate a VN for an upcoming monthly or seasonal voting.",
+      "usage": "/nominate title:<title> [status:<monthly|seasonal>] [target_month:<YYYY-MM>]",
+      "description": "Nominate a VN for an upcoming vote in this server. Nominations are persistent — you don't need an active voting cycle to nominate. One nomination per user per target month. Monthly and seasonal voting are tracked separately — pick which series via `status` (default: monthly). When an admin opens voting from `/manage_voting`, every nomination matching the target month gets swept onto that vote. The nomination becomes pool entry #N (visible in /pool); use /pool_entry id:N for full detail.",
+      "parameters": "• `title`: Search for a VN by title (type at least 2 characters to search VNDB)\n• `status`: Optional - `monthly` (default) or `seasonal`. Selects which voting series this nomination targets.\n• `target_month`: Optional - YYYY-MM (default: next month for monthly / next season for seasonal).",
+      "example": "/nominate status:seasonal title:Subarashiki Hibi"
+    },
+    {
+      "name": "/vote",
+      "category": "voting",
+      "short_description": "Open a personal voting menu for the active vote(s) in this server.",
+      "usage": "/vote",
+      "description": "Opens an ephemeral copy of the public vote message — same nominees, same controls, same role gates — scoped to whichever guild you ran the command in. Useful when the public vote message has scrolled off, or when the bot is in multiple servers and you want to make sure you're voting on the right cycle. Both monthly and seasonal active votes appear if both exist. You can also vote by clicking buttons on the public vote message.",
+      "parameters": "_(none — the menu shows whichever cycles are active in this server.)_",
+      "example": "/vote"
+    },
+    {
+      "name": "/manage_pool",
+      "category": "admin",
+      "short_description": "Admin: add, edit, or remove pool entries.",
+      "usage": "/manage_pool action:<add|edit|remove> title:<title-or-pool-id> [start_month:<YYYY-MM>] [end_month:<YYYY-MM>] [points:<int>] [status:<monthly|seasonal|special>] [guild_id:<int|NULL>]",
+      "description": "Admin-only. Manage this server's curated pool. The `title` autocomplete is action-aware: searches VNDB on add, lists existing pool entries (with their pool IDs) on edit/remove. Each pool entry has a unique pool ID (visible in `/pool` and `/pool_entry`). For edit, any field omitted stays unchanged; pass `guild_id:NULL` to clear to legacy-global state, or an integer to set a specific guild. The bot edits one row at a time — bulk reassignments are out of scope here.",
+      "parameters": "• `action`: `add`, `edit`, or `remove`\n• `title`: Search for a VN — autocomplete switches based on action.\n• `start_month`: (add/edit) Active window start. YYYY-MM.\n• `end_month`: (add/edit) Active window end. YYYY-MM.\n• `points`: (add/edit) Points awarded during the active window. Default 10 on add.\n• `status`: (add/edit) Pool kind: `monthly` (default), `seasonal`, or `special`.\n• `guild_id`: (edit) New guild_id for the row — integer or `NULL` to clear.",
+      "example": "/manage_pool action:edit title:#5 points:25 status:seasonal"
+    },
+    {
+      "name": "/manage_voting",
+      "category": "admin",
+      "short_description": "Admin: open the voting dashboard (manage cycles + settings).",
+      "usage": "/manage_voting",
+      "description": "Admin-only. Opens an ephemeral dashboard panel showing both monthly and seasonal cycle state with state-aware action buttons. From the panel: open voting (modal collects target_month / choice_mode / winner_count / duration), post the vote message in the current channel, close voting, cancel voting, and configure guild-wide defaults (default voting role, default vote UI). Monthly and seasonal cycles run independently — the panel surfaces both. Closing voting auto-promotes the winner(s) into the pool with the matching status (monthly/seasonal) and posts a banner.",
+      "parameters": "_(none — the dashboard collects every input through the panel and modals.)_",
+      "example": "/manage_voting"
+    },
+    {
+      "name": "/manage_reward_points",
+      "category": "admin",
+      "short_description": "Admin: manually award (or deduct) points to a user.",
+      "usage": "/manage_reward_points member:<@user> points:<int> reason:<text>",
+      "description": "Admin-only. Manually award points to a user — useful for events, read-alongs, or correcting missed completions. The reward shows up in the user's logs with the supplied reason.",
+      "parameters": "• `member`: The user to reward.\n• `points`: How many points to grant (integer; can be negative to deduct).\n• `reason`: Free-text reason recorded on the log entry.",
+      "example": "/manage_reward_points member:@JohnDoe points:50 reason:Won read-along contest"
+    },
+    {
+      "name": "/manage_log",
+      "category": "admin",
+      "short_description": "Admin: record a VN completion on behalf of another user.",
+      "usage": "/manage_log member:<@user> title:<VN_title> rating:<1-5> comment:<text> [reward_month:<YYYY-MM>] [points:<int>]",
+      "description": "Admin-only. Backfill a reading log on behalf of another user — for cases where they completed a VN but didn't run /finish themselves. Defaults reward_month to the current month and computes points the same way /finish does (pool-window match awards the configured monthly points; otherwise the not-monthly fallback). Pass explicit `points` to override. The same VN can be logged for the same user in different reward_months (re-reads); only same-month duplicates are rejected — use /log_edit if you meant to update an existing log instead.",
+      "parameters": "• `member`: The user to log a completion for.\n• `title`: Search for a VN by title (autocomplete).\n• `rating`: 1-5 (1=Terrible, 5=Masterpiece).\n• `comment`: The comment/review text (max 2000 chars).\n• `reward_month`: Optional override (YYYY-MM). Defaults to current month.\n• `points`: Optional override. Defaults to the same calculation /finish uses.",
+      "example": "/manage_log member:@JohnDoe title:Muramasa rating:5 comment:Backfilled their completion from last week"
+    },
+    {
+      "name": "/help",
+      "category": "help",
+      "short_description": "Show this command list. Pass `command:<name>` for full detail.",
+      "usage": "/help [command:<command_name>]",
+      "description": "Show the command list. By default renders a compact, categorized view with a dropdown for picking a single command's full detail. Pass `command:<name>` to jump straight to that command's detail view.",
+      "parameters": "• `command`: Optional - The specific command to show full detail for (autocomplete available).",
+      "example": "/help command:finish"
     }
   ]
 }

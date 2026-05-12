@@ -28,9 +28,36 @@
 import re
 
 
+def _absolutize_vndb_url(url: str) -> str:
+    """Promote a VNDB-relative URL to an absolute one. Discord only renders
+    `[text](url)` as a clickable link when the URL is absolute — relative
+    paths like `/c161706` (VNDB cross-references to characters, VNs, etc.)
+    are shown as literal text otherwise.
+    """
+    if url.startswith("/"):
+        return "https://vndb.org" + url
+    return url
+
+
 def replace_url(text: str) -> str:
-    # Convert [url=LINK]TEXT[/url] to [TEXT](LINK)
-    return re.sub(r"\[url=(.*?)\](.*?)\[/url\]", r"[\2](\1)", text)
+    """Convert VNDB BBCode `[url=LINK]TEXT[/url]` into Discord markdown
+    `[TEXT](LINK)`, absolutizing any relative VNDB URLs in the process."""
+    def repl(m: re.Match) -> str:
+        url = _absolutize_vndb_url(m.group(1))
+        label = m.group(2)
+        return f"[{label}]({url})"
+    return re.sub(r"\[url=(.*?)\](.*?)\[/url\]", repl, text)
+
+
+def replace_relative_md_links(text: str) -> str:
+    """Catch already-markdown-formatted links with relative VNDB targets
+    (e.g. `[Houzuki Enju](/c161706)`) and absolutize them. The VNDB API
+    has been observed emitting these directly, in addition to BBCode."""
+    return re.sub(
+        r"(\[[^\]]+\]\()(/[a-z]\d[\w./?#=&%-]*)(\))",
+        lambda m: m.group(1) + _absolutize_vndb_url(m.group(2)) + m.group(3),
+        text,
+    )
 
 
 def replace_spoiler(text: str) -> str:
@@ -40,6 +67,7 @@ def replace_spoiler(text: str) -> str:
 
 def replace_bbcode(text: str) -> str:
     text = replace_url(text)
+    text = replace_relative_md_links(text)
     text = replace_spoiler(text)
     return text
 

@@ -1,5 +1,6 @@
 import discord
 import os
+import sys
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
@@ -13,6 +14,17 @@ TOKEN = os.getenv("TOKEN")
 PATH_TO_DB = os.getenv("PATH_TO_DB")
 COG_FOLDER = "cogs"
 LOG_FILE = os.getenv("LOG_FILE", "hikaru_bot.log")
+
+# Fail fast on missing required config so deploy mistakes surface immediately
+# instead of crashing opaquely on the first slash command.
+_missing = [name for name, val in (
+    ("TOKEN", TOKEN),
+    ("COMMAND_PREFIX", COMMAND_PREFIX),
+    ("PATH_TO_DB", PATH_TO_DB),
+) if not val]
+if _missing:
+    print(f"FATAL: missing required env vars: {', '.join(_missing)}", file=sys.stderr)
+    sys.exit(1)
 
 my_bot = VNClubBot(
     command_prefix=COMMAND_PREFIX, cog_folder=COG_FOLDER, path_to_db=PATH_TO_DB

@@ -29,6 +29,12 @@ GROUP BY user_id;
 """
 
 
+# Configured reward role_ids we've already warned about being missing from
+# the guild. Mirrors the _missing_guilds_warned pattern below — a deleted
+# or renamed reward role shouldn't spam the log every 5 minutes.
+_missing_roles_warned: set[int] = set()
+
+
 async def determine_correct_role(
     member: discord.Member, total_points: int
 ) -> discord.Role | None:
@@ -37,7 +43,19 @@ async def determine_correct_role(
         REWARD_STRUCTURE[member.guild.id].items(), reverse=True
     ):
         if total_points >= points_threshold:
-            return member.guild.get_role(role_id)
+            role = member.guild.get_role(role_id)
+            if role is None:
+                if role_id not in _missing_roles_warned:
+                    _log.warning(
+                        "role_reward: configured role_id=%s not found in guild=%s "
+                        "(deleted/renamed?); users at this threshold will be skipped",
+                        role_id, member.guild.id,
+                    )
+                    _missing_roles_warned.add(role_id)
+                continue
+            _missing_roles_warned.discard(role_id)
+            return role
+    return None
 
 
 async def remove_other_roles(member: discord.Member, role_to_keep: discord.Role):
@@ -58,6 +76,11 @@ async def remove_other_roles(member: discord.Member, role_to_keep: discord.Role)
 class RoleRewards(commands.Cog):
     def __init__(self, bot: VNClubBot):
         self.bot = bot
+        # Guild IDs we've already logged a "not found" warning for in this
+        # process lifetime. The configured REWARD_STRUCTURE is a deployment
+        # constant; if a guild isn't reachable on startup, repeating the
+        # warning every 5 minutes just buries real signal in noise.
+        self._missing_guilds_warned: set[int] = set()
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -78,8 +101,16 @@ class RoleRewards(commands.Cog):
             for guild_id in REWARD_STRUCTURE:
                 guild = self.bot.get_guild(guild_id)
                 if not guild:
-                    _log.warning(f"Guild {guild_id} not found, skipping rewards check.")
+                    if guild_id not in self._missing_guilds_warned:
+                        _log.warning(
+                            "Guild %s not found, skipping rewards check (won't repeat this warning).",
+                            guild_id,
+                        )
+                        self._missing_guilds_warned.add(guild_id)
                     continue
+                # Re-arm the warning if the guild becomes reachable again
+                # (e.g. after a reconnect or re-invite mid-run).
+                self._missing_guilds_warned.discard(guild_id)
 
                 for user_id in data:
                     user = guild.get_member(user_id)
@@ -90,13 +121,32 @@ class RoleRewards(commands.Cog):
                     role_to_keep = await determine_correct_role(user, total_points)
                     if role_to_keep and role_to_keep not in user.roles:
                         _log.info(
-                            f"Assigning role {role_to_keep.name} to {user.display_name}."
+                            "role_reward: assigning role=%s (id=%s) to user=%s (id=%s) guild=%s points=%s",
+                            role_to_keep.name, role_to_keep.id,
+                            user.display_name, user.id, guild_id, total_points,
                         )
-                        await remove_other_roles(user, role_to_keep)
-                        await user.add_roles(role_to_keep, reason="Role reward update")
+                        # Per-user try/except: a Forbidden / role-hierarchy
+                        # failure on one user must not abort the rest of
+                        # the loop. The outer except below still catches
+                        # anything raised by the bot.GET or the per-guild
+                        # bookkeeping, which is what "task wedged" looks like.
+                        try:
+                            await remove_other_roles(user, role_to_keep)
+                            await user.add_roles(role_to_keep, reason="Role reward update")
+                        except discord.Forbidden:
+                            _log.exception(
+                                "role_reward: forbidden assigning role=%s to user=%s "
+                                "guild=%s (bot lacks Manage Roles or hierarchy?)",
+                                role_to_keep.id, user.id, guild_id,
+                            )
+                        except Exception:
+                            _log.exception(
+                                "role_reward: failed to assign role=%s to user=%s guild=%s",
+                                role_to_keep.id, user.id, guild_id,
+                            )
 
-        except Exception as e:
-            _log.error(f"Error in check_rewards task: {e}")
+        except Exception:
+            _log.exception("Error in check_rewards task")
 
 
 async def setup(bot: VNClubBot):

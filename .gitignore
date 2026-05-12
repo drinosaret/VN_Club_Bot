@@ -13,3 +13,6 @@ run.bat
 reference
 *.log
 tests
+pytest.ini
+requirements-dev.txt
+docs

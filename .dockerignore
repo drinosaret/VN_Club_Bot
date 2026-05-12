@@ -1,2 +1,40 @@
+# Runtime state — mounted as a volume, never copied into the image.
 data/
 data/*
+
+# Local secrets — the workflow writes a fresh .env on the host;
+# `COPY . .` would otherwise bake whatever the dev had locally into
+# the image layer cache.
+.env
+.env.*
+
+# Logs — image starts fresh; touching them here would mask host state.
+*.log
+
+# Python build/cache artifacts.
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# Repo metadata that isn't needed at runtime.
+.git/
+.github/
+.gitignore
+
+# Test suite — gitignored, never shipped; defensive in case it ever
+# lands in the build context.
+tests/
+pytest.ini
+requirements-dev.txt
+
+# Reference/legacy code kept for reading, not running.
+reference/
+
+# Docs and planning artifacts.
+docs/
+plans/
+*.md
+!README.md

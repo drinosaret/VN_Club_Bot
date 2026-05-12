@@ -3,4 +3,4 @@ python-dotenv
 aiosqlite
 aiohttp
 pyyaml
-requests
+Pillow

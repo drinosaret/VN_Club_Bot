@@ -12,8 +12,6 @@ env:
   PATH_TO_DB: ${{ vars.PATH_TO_DB }}
   AUTHORIZED_USERS: ${{ vars.AUTHORIZED_USERS }}
   DB_BACKUP_CHANNEL: ${{ vars.DB_BACKUP_CHANNEL }}
-  VN_MANAGER_USER_IDS: ${{ vars.VN_MANAGER_USER_IDS }}
-  VN_MANAGER_ROLE_IDS: ${{ vars.VN_MANAGER_ROLE_IDS }}
 
 jobs:
   deploy:
@@ -77,15 +75,17 @@ jobs:
           # Sync new code, preserving data and log
           rsync -av --exclude='data/' --exclude='hikaru_bot.log' --exclude='.env' . ~/bots/hikaru/
 
-          # Write .env from GitHub secrets/vars
-          printf '%s\n' \
-            "TOKEN=${TOKEN}" \
-            "COMMAND_PREFIX=${COMMAND_PREFIX}" \
-            "PATH_TO_DB=${PATH_TO_DB}" \
-            "AUTHORIZED_USERS=${AUTHORIZED_USERS}" \
-            "DB_BACKUP_CHANNEL=${DB_BACKUP_CHANNEL}" \
-            "VN_MANAGER_USER_IDS=${VN_MANAGER_USER_IDS}" \
-            "VN_MANAGER_ROLE_IDS=${VN_MANAGER_ROLE_IDS}" \
+          # Write .env from GitHub secrets/vars.
+          # Use printf format args (not pre-built "KEY=VALUE" strings) so a
+          # value containing a literal newline is written as-is on a single
+          # quoted line by printf — it can't spill onto a subsequent line
+          # and forge a different KEY=VALUE entry.
+          printf 'TOKEN=%s\nCOMMAND_PREFIX=%s\nPATH_TO_DB=%s\nAUTHORIZED_USERS=%s\nDB_BACKUP_CHANNEL=%s\n' \
+            "${TOKEN}" \
+            "${COMMAND_PREFIX}" \
+            "${PATH_TO_DB}" \
+            "${AUTHORIZED_USERS}" \
+            "${DB_BACKUP_CHANNEL}" \
             > ~/bots/hikaru/.env
 
           # Ensure log file exists
@@ -108,9 +108,11 @@ jobs:
           docker compose build
           docker compose up -d
 
-          # Verify container is running
+          # Verify container is running. Match both "Up" (compose v1)
+          # and "running" (compose v2) so the check works on either
+          # runner version without false-negatives.
           sleep 5
-          if docker compose ps | grep -q "Up"; then
+          if docker compose ps | grep -qE "Up|running"; then
             echo "✓ Hikaru is running"
           else
             echo "❌ Hikaru failed to start! Checking logs..."

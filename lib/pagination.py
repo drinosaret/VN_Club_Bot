@@ -57,12 +57,29 @@ class BasePaginationView(discord.ui.View, ABC):
         self.next_page.disabled = True
         self.last_page.disabled = True
 
+    async def _navigate(self, interaction: discord.Interaction, action: str):
+        """Shared edit_message wrapper. A discord.HTTPException here (rate
+        limit, deleted source message, expired interaction token) would
+        otherwise propagate to discord.py's silent default and the user
+        would see a frozen pager — log enough context to debug after the
+        fact."""
+        try:
+            await interaction.response.edit_message(
+                embed=self.create_embed(), view=self,
+            )
+        except Exception:
+            _log.exception(
+                "pagination edit_message failed: view=%s action=%s page=%d/%d user=%s",
+                type(self).__name__, action,
+                self.current_page + 1, self.max_pages, interaction.user.id,
+            )
+
     @discord.ui.button(label='⏪', style=discord.ButtonStyle.secondary)
     async def first_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Go to first page"""
         self.current_page = 0
         self._update_button_states()
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        await self._navigate(interaction, "first")
 
     @discord.ui.button(label='◀️', style=discord.ButtonStyle.secondary)
     async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -70,7 +87,7 @@ class BasePaginationView(discord.ui.View, ABC):
         if self.current_page > 0:
             self.current_page -= 1
             self._update_button_states()
-            await interaction.response.edit_message(embed=self.create_embed(), view=self)
+            await self._navigate(interaction, "previous")
 
     @discord.ui.button(label='▶️', style=discord.ButtonStyle.secondary)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -78,14 +95,14 @@ class BasePaginationView(discord.ui.View, ABC):
         if self.current_page < self.max_pages - 1:
             self.current_page += 1
             self._update_button_states()
-            await interaction.response.edit_message(embed=self.create_embed(), view=self)
+            await self._navigate(interaction, "next")
 
     @discord.ui.button(label='⏩', style=discord.ButtonStyle.secondary)
     async def last_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Go to last page"""
         self.current_page = self.max_pages - 1
         self._update_button_states()
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        await self._navigate(interaction, "last")
 
     async def on_timeout(self):
         """Disable all buttons when the view times out"""

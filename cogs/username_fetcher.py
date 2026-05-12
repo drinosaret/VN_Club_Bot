@@ -47,8 +47,8 @@ async def get_username_db(bot: VNClubBot, user_id: int) -> str:
         except discord.NotFound:
             _log.warning(f"User {user_id} not found on Discord")
             return "Unknown User"
-        except discord.HTTPException as e:
-            _log.error(f"HTTP error fetching user {user_id}: {e}")
+        except discord.HTTPException:
+            _log.exception("HTTP error fetching user %s", user_id)
             return "Unknown User"
 
 
