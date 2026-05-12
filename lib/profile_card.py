@@ -62,7 +62,7 @@ class ProfileCardGenerator:
     #   header (eyebrow + name + subtitle)        ~  170*S
     #   stats grid                                  ~  120*S
     #   gap                                            12*S
-    #   STANDING panel (rank + opt voting + badges) ~  108*S
+    #   STANDING panel (rank + voting slot + badges) ~ 134*S
     #   gap                                            12*S
     #   activity callout                              100*S
     #     ├─ eyebrow band                             24*S
@@ -72,7 +72,7 @@ class ProfileCardGenerator:
     #     ├─ bar area                                 30*S
     #     └─ month-label band                         22*S
     #   bottom hairline margin                       ~30*S
-    BANNER_HEIGHT = 604 * SCALE
+    BANNER_HEIGHT = 630 * SCALE
 
     AVATAR_SIZE = 240 * SCALE
     AVATAR_X = 60 * SCALE
