@@ -1318,10 +1318,11 @@ class VNTitleManagement(commands.Cog):
                 inline=False,
             )
         if nominator_user_id:
-            user = self.bot.get_user(nominator_user_id)
+            # Always-mention so rendering doesn't depend on the bot's
+            # user cache; allowed_mentions=none() prevents pings.
             embed.add_field(
                 name="Nominated by",
-                value=f"@{user.name}" if user else f"<@{nominator_user_id}>",
+                value=f"<@{nominator_user_id}>",
                 inline=True,
             )
         if vn_info and getattr(vn_info, "thumbnail_url", None):
@@ -1530,10 +1531,8 @@ class VNTitleManagement(commands.Cog):
                 else f" · {period}"
             )
             if status == "nominated":
-                user = bot.get_user(nominator_user_id) if nominator_user_id else None
                 nominator = (
-                    f"@{user.name}" if user
-                    else (f"<@{nominator_user_id}>" if nominator_user_id else "unknown")
+                    f"<@{nominator_user_id}>" if nominator_user_id else "unknown"
                 )
                 # Monthly vs seasonal is implicit in the section header
                 # the row is rendered under, so we don't repeat it here.

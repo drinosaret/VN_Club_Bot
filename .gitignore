@@ -16,3 +16,4 @@ tests
 pytest.ini
 requirements-dev.txt
 docs
+scripts
