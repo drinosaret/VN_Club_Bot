@@ -11,7 +11,7 @@ from lib.utils import (
     format_rating_display,
     create_vndb_link,
     truncate_text,
-    MAX_EMBED_FIELD
+    MAX_EMBED_DESCRIPTION
 )
 from lib.monthly_banner import format_length_tier
 from lib.vndb_api import VN_Entry
@@ -77,11 +77,8 @@ class EmbedBuilder:
         if not vn_info.thumbnail_is_nsfw and vn_info.thumbnail_url:
             embed.set_thumbnail(url=vn_info.thumbnail_url)
 
-        embed.add_field(
-            name="Comment",
-            value=truncate_text(comment, MAX_EMBED_FIELD),
-            inline=False
-        )
+        header = "**Comment**\n"
+        embed.description = header + truncate_text(comment, MAX_EMBED_DESCRIPTION - len(header))
 
         embed.set_footer(text=f"⭐ {rating}/5 • +{points_earned:,} pts • Log #{log_id}")
         embed.timestamp = discord.utils.utcnow()
