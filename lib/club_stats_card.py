@@ -235,7 +235,7 @@ def render_club_stats(
     )
     draw.text(
         (trend_box[0] + 22 * S, trend_box[1] + 12 * S),
-        "MONTHLY ACTIVITY  •  LAST 12 MONTHS",
+        "MONTHLY COMPLETIONS  •  LAST 12 MONTHS",
         fill=ACCENT, font=font_panel_eyebrow,
     )
 

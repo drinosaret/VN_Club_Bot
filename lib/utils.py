@@ -923,10 +923,11 @@ class DatabaseQueries:
     
     GET_USER_MOST_ACTIVE_SERVER = """
     SELECT logged_in_guild, COUNT(*) as entry_count
-    FROM reading_logs 
+    FROM reading_logs
     WHERE user_id = ? AND logged_in_guild IS NOT NULL
-    GROUP BY logged_in_guild 
-    ORDER BY entry_count DESC 
+      AND vndb_id IS NOT NULL
+    GROUP BY logged_in_guild
+    ORDER BY entry_count DESC
     LIMIT 1;
     """
     
@@ -1036,7 +1037,7 @@ class DatabaseQueries:
     # with total_points (the real "club output" the leaderboard is built on).
     CLUB_STATS_TOTALS = """
     SELECT
-        COUNT(*) AS total_completions,
+        COUNT(CASE WHEN vndb_id IS NOT NULL THEN 1 END) AS total_completions,
         COUNT(DISTINCT vndb_id) AS unique_vns,
         COUNT(DISTINCT user_id) AS active_members,
         COALESCE(SUM(points), 0) AS total_points
@@ -1045,7 +1046,8 @@ class DatabaseQueries:
     """
 
     CLUB_STATS_TOP_CONTRIBUTORS = """
-    SELECT user_id, SUM(points) AS total_points, COUNT(*) AS completions
+    SELECT user_id, SUM(points) AS total_points,
+           COUNT(CASE WHEN vndb_id IS NOT NULL THEN 1 END) AS completions
     FROM reading_logs
     WHERE (? IS NULL OR logged_in_guild = ?)
     GROUP BY user_id
@@ -1066,6 +1068,7 @@ class DatabaseQueries:
     SELECT reward_month, COUNT(*)
     FROM reading_logs
     WHERE (? IS NULL OR logged_in_guild = ?)
+      AND vndb_id IS NOT NULL
     GROUP BY reward_month
     ORDER BY reward_month DESC
     LIMIT 12;

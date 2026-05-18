@@ -558,7 +558,7 @@ class ProfileCardGenerator:
         # info rather than fading into the background.
         draw.text(
             (text_x, box[1] + 80 * S),
-            f"{count:,} completion(s)",
+            f"{count:,} {'completion' if count == 1 else 'completions'} here",
             fill=self.INK_SECONDARY, font=font_count,
         )
 
