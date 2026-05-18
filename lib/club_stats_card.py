@@ -227,14 +227,10 @@ def render_club_stats(
     trend_box = (inner_x, trend_top, inner_x + inner_w, trend_top + trend_h)
     paste_aa_rounded(
         img, trend_box, radius=12 * S, fill=PANEL_BG, outline=None,
-    )
-    bar_strip_x = trend_box[0] + 8 * S
-    draw.rectangle(
-        [bar_strip_x, trend_box[1], bar_strip_x + 6 * S, trend_box[3]],
-        fill=ACCENT,
+        left_accent_w=6 * S, left_accent_fill=ACCENT,
     )
     draw.text(
-        (trend_box[0] + 22 * S, trend_box[1] + 12 * S),
+        (trend_box[0] + 18 * S, trend_box[1] + 12 * S),
         "MONTHLY COMPLETIONS  •  LAST 12 MONTHS",
         fill=ACCENT, font=font_panel_eyebrow,
     )

@@ -252,10 +252,16 @@ def format_compact_count(n: Optional[int]) -> str:
 
 def paste_aa_rounded(img: Image.Image, box, radius: int,
                      fill=None, outline=None, outline_w: int = 1,
-                     oversample: int = 4):
+                     oversample: int = 4,
+                     left_accent_w: int = 0, left_accent_fill=None):
     """Draw a rounded rectangle at OVERSAMPLE× resolution and downsample with
     LANCZOS for anti-aliased corners. Pillow's primitives don't AA at
     integer pixels, so this is the standard workaround.
+
+    If ``left_accent_w > 0`` and ``left_accent_fill`` is set, paint a vertical
+    accent stripe of that pixel width along the left edge with the same
+    rounded-corner clipping as the panel — so the stripe's top-left and
+    bottom-left edges follow the panel curve instead of poking past it.
     """
     x0, y0, x1, y1 = box
     w, h = x1 - x0, y1 - y0
@@ -269,6 +275,16 @@ def paste_aa_rounded(img: Image.Image, box, radius: int,
         outline=outline,
         width=outline_w * oversample,
     )
+    if left_accent_w > 0 and left_accent_fill is not None:
+        # Snapshot the rounded mask first; the stripe's sharp rectangle would
+        # otherwise paint into the transparent corner squares. Re-applying the
+        # mask after drawing clips the stripe to the same curve as the panel.
+        mask = layer.split()[3]
+        d.rectangle(
+            [(0, 0), (left_accent_w * oversample - 1, oh - 1)],
+            fill=left_accent_fill,
+        )
+        layer.putalpha(mask)
     layer = layer.resize((w, h), Image.Resampling.LANCZOS)
     img.paste(layer, (x0, y0), layer)
 
