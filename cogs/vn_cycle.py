@@ -188,6 +188,10 @@ VOTE_REMOVE_PREFIX = "vncycle:remove"
 # matches the open_voting refusal threshold (Discord component limits).
 _VOTE_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXY"
 
+# Discord caps embed description at 4096 chars. Leave headroom for the
+# variable header lines (closes_at, allowed_role) we don't always render.
+_VOTE_DESC_BUDGET = 3900
+
 
 class VoteButton(discord.ui.Button):
     def __init__(self, cycle_id: int, nomination_id: int, label: str):
@@ -735,13 +739,16 @@ def _seconds_until(closes_at) -> Optional[float]:
     return (dt - now).total_seconds()
 
 
-async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> str:
-    """Build the live vote-message text with running tally per nominee.
+async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
+    """Build the live vote embed with running tally per nominee.
 
     ``nominees`` is the ordered list (display order = letter labels A, B, …).
     ``tally`` is the row list from TALLY_VOTES — keyed by nomination_id; we
     re-key it here so we can render in nominee display order rather than
     tally order (which is sorted by votes DESC).
+
+    Returns an Embed because 25 nominees of ~145 chars/row overflow Discord's
+    2000-char message-content cap; the 4096-char embed description fits.
 
     Async because seasonal cycles get a "· Season N" suffix on their period
     label that needs a reading_logs lookup.
@@ -758,47 +765,72 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> str:
     votes_by_nom = {row[0]: row[6] for row in tally}
     total_votes = sum(votes_by_nom.values())
 
-    header_lines = [
-        f"🗳️ **{title_lead} - {period_label}**",
+    meta_lines = [
         f"Mode: `{choice_mode}` · Winners: `{winner_count}` · "
         f"Vote ID: `{cycle_row[CYCLE_ID]}`",
     ]
     rel = _format_closes_at_relative(closes_at)
     if rel:
-        header_lines.append(f"⏱ Closes {rel}")
+        meta_lines.append(f"⏱ Closes {rel}")
     allowed_role_id = cycle_row[CYCLE_ALLOWED_ROLE_ID]
     if allowed_role_id:
-        header_lines.append(f"🔒 Allowed role: <@&{allowed_role_id}>")
+        meta_lines.append(f"🔒 Allowed role: <@&{allowed_role_id}>")
 
-    body_lines = []
+    footer_lines = [
+        f"**{total_votes}** total vote(s)",
+        "Tap a button below or use `/vote` for a personal voting menu.",
+    ]
+    footer_text = "\n".join(footer_lines)
+
+    body_lines: list[str] = []
+    # Track running description length so we can stop appending if a
+    # pathological row pushes us toward the 4096 cap. Math: 25 rows of
+    # ~145 chars + meta/footer ~250 chars ≈ 3875 chars — fits with
+    # headroom. This guard is defense-in-depth for unusually long mentions
+    # or escapes Discord-side.
+    running_len = sum(len(line) + 1 for line in meta_lines) + 1 + len(footer_text)
+    truncated = 0
+    total_nominees = min(len(nominees), 25)
     for idx, n in enumerate(nominees[:25]):
         letter = _VOTE_LETTERS[idx]
         votes = votes_by_nom.get(n[NOM_ID], 0)
         pct = (votes / total_votes * 100.0) if total_votes else 0.0
         title = _truncate_label(n[NOM_TITLE], 60)
         # Markdown-link the title to its VNDB page. Escape any [ or ] in the
-        # label so the link parser doesn't choke on unusual VN titles. Wrap
-        # the URL in <…> to suppress Discord's link-embed preview — without
-        # it, every nominee row would balloon the message with a VNDB embed
-        # card and defeat the purpose of the compact tally view.
+        # label so the link parser doesn't choke on unusual VN titles. The
+        # `<URL>` wrapping used in the legacy plain-message format isn't
+        # needed in an embed description — Discord doesn't auto-preview
+        # links inside embeds.
         safe_title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
-        title_link = f"[{safe_title}](<https://vndb.org/{n[NOM_VNDB_ID]}>)"
+        title_link = f"[{safe_title}](https://vndb.org/{n[NOM_VNDB_ID]})"
         # Nominator is rendered as a Discord user-mention so it shows the
         # user's display name client-side. Pings are suppressed at send/edit
         # time via allowed_mentions=none so nominators aren't notified on
         # every tally refresh.
         nominator_mention = f"<@{n[NOM_USER_ID]}>"
-        body_lines.append(
+        line = (
             f"`{letter}` — {title_link} · {nominator_mention} · "
             f"`{pct:5.1f}%` ({votes})"
         )
+        # +1 for the joining newline.
+        if running_len + len(line) + 1 > _VOTE_DESC_BUDGET:
+            truncated = total_nominees - idx
+            break
+        body_lines.append(line)
+        running_len += len(line) + 1
 
-    footer_lines = [
-        "",
-        f"**{total_votes}** total vote(s)",
-        "Tap a button below or use `/vote` for a personal voting menu.",
-    ]
-    return "\n".join(header_lines + [""] + body_lines + footer_lines)
+    if truncated:
+        body_lines.append(
+            f"_…{truncated} more nominee(s) hidden; use `/vote` for the full list._"
+        )
+
+    description = "\n".join(meta_lines + [""] + body_lines + ["", footer_text])
+    embed = discord.Embed(
+        title=f"🗳️ {title_lead} - {period_label}",
+        description=description,
+        color=discord.Color.blurple(),
+    )
+    return embed
 
 
 async def _refresh_vote_message(bot, cycle_id: int) -> None:
@@ -829,11 +861,14 @@ async def _refresh_vote_message(bot, cycle_id: int) -> None:
             return
         nominees = await bot.GET(DatabaseQueries.GET_CYCLE_NOMINEES, (cycle_id,))
         tally = await bot.GET(DatabaseQueries.TALLY_VOTES, (cycle_id,))
-        prompt = await _render_vote_prompt(bot, cycle, nominees, tally)
-        # Suppress pings — message has nominator mentions in the body and
-        # we'd otherwise notify them on every vote.
+        embed = await _render_vote_prompt(bot, cycle, nominees, tally)
+        # Suppress pings — embed has nominator mentions in its description
+        # and we'd otherwise notify them on every vote. content=None clears
+        # any legacy plain-text content from messages posted before the
+        # embed migration.
         await message.edit(
-            content=prompt,
+            content=None,
+            embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),
         )
     except discord.HTTPException as e:
@@ -2652,7 +2687,7 @@ class VNCycleCog(commands.Cog):
             )
 
         tally = await self.bot.GET(DatabaseQueries.TALLY_VOTES, (cycle[CYCLE_ID],))
-        prompt = await _render_vote_prompt(self.bot, cycle, nominees, tally)
+        embed = await _render_vote_prompt(self.bot, cycle, nominees, tally)
         view = VoteView(
             cycle_id=cycle[CYCLE_ID],
             nominees=list(nominees),
@@ -2664,10 +2699,10 @@ class VNCycleCog(commands.Cog):
         # (no separate ephemeral "posted" confirmation cluttering the UX).
         # ``wait=True`` returns the WebhookMessage so we can persist its id.
         # ``allowed_mentions=none`` suppresses the @-pings on the nominator
-        # mentions in the body — they render as clickable user names but
+        # mentions in the embed — they render as clickable user names but
         # don't notify (which would otherwise spam every refresh).
         new_message = await interaction.followup.send(
-            prompt, view=view, wait=True,
+            embed=embed, view=view, wait=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
         new_channel_id = interaction.channel_id
@@ -2684,11 +2719,16 @@ class VNCycleCog(commands.Cog):
             if old_channel is not None:
                 try:
                     old_msg = await old_channel.fetch_message(old_message_id)
+                    # embed=None clears the stale vote tally; the new
+                    # message owns the rendering from here on. (Pre-embed
+                    # vote messages had no embed, so this was a no-op
+                    # before the embed migration.)
                     await old_msg.edit(
                         content=(
                             f"🔁 Voting menu moved — see "
                             f"{new_message.jump_url}"
                         ),
+                        embed=None,
                         view=None,
                     )
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
@@ -3502,7 +3542,7 @@ class VNCycleCog(commands.Cog):
                 tally = await self.bot.GET(
                     DatabaseQueries.TALLY_VOTES, (cycle[CYCLE_ID],),
                 )
-                prompt = await _render_vote_prompt(
+                embed = await _render_vote_prompt(
                     self.bot, cycle, nominees, tally,
                 )
                 view = VoteView(
@@ -3511,7 +3551,7 @@ class VNCycleCog(commands.Cog):
                     vote_ui=cycle[CYCLE_VOTE_UI],
                 )
                 await interaction.followup.send(
-                    prompt, view=view, ephemeral=True,
+                    embed=embed, view=view, ephemeral=True,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
         except Exception:  # noqa: BLE001

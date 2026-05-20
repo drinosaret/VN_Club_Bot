@@ -1416,25 +1416,41 @@ class VNTitleManagement(commands.Cog):
         if vn_info and getattr(vn_info, "thumbnail_url", None):
             embed.set_thumbnail(url=vn_info.thumbnail_url)
 
-        # Top completers (last 10) for this VN in this guild.
+        # Top completers (last 5) for this VN in this guild.
         try:
             log_rows = await self.bot.GET(
                 "SELECT user_id, user_rating, comment FROM reading_logs "
                 "WHERE vndb_id = ? AND logged_in_guild = ? "
-                "ORDER BY log_id DESC LIMIT 10",
+                "ORDER BY log_id DESC LIMIT 5",
                 (vndb_id, interaction.guild.id),
             )
         except Exception:
             log_rows = []
         if log_rows:
-            lines = []
+            # Greedy pack within the 1024-char field cap. Rows arrive newest
+            # first; dropped overflow is always the oldest of the fetched
+            # batch, so the tail notice can phrase it accurately.
+            FIELD_CAP = 1000
+            lines: list[str] = []
+            cur_len = 0
+            rendered = 0
             for uid, rating, comment in log_rows:
                 u = self.bot.get_user(uid)
                 name = f"@{u.name}" if u else f"<@{uid}>"
                 snippet = (comment or "").strip().replace("\n", " ")
                 if len(snippet) > 80:
                     snippet = snippet[:79] + "…"
-                lines.append(f"{name} · {rating}/5{(' · ' + snippet) if snippet else ''}")
+                line = f"{name} · {rating}/5{(' · ' + snippet) if snippet else ''}"
+                added = len(line) + (1 if lines else 0)
+                if cur_len + added > FIELD_CAP - 40:  # reserve for tail notice
+                    break
+                lines.append(line)
+                cur_len += added
+                rendered += 1
+            if rendered < len(log_rows):
+                lines.append(
+                    f"_…and {len(log_rows) - rendered} older entries hidden._"
+                )
             embed.add_field(
                 name=f"Recent completions ({len(log_rows)})",
                 value="\n".join(lines),
