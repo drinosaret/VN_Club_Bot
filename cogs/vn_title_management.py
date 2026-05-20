@@ -180,10 +180,12 @@ _PICK_KIND_EMOJI = {
     "special":  "✨",
 }
 
-# Maximum entries we'll render per page before truncating with "and N more".
-# Bounded by Discord's 4096-char embed description limit; ~120 chars per row
-# leaves comfortable headroom at 25.
-_POOL_PAGE_CAP = 25
+# Per-page description budget for /pool. Discord caps embed descriptions
+# at 4096 chars; leave headroom for the meta line and section headers we
+# prepend at embed-build time.
+_POOL_DESC_BUDGET = 3900
+# Defensive cap so one pathologically long row can't render past 4096 by itself.
+_POOL_ROW_HARD_CAP = 1000
 
 
 def _nomination_tag(phase: str, winner_flag: int) -> tuple[str, str]:
@@ -338,7 +340,14 @@ class PoolNavigationView(discord.ui.View):
         self.filter_value = filter_value
         self.all_servers = all_servers
         self.view_mode = view_mode
+        # Cached page list for the current (month, view_mode, filter, scope)
+        # state. Populated on first refresh (or pre-populated by the slash
+        # command). Page-nav buttons reuse the cache without re-querying;
+        # month/view nav rebuilds it.
+        self._pages: list[discord.Embed] | None = None
+        self.page: int = 0
         self._sync_button_labels()
+        self._sync_page_button_states()
 
     def _sync_button_labels(self) -> None:
         """Adapt button labels to the active view mode."""
@@ -349,10 +358,29 @@ class PoolNavigationView(discord.ui.View):
             self.today.label = "Current month"
             self.toggle_view.label = "🌸 Seasonal view"
 
-    async def _refresh(self, interaction: discord.Interaction):
-        self._sync_button_labels()
-        embed = await self._cog._build_pool_embed(
-            interaction.client,  # type: ignore[arg-type]
+    def _sync_page_button_states(self) -> None:
+        """Show page nav only when there's more than one page. With a single
+        page the buttons are removed from the view entirely so they don't
+        sit greyed-out and waste vertical space; re-added when a future
+        refresh produces multiple pages."""
+        total = len(self._pages) if self._pages else 1
+        page_buttons = (self.first_page, self.prev_page, self.next_page, self.last_page)
+        if total <= 1:
+            for btn in page_buttons:
+                if btn in self.children:
+                    self.remove_item(btn)
+            return
+        for btn in page_buttons:
+            if btn not in self.children:
+                self.add_item(btn)
+        self.first_page.disabled = self.page == 0
+        self.prev_page.disabled = self.page == 0
+        self.next_page.disabled = self.page >= total - 1
+        self.last_page.disabled = self.page >= total - 1
+
+    async def _rebuild_pages(self, bot: VNClubBot) -> None:
+        self._pages = await self._cog._build_pool_pages(
+            bot,
             guild_id=self._guild_id,
             month=self.month,
             year=self.year,
@@ -360,9 +388,29 @@ class PoolNavigationView(discord.ui.View):
             all_servers=self.all_servers,
             view_mode=self.view_mode,
         )
-        await interaction.response.edit_message(embed=embed, view=self)
+        if self.page >= len(self._pages):
+            self.page = max(0, len(self._pages) - 1)
 
-    @discord.ui.button(label="← Previous", style=discord.ButtonStyle.secondary)
+    async def _refresh(self, interaction: discord.Interaction):
+        """Re-query and re-render. Used by month/season/view-mode nav,
+        which all reset the page to 0 before calling this."""
+        self._sync_button_labels()
+        await self._rebuild_pages(interaction.client)  # type: ignore[arg-type]
+        self._sync_page_button_states()
+        await interaction.response.edit_message(
+            embed=self._pages[self.page], view=self,
+        )
+
+    async def _refresh_page_only(self, interaction: discord.Interaction):
+        """Flip pages from the cached page list without re-querying."""
+        if self._pages is None:
+            await self._rebuild_pages(interaction.client)  # type: ignore[arg-type]
+        self._sync_page_button_states()
+        await interaction.response.edit_message(
+            embed=self._pages[self.page], view=self,
+        )
+
+    @discord.ui.button(label="← Previous", style=discord.ButtonStyle.secondary, row=0)
     async def previous_month(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -376,9 +424,10 @@ class PoolNavigationView(discord.ui.View):
             if self.month < 1:
                 self.month = 12
                 self.year -= 1
+        self.page = 0
         await self._refresh(interaction)
 
-    @discord.ui.button(label="Current month", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Current month", style=discord.ButtonStyle.primary, row=0)
     async def today(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -391,9 +440,10 @@ class PoolNavigationView(discord.ui.View):
             now = datetime.now()
             self.month = now.month
             self.year = now.year
+        self.page = 0
         await self._refresh(interaction)
 
-    @discord.ui.button(label="Next →", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Next →", style=discord.ButtonStyle.secondary, row=0)
     async def next_month(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -407,9 +457,10 @@ class PoolNavigationView(discord.ui.View):
             if self.month > 12:
                 self.month = 1
                 self.year += 1
+        self.page = 0
         await self._refresh(interaction)
 
-    @discord.ui.button(label="🌸 Seasonal view", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="🌸 Seasonal view", style=discord.ButtonStyle.success, row=0)
     async def toggle_view(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -421,7 +472,39 @@ class PoolNavigationView(discord.ui.View):
             # viewing, so prev/next steps are aligned to season boundaries.
             season_name = month_to_season_name(self.month)
             self.month = int(season_to_months(season_name, self.year)[0].split("-")[1])
+        self.page = 0
         await self._refresh(interaction)
+
+    @discord.ui.button(label="⏪", style=discord.ButtonStyle.secondary, row=1)
+    async def first_page(
+        self, interaction: discord.Interaction, _button: discord.ui.Button,
+    ):
+        self.page = 0
+        await self._refresh_page_only(interaction)
+
+    @discord.ui.button(label="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_page(
+        self, interaction: discord.Interaction, _button: discord.ui.Button,
+    ):
+        if self.page > 0:
+            self.page -= 1
+        await self._refresh_page_only(interaction)
+
+    @discord.ui.button(label="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(
+        self, interaction: discord.Interaction, _button: discord.ui.Button,
+    ):
+        if self._pages is not None and self.page < len(self._pages) - 1:
+            self.page += 1
+        await self._refresh_page_only(interaction)
+
+    @discord.ui.button(label="⏩", style=discord.ButtonStyle.secondary, row=1)
+    async def last_page(
+        self, interaction: discord.Interaction, _button: discord.ui.Button,
+    ):
+        if self._pages is not None:
+            self.page = max(0, len(self._pages) - 1)
+        await self._refresh_page_only(interaction)
 
 
 class PoolBannerPaginator(discord.ui.View):
@@ -1237,7 +1320,7 @@ class VNTitleManagement(commands.Cog):
 
         filter_value = filter.value if filter else "all"
 
-        embed = await self._build_pool_embed(
+        pages = await self._build_pool_pages(
             self.bot,
             guild_id=interaction.guild.id,
             month=m,
@@ -1253,7 +1336,12 @@ class VNTitleManagement(commands.Cog):
             filter_value=filter_value,
             all_servers=all_servers,
         )
-        await interaction.followup.send(embed=embed, view=view)
+        # Pre-populate the cached pages so the first page-button click doesn't
+        # re-query, and re-sync the page button states (constructor ran with
+        # _pages=None which assumes a single page).
+        view._pages = pages
+        view._sync_page_button_states()
+        await interaction.followup.send(embed=pages[0], view=view)
 
     @app_commands.command(
         name="pool_entry",
@@ -1370,7 +1458,7 @@ class VNTitleManagement(commands.Cog):
     ):
         return await self._pool_entry_lookup_autocomplete(interaction, current)
 
-    async def _build_pool_embed(
+    async def _build_pool_pages(
         self,
         bot: VNClubBot,
         *,
@@ -1380,12 +1468,17 @@ class VNTitleManagement(commands.Cog):
         filter_value: str,
         all_servers: bool,
         view_mode: str = "monthly",
-    ) -> discord.Embed:
-        """Render the pool embed. Two view modes:
+    ) -> list[discord.Embed]:
+        """Render the pool view as a list of embeds, each safely under
+        Discord's per-embed limits. The list always has at least one
+        embed (an empty-state page when no rows match).
+
+        Two view modes:
           - ``monthly``: one calendar month; only single-month entries
             (monthly picks/noms, special) appear.
           - ``seasonal``: one 3-month season; only multi-month entries
             (seasonal picks/noms, multi-month specials) appear.
+
         Shared between the slash command and the PoolNavigationView so
         toggling and navigation re-use the exact same pipeline.
         """
@@ -1438,21 +1531,17 @@ class VNTitleManagement(commands.Cog):
 
         scope_label = "All Servers" if all_servers else "This Server"
         view_label = "Seasonal" if view_mode == "seasonal" else "Monthly"
-        embed = discord.Embed(
-            title=f"📚 Pool — {period_label}",
-            description=f"*View: {view_label} · Scope: {scope_label} · Filter: {filter_value}*",
-            color=discord.Color.blurple(),
-        )
-        embed.set_author(name="Visual Novel Club")
-        embed.set_footer(text="Tip: /pool_entry id:<#> shows full detail for any entry below.")
+        meta = f"*View: {view_label} · Scope: {scope_label} · Filter: {filter_value}*"
 
         if not picks and not noms:
-            embed.add_field(
-                name="​",
-                value=f"_No entries match for {empty_label}._",
-                inline=False,
+            embed = discord.Embed(
+                title=f"📚 Pool — {period_label}",
+                description=f"{meta}\n\n_No entries match for {empty_label}._",
+                color=discord.Color.blurple(),
             )
-            return embed
+            embed.set_author(name="Visual Novel Club")
+            embed.set_footer(text="Tip: /pool_entry id:<#> shows full detail for any entry below.")
+            return [embed]
 
         # `expected_start` / `expected_end` define the view's period —
         # rows whose period exactly matches it skip the redundant date
@@ -1464,43 +1553,90 @@ class VNTitleManagement(commands.Cog):
         else:
             expected_start = expected_end = displayed_month
 
-        if picks:
-            pick_lines = self._format_pool_lines(
-                bot, picks, all_servers,
-                expected_start=expected_start, expected_end=expected_end,
-            )
-            embed.add_field(
-                name=f"📌 Picks ({len(picks)})",
-                value="\n".join(pick_lines) if pick_lines else "_None_",
-                inline=False,
-            )
-        # Split nominations by intended status. Period span is authoritative:
-        # 1-month range ⇒ monthly, multi-month ⇒ seasonal. Monthly section
-        # renders first since the monthly cadence is the more common cycle
-        # and what most members are watching for week-to-week.
+        # Build (section_header, lines) tuples in render order. Monthly noms
+        # render before seasonal noms since the monthly cadence is the more
+        # common cycle members watch week-to-week.
         monthly_noms = [r for r in noms if r[3] == r[4]]
         seasonal_noms = [r for r in noms if r[3] != r[4]]
-        if monthly_noms:
+        sections: list[tuple[str, list[str]]] = []
+        for label_emoji, label_text, section_rows in (
+            ("📌", "Picks", picks),
+            ("🗳️", "Monthly Nominations", monthly_noms),
+            ("🗳️", "Seasonal Nominations", seasonal_noms),
+        ):
+            if not section_rows:
+                continue
             lines = self._format_pool_lines(
-                bot, monthly_noms, all_servers,
+                bot, section_rows, all_servers,
                 expected_start=expected_start, expected_end=expected_end,
             )
-            embed.add_field(
-                name=f"🗳️ Monthly Nominations ({len(monthly_noms)})",
-                value="\n".join(lines) if lines else "_None_",
-                inline=False,
+            sections.append((f"### {label_emoji} {label_text} ({len(section_rows)})", lines))
+
+        # Greedy line-by-line packer. Each page's body string lives in
+        # ``page_bodies``; the meta line is prepended at embed-build time.
+        # When a section spills past the budget, the continuation page
+        # repeats the section header with a "(cont.)" suffix so readers
+        # arriving via page nav always have context.
+        page_bodies: list[str] = []
+        buf: list[str] = []
+        buf_len = 0
+
+        def flush() -> None:
+            nonlocal buf, buf_len
+            if buf:
+                page_bodies.append("\n".join(buf))
+                buf = []
+                buf_len = 0
+
+        for header, lines in sections:
+            # Blank line between sections for readability when stacking on
+            # the same page (skip the leading blank on the first section).
+            sep = [""] if buf else []
+            sep_cost = sum(len(s) + 1 for s in sep)
+            header_cost = len(header) + (1 if buf else 0)
+            # Require room for the header AND at least one row so we never
+            # orphan a section header at the bottom of a page.
+            first_line_cost = (len(lines[0]) + 1) if lines else 0
+            if buf and buf_len + sep_cost + header_cost + first_line_cost > _POOL_DESC_BUDGET:
+                flush()
+                sep = []
+                sep_cost = 0
+                header_cost = len(header)
+            buf.extend(sep)
+            buf.append(header)
+            buf_len += sep_cost + header_cost
+            for line in lines:
+                line_cost = len(line) + 1  # always preceded by header or earlier line
+                if buf_len + line_cost > _POOL_DESC_BUDGET:
+                    flush()
+                    cont = header + " (cont.)" if not header.endswith(" (cont.)") else header
+                    buf.append(cont)
+                    buf_len = len(cont)
+                    line_cost = len(line) + 1
+                buf.append(line)
+                buf_len += line_cost
+
+        flush()
+
+        pages: list[discord.Embed] = []
+        total = len(page_bodies)
+        for i, body in enumerate(page_bodies):
+            embed = discord.Embed(
+                title=f"📚 Pool — {period_label}",
+                description=f"{meta}\n\n{body}",
+                color=discord.Color.blurple(),
             )
-        if seasonal_noms:
-            lines = self._format_pool_lines(
-                bot, seasonal_noms, all_servers,
-                expected_start=expected_start, expected_end=expected_end,
-            )
-            embed.add_field(
-                name=f"🗳️ Seasonal Nominations ({len(seasonal_noms)})",
-                value="\n".join(lines) if lines else "_None_",
-                inline=False,
-            )
-        return embed
+            embed.set_author(name="Visual Novel Club")
+            if total > 1:
+                embed.set_footer(
+                    text=f"Page {i + 1}/{total} · Tip: /pool_entry id:<#> shows full detail.",
+                )
+            else:
+                embed.set_footer(
+                    text="Tip: /pool_entry id:<#> shows full detail for any entry below.",
+                )
+            pages.append(embed)
+        return pages
 
     def _format_pool_lines(
         self, bot: VNClubBot, rows: list, all_servers: bool,
@@ -1508,15 +1644,18 @@ class VNTitleManagement(commands.Cog):
         expected_start: Optional[str] = None,
         expected_end: Optional[str] = None,
     ) -> list[str]:
-        """One line per vn_titles row, capped at _POOL_PAGE_CAP with overflow.
+        """One formatted line per vn_titles row.
 
         When ``expected_start`` / ``expected_end`` match a row's period
         the date segment is dropped — the view header already conveys it.
         Rows with a non-matching period (custom-span specials, etc.)
         keep the date segment so the anomaly is still visible.
+
+        Pagination/budgeting is handled by the caller (see
+        ``_build_pool_pages``); this method emits every row.
         """
         lines: list[str] = []
-        for row in rows[:_POOL_PAGE_CAP]:
+        for row in rows:
             (rid, vndb_id, gid, start_m, end_m, pts, _ca, title_ja, title_en,
              status, cycle_id, nominator_user_id, title_cache,
              phase, kind, _target_m, _target_end_m, _winner_flag) = row
@@ -1536,17 +1675,21 @@ class VNTitleManagement(commands.Cog):
                 )
                 # Monthly vs seasonal is implicit in the section header
                 # the row is rendered under, so we don't repeat it here.
-                lines.append(
+                line = (
                     f"{emoji} `[{tag}]` **#{rid}** [{display_title}]({link}) "
                     f"`{vndb_id}`{period_segment} · {nominator}{server_tag}"
                 )
             else:
-                lines.append(
+                line = (
                     f"{emoji} `[{tag}]` **#{rid}** [{display_title}]({link}) "
                     f"`{vndb_id}`{period_segment} · **{pts}**点{server_tag}"
                 )
-        if len(rows) > _POOL_PAGE_CAP:
-            lines.append(f"_…and {len(rows) - _POOL_PAGE_CAP} more._")
+            # Truncate the title if a single row would exceed the per-row cap.
+            if len(line) > _POOL_ROW_HARD_CAP:
+                overflow = len(line) - _POOL_ROW_HARD_CAP + 1  # +1 for ellipsis
+                truncated_title = display_title[: max(1, len(display_title) - overflow)] + "…"
+                line = line.replace(f"[{display_title}]", f"[{truncated_title}]", 1)
+            lines.append(line)
         return lines
 
     @staticmethod
