@@ -14,6 +14,11 @@ API_URL = "https://api.vndb.org/kana/vn"
 
 _log = logging.getLogger(__name__)
 
+# VNDB image.sexual is 0-2; >=0.7 catches the "suggestive" band. Lowering
+# this requires wiping vndb_cache (see
+# lib/migrations._invalidate_vndb_cache_for_blur_threshold).
+COVER_BLUR_THRESHOLD = 0.7
+
 # Process-local TTL cache for VNDB extras.
 # Banners re-render on /season_overview, /monthly, /seasonal, and on vote
 # closes — without caching, every render fires a fresh VNDB POST per VN.
@@ -219,7 +224,9 @@ class VN_Entry:
 
         image = vn.get("image") or {}
         thumbnail_url = image.get("url", "")
-        thumbnail_is_nsfw = image.get("sexual", 0) > 1
+        # `image.sexual` can be None for unrated covers; coerce to 0.
+        sexual_score = image.get("sexual") or 0
+        thumbnail_is_nsfw = sexual_score >= COVER_BLUR_THRESHOLD
 
         length_minutes = vn.get("length_minutes")
         length_rating = vn.get("length")

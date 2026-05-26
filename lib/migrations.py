@@ -54,6 +54,8 @@ async def run_migrations(bot) -> None:
         await _drop_vn_cycles_target_month_unique(bot)
         await _create_guild_managers_table(bot)
         await _add_vn_titles_nomination_dedup_index(bot)
+        await _create_migration_markers_table(bot)
+        await _invalidate_vndb_cache_for_blur_threshold(bot)
     except Exception:
         _log.exception("Migrations failed; aborting startup so the container restart-loops cleanly")
         raise
@@ -1016,6 +1018,40 @@ async def _add_vn_titles_nomination_dedup_index(bot) -> None:
             "guard, but the TOCTOU race window is not closed until duplicates "
             "are cleaned up and the bot restarts."
         )
+
+
+async def _create_migration_markers_table(bot) -> None:
+    """Marker table for one-shot data migrations whose effect isn't
+    detectable from schema state (e.g. cache invalidations).
+    """
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS migration_markers (
+            name TEXT PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+
+async def _invalidate_vndb_cache_for_blur_threshold(bot) -> None:
+    """Wipe vndb_cache so existing rows re-evaluate against the current
+    COVER_BLUR_THRESHOLD. `from_vndb_id` never refetches once a row is
+    present, so without this old rows keep the previous threshold's flag.
+    """
+    marker = "invalidate_vndb_cache_blur_threshold_v1"
+    existing = await bot.GET(
+        "SELECT name FROM migration_markers WHERE name = ?", (marker,)
+    )
+    if existing:
+        return
+    cols = await _column_names(bot, "vndb_cache")
+    if cols:
+        _log.info("Invalidating vndb_cache for new cover-blur threshold")
+        await bot.RUN("DELETE FROM vndb_cache")
+    await bot.RUN(
+        "INSERT OR IGNORE INTO migration_markers (name) VALUES (?)", (marker,)
+    )
 
 
 async def _column_names(bot, table: str) -> list[str]:

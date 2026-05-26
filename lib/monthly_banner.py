@@ -31,7 +31,7 @@ import time
 from typing import Any, Optional, Tuple
 
 import aiohttp
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 # Font cascade, palette, and the AA rounded-rect primitive live in
 # pillow_helpers now so every renderer (banner, profile card, club stats,
@@ -321,7 +321,7 @@ class MonthlyBannerGenerator:
         # of milliseconds.
         t0 = time.perf_counter()
         prefetched_cover: Optional[Image.Image] = None
-        if cover_url and not cover_is_nsfw:
+        if cover_url:
             prefetched_cover = await self._fetch_cover(cover_url)
         try:
             buf = await asyncio.to_thread(
@@ -391,10 +391,13 @@ class MonthlyBannerGenerator:
         # ---- cover ----
         cover_box = (self.COVER_X, self.COVER_Y,
                      self.COVER_X + self.COVER_WIDTH, self.COVER_Y + self.COVER_HEIGHT)
-        if prefetched_cover is not None and not cover_is_nsfw:
+        if prefetched_cover is not None:
             raw = prefetched_cover
             if raw is not None:
                 fitted = self._fit_cover(raw)
+                if cover_is_nsfw:
+                    # Blur flagged covers; see COVER_BLUR_THRESHOLD in lib/vndb_api.py.
+                    fitted = fitted.filter(ImageFilter.GaussianBlur(radius=20))
                 # Mask the cover with the same rounded shape as its border so
                 # the image's square corners don't poke past the rounded
                 # outline. Render the mask at OVERSAMPLE× and downsample with
@@ -986,12 +989,13 @@ async def _prefetch_overview_cover(
     banner_gen: "MonthlyBannerGenerator", pick: dict,
 ) -> Optional[Image.Image]:
     """Fetch the cover Image for one overview-strip pick, or None when the
-    pick is NSFW, has no url, or the fetch fails. Returning the raw
-    Image lets the (synchronous) compositing loop later run inside
-    asyncio.to_thread without needing async I/O.
+    pick has no url or the fetch fails. Returning the raw Image lets the
+    (synchronous) compositing loop later run inside asyncio.to_thread
+    without needing async I/O. Flagged covers are blurred in
+    `_draw_overview_card`, not skipped here.
     """
     url = pick.get("cover_url")
-    if not url or pick.get("is_nsfw"):
+    if not url:
         return None
     try:
         return await banner_gen._fetch_cover(url)
@@ -1210,6 +1214,9 @@ def _draw_overview_card(
             logger.warning("season-overview cover composite failed: %s", e)
 
     if cover_img is not None:
+        if pick.get("is_nsfw"):
+            # Smaller radius than the main banner; mini-card is ~100x140.
+            cover_img = cover_img.filter(ImageFilter.GaussianBlur(radius=8))
         canvas.paste(cover_img, (cover_box[0], cover_box[1]))
     else:
         label = "NSFW" if pick.get("is_nsfw") else "—"

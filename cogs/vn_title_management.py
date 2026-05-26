@@ -1413,7 +1413,11 @@ class VNTitleManagement(commands.Cog):
                 value=f"<@{nominator_user_id}>",
                 inline=True,
             )
-        if vn_info and getattr(vn_info, "thumbnail_url", None):
+        if (
+            vn_info
+            and getattr(vn_info, "thumbnail_url", None)
+            and not getattr(vn_info, "thumbnail_is_nsfw", False)
+        ):
             embed.set_thumbnail(url=vn_info.thumbnail_url)
 
         # Top completers (last 5) for this VN in this guild.
