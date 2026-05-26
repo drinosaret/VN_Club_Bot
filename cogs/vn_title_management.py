@@ -156,6 +156,17 @@ def _seasonal_period_label(start_month: str) -> str:
     return f"{season_name} {year_str}" if season_name else start_month
 
 
+def _season_end_for_month(month: str) -> str:
+    """YYYY-MM of the season-end containing `month`; returns `month` unchanged
+    when no season matches (defensive; ANIME_SEASONS covers 1-12)."""
+    yr = int(month.split("-")[0])
+    mnum = int(month.split("-")[1])
+    for sname, smonths in ANIME_SEASONS.items():
+        if mnum in smonths:
+            return season_to_months(sname, yr)[-1]
+    return month
+
+
 _SEASON_CHOICES = [
     app_commands.Choice(name="Winter (Jan–Mar)", value="winter"),
     app_commands.Choice(name="Spring (Apr–Jun)", value="spring"),
@@ -977,14 +988,7 @@ class VNTitleManagement(commands.Cog):
                 return
             if not end_month:
                 if status == "seasonal":
-                    yr = int(start_month.split("-")[0])
-                    mnum = int(start_month.split("-")[1])
-                    for sname, smonths in ANIME_SEASONS.items():
-                        if mnum in smonths:
-                            end_month = season_to_months(sname, yr)[-1]
-                            break
-                    else:
-                        end_month = start_month  # defensive; ANIME_SEASONS covers 1-12
+                    end_month = _season_end_for_month(start_month)
                 else:
                     end_month = start_month
             else:
@@ -1035,10 +1039,34 @@ class VNTitleManagement(commands.Cog):
                     )
                 target_guild_id = g_int
 
+        # Refuse adds that overlap an existing active entry for the same VN +
+        # guild. Admins can still add the same VN for non-overlapping periods
+        # (the deliberate "two cycles" use case); this just catches the
+        # "re-add after a bad edit, now there are two rows" footgun.
+        existing_overlaps = await self.bot.GET(
+            DatabaseQueries.GET_OVERLAPPING_POOL_ENTRIES,
+            (vn_info.vndb_id, target_guild_id, target_guild_id,
+             end_month, start_month),
+        )
+        if existing_overlaps:
+            rows_desc = []
+            for row in existing_overlaps:
+                row_id, _vid, _gid, sm, em, st = row
+                period = sm if sm == em else f"{sm}–{em}"
+                rows_desc.append(f"#{row_id} ({st}, {period})")
+            raise ValidationError(
+                f"overlap on add for {vn_info.vndb_id} in guild {target_guild_id}",
+                f"`{vn_info.vndb_id}` already has an overlapping pool entry: "
+                + ", ".join(rows_desc) + ".\n"
+                "Use `/manage_pool action:edit` to modify the existing entry, "
+                "or `action:remove` first if you want to start fresh.",
+            )
+
         new_pool_id = await self.bot.RUN_RETURNING_ID(
             DatabaseQueries.ADD_VN_TITLE_FOR_GUILD,
             (vn_info.vndb_id, target_guild_id, start_month, end_month, points, status),
         )
+        self._invalidate_season_overview_cache()
 
         _log.info(f"Added VN to pool ({status}, pool_id={new_pool_id}): {vn_info}")
 
@@ -1111,6 +1139,7 @@ class VNTitleManagement(commands.Cog):
                 f"affiliation was modified by another admin or the web "
                 f"console while we were reading it). Re-run the command.",
             )
+        self._invalidate_season_overview_cache()
 
         period = start_m if start_m == end_m else f"{start_m}–{end_m}"
         kind_tag = f" [{status or 'monthly'}]"
@@ -1225,6 +1254,18 @@ class VNTitleManagement(commands.Cog):
                 params.append(g_int)
                 applied.append(f"guild_id={g_int}")
 
+        # Auto-widen end_month when promoting to seasonal without an explicit
+        # end. Mirrors _pool_add's default-expansion logic so an edit-path
+        # promotion doesn't leave a one-month-wide seasonal entry.
+        auto_widened_to: Optional[str] = None
+        if status == "seasonal" and end_month is None:
+            effective_start = start_month if start_month is not None else existing[3]
+            auto_end = _season_end_for_month(effective_start)
+            sets.append("end_month = ?")
+            params.append(auto_end)
+            applied.append(f"end_month={auto_end!r} (auto-widened)")
+            auto_widened_to = auto_end
+
         if not sets:
             raise ValidationError(
                 "no fields to update",
@@ -1259,6 +1300,7 @@ class VNTitleManagement(commands.Cog):
                 f"affiliation was modified by another admin or the web "
                 f"console while we were reading it). Re-run the command.",
             )
+        self._invalidate_season_overview_cache()
 
         _log.info(
             "User %s edited pool entry #%s: %s",
@@ -1281,10 +1323,16 @@ class VNTitleManagement(commands.Cog):
         _id, vndb_id, gid, sm, em, pts, st = updated
         period = sm if sm == em else f"{sm}–{em}"
         gid_str = "NULL (global)" if gid is None else str(gid)
-        await interaction.followup.send(
+        msg = (
             f"✅ Pool entry **#{pool_id}** updated:\n"
             f"  • `{vndb_id}` · {period} · **{pts}**点 · `{st or 'monthly'}` · guild={gid_str}"
         )
+        if auto_widened_to is not None:
+            msg += (
+                f"\n  • Auto-widened `end_month` to **{auto_widened_to}** "
+                "to cover the full season."
+            )
+        await interaction.followup.send(msg)
 
 
     @app_commands.command(
@@ -1505,9 +1553,11 @@ class VNTitleManagement(commands.Cog):
         if view_mode == "seasonal":
             season_name = month_to_season_name(month)
             season_months = season_to_months(season_name, year)
-            # Probe the first month of the season; any 3-month entry
-            # whose period is exactly this season covers it.
             displayed_month = season_months[0]
+            # Probe the full season span so entries starting mid-season
+            # (e.g. May-Jul for Spring) still surface.
+            probe_start_month = season_months[0]
+            probe_end_month = season_months[-1]
             # `format_season_label` adds the "· Season N" suffix derived
             # from the earliest reading_logs entry, matching the suffix
             # on the vote-message header and the seasonal banner.
@@ -1515,18 +1565,20 @@ class VNTitleManagement(commands.Cog):
             empty_label = period_label
         else:
             displayed_month = f"{year:04d}-{month:02d}"
+            probe_start_month = probe_end_month = displayed_month
             period_label = month_label_for(displayed_month)
             empty_label = period_label
 
+        # Query is an overlap check: (probe_end, probe_start).
         if all_servers:
             rows = await bot.GET(
                 DatabaseQueries.GET_VN_TITLES_FOR_MONTH_GLOBAL,
-                (displayed_month, displayed_month),
+                (probe_end_month, probe_start_month),
             )
         else:
             rows = await bot.GET(
                 DatabaseQueries.GET_VN_TITLES_FOR_MONTH,
-                (displayed_month, displayed_month, guild_id),
+                (probe_end_month, probe_start_month, guild_id),
             )
 
         # View-mode lane: period span keeps monthly/seasonal entries
@@ -1975,7 +2027,7 @@ class VNTitleManagement(commands.Cog):
 
         seasonal_rows = await self.bot.GET(
             DatabaseQueries.GET_CURRENT_SEASONAL_VNS_FOR_GUILD,
-            (start_month, start_month, guild_id),
+            (end_month, start_month, guild_id),
         )
 
         seasonal_period_label = (
@@ -2055,6 +2107,12 @@ class VNTitleManagement(commands.Cog):
             "vndb_id": s_vndb_id,
             "jiten_deck": seasonal_jiten_deck,
         }
+
+    def _invalidate_season_overview_cache(self) -> None:
+        """Drop every cached /season_overview render so admins who edit the
+        pool see fresh overviews without a bot restart. Process-local cache,
+        so clearing is in-memory and cheap."""
+        self._season_overview_cache.clear()
 
     async def _get_or_build_season_overview_payload(
         self,

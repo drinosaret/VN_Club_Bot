@@ -1296,6 +1296,29 @@ class DatabaseQueries:
     ORDER BY start_month DESC;
     """
 
+    # Active pool entries for one VN whose range overlaps a proposed range.
+    # Used by /manage_pool action:add to refuse duplicate adds. Excludes
+    # 'nominated' since those are votes-in-progress, not picks.
+    #
+    # Guild-scoping: when proposed_guild_id is non-NULL, match NULL-guild
+    # (global) rows OR same-guild rows. When proposed_guild_id is NULL
+    # (operator adding a global entry), match EVERY row for the VN, since a
+    # global entry conflicts with all guilds. SQLite's `col = NULL` is
+    # always NULL, so the `? IS NULL` short-circuit is required.
+    #
+    # Params: (vndb_id, proposed_guild_id, proposed_guild_id,
+    #          proposed_end_month, proposed_start_month).
+    GET_OVERLAPPING_POOL_ENTRIES = """
+    SELECT id, vndb_id, guild_id, start_month, end_month, status
+    FROM vn_titles
+    WHERE vndb_id = ?
+      AND (? IS NULL OR guild_id IS NULL OR guild_id = ?)
+      AND start_month <= ?
+      AND end_month >= ?
+      AND status IN ('monthly', 'seasonal', 'special')
+    ORDER BY start_month;
+    """
+
     DELETE_VN_TITLE_FOR_GUILD = """
     DELETE FROM vn_titles WHERE vndb_id = ? AND (guild_id IS NULL OR guild_id = ?);
     """

@@ -56,6 +56,7 @@ async def run_migrations(bot) -> None:
         await _add_vn_titles_nomination_dedup_index(bot)
         await _create_migration_markers_table(bot)
         await _invalidate_vndb_cache_for_blur_threshold(bot)
+        await _backfill_vndb_cache_after_blur_invalidation(bot)
     except Exception:
         _log.exception("Migrations failed; aborting startup so the container restart-loops cleanly")
         raise
@@ -1049,6 +1050,65 @@ async def _invalidate_vndb_cache_for_blur_threshold(bot) -> None:
     if cols:
         _log.info("Invalidating vndb_cache for new cover-blur threshold")
         await bot.RUN("DELETE FROM vndb_cache")
+    await bot.RUN(
+        "INSERT OR IGNORE INTO migration_markers (name) VALUES (?)", (marker,)
+    )
+
+
+async def _backfill_vndb_cache_after_blur_invalidation(bot) -> None:
+    """Refetch metadata for every vndb_id referenced in vn_titles after the
+    blur-threshold cache wipe, so /pool and other JOIN-based surfaces don't
+    fall through to title_cache/vndb_id while the cache organically refills.
+
+    Blocking on first boot (one VNDB POST per distinct VN); typically tens of
+    seconds for a real instance. Marker-gated to once.
+    """
+    marker = "backfill_vndb_cache_after_blur_invalidation_v1"
+    existing = await bot.GET(
+        "SELECT name FROM migration_markers WHERE name = ?", (marker,)
+    )
+    if existing:
+        return
+    cols = await _column_names(bot, "vn_titles")
+    if not cols:
+        # Fresh install. Mark done so we don't re-check every boot.
+        await bot.RUN(
+            "INSERT OR IGNORE INTO migration_markers (name) VALUES (?)", (marker,)
+        )
+        return
+    rows = await bot.GET(
+        "SELECT DISTINCT vndb_id FROM vn_titles WHERE vndb_id IS NOT NULL"
+    )
+    if not rows:
+        await bot.RUN(
+            "INSERT OR IGNORE INTO migration_markers (name) VALUES (?)", (marker,)
+        )
+        return
+
+    # Deferred import: lib.vndb_api imports lib.bot which is also a migrations
+    # consumer at startup. Importing inside the function avoids any cycle.
+    from lib.vndb_api import from_vndb_id
+
+    _log.info("Backfilling vndb_cache for %d distinct VNs", len(rows))
+    success = 0
+    failure = 0
+    for (vndb_id,) in rows:
+        try:
+            result = await from_vndb_id(bot, vndb_id)
+            if result is not None:
+                success += 1
+            else:
+                # from_vndb_id already logged the cause.
+                failure += 1
+        except Exception:
+            _log.exception("Backfill failed for vndb_id=%s", vndb_id)
+            failure += 1
+    _log.info(
+        "vndb_cache backfill complete: %d succeeded, %d failed", success, failure
+    )
+    # Mark complete even if some failed. Partial repopulation is strictly
+    # better than empty, and natural usage will fill in remaining gaps. To
+    # force a retry, delete the marker row manually.
     await bot.RUN(
         "INSERT OR IGNORE INTO migration_markers (name) VALUES (?)", (marker,)
     )

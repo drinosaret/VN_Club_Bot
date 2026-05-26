@@ -2908,6 +2908,13 @@ class VNCycleCog(commands.Cog):
             cycle[CYCLE_ID], len(promoted_pool_ids), len(winners),
         )
 
+        # Cross-cog cache invalidation. The /season_overview cache lives on
+        # VNTitleManagement; vote close mutates vn_titles.status without going
+        # through /manage_pool, so we need to call the invalidator directly.
+        vn_mgmt = self.bot.get_cog("VNTitleManagement")
+        if vn_mgmt is not None:
+            vn_mgmt._invalidate_season_overview_cache()
+
         # Post banners for the winners in the announcement channel.
         # When auto-closing, ``interaction`` is None and we must rely on the
         # cycle's stored channel id (interaction.channel isn't available).
@@ -3152,6 +3159,13 @@ class VNCycleCog(commands.Cog):
                 (cycle_id, target_month, target_end_month, guild_id),
             ),
         ])
+
+        # Cross-cog cache invalidation: demoting picks back to nominations
+        # removes them from /season_overview's source set. Same reasoning as
+        # the close-voting site above.
+        vn_mgmt = self.bot.get_cog("VNTitleManagement")
+        if vn_mgmt is not None:
+            vn_mgmt._invalidate_season_overview_cache()
 
         # Apply optional setting overrides. Only fields the admin
         # explicitly provided are touched — everything else inherits
