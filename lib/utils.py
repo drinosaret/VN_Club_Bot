@@ -1457,14 +1457,19 @@ class DatabaseQueries:
     # status='nominated' rows for the target month onto the new cycle,
     # this query returns them in nomination order. Same column shape the
     # cog uses today via NOM_* indices: (id, cycle_id, vndb_id, user_id,
-    # guild_id, title, created_at). title_cache is COALESCEd to vndb_id
-    # if NULL — should never be NULL post-migration but defensive.
+    # guild_id, title, created_at). Title preference matches the pool
+    # view: live vndb_cache.title_ja first, then title_en, then the
+    # nomination-time title_cache, then vndb_id. Older nominations whose
+    # title_cache was captured as romaji still surface in JA once the
+    # cache has the row.
     GET_CYCLE_NOMINEES = """
-    SELECT id, cycle_id, vndb_id, nominator_user_id, guild_id,
-           COALESCE(title_cache, vndb_id) AS title, created_at
-    FROM vn_titles
-    WHERE cycle_id = ? AND status = 'nominated'
-    ORDER BY created_at ASC;
+    SELECT vt.id, vt.cycle_id, vt.vndb_id, vt.nominator_user_id, vt.guild_id,
+           COALESCE(vc.title_ja, vc.title_en, vt.title_cache, vt.vndb_id) AS title,
+           vt.created_at
+    FROM vn_titles vt
+    LEFT JOIN vndb_cache vc ON vc.vndb_id = vt.vndb_id
+    WHERE vt.cycle_id = ? AND vt.status = 'nominated'
+    ORDER BY vt.created_at ASC;
     """
 
     # Sweep all status='nominated' rows whose [start_month, end_month]
