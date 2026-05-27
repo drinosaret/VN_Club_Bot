@@ -40,7 +40,7 @@ LOG_FILE=hikaru_bot.log    # Log file path
 SYNC_COMMANDS=false        # Set true to auto-sync the command tree on each boot
 ```
 
-`AUTHORIZED_USERS` is the comma-separated list of user IDs that can run the `sync_global` / `sync_guild` admin commands (prefix commands — see `COMMAND_PREFIX`), edit each guild's manager list via `/manage_managers`, and bypass guild-scope checks on any admin command. Keep it small — usually just the host.
+`AUTHORIZED_USERS` is the comma-separated list of user IDs treated as bot operators. Operators can run the `sync_global` / `sync_guild` admin commands (prefix commands; see `COMMAND_PREFIX`), grant or revoke per-guild VN-manager permissions via `/manage_managers`, and use admin commands across any server the bot is in without needing a per-guild grant of their own. Keep this list small. Usually just whoever runs the host.
 
 Per-guild VN managers (who can use `/manage_pool`, `/manage_voting`, etc. inside a given server) are managed at runtime via `/manage_managers`, not the env. After deploy, an `AUTHORIZED_USERS` member runs `/manage_managers action:add guild_id:<server> user:@someone` (or `role:@somerole`). The `guild_id` parameter is required and autocompletes a dropdown of every server the bot is in, so you always pick the target server explicitly. Each guild's list is independent: a manager in one server has no automatic permissions in any other.
 
@@ -61,7 +61,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-On first boot the bot creates `data/db.sqlite3` and applies the full migration chain. Subsequent boots re-run migrations idempotently. The schema spans 17 versioned steps in [`lib/migrations.py`](lib/migrations.py). Each destructive step writes a `*_backup` table inside the DB before mutating, so rollback is a `DROP TABLE` plus `ALTER TABLE ... RENAME` away.
+On first boot the bot creates `data/db.sqlite3` and applies the full migration chain. Subsequent boots re-run migrations idempotently. The schema spans 20 versioned steps in [`lib/migrations.py`](lib/migrations.py). Each destructive schema step writes a `*_backup` table inside the DB before mutating, so rollback is a `DROP TABLE` plus `ALTER TABLE ... RENAME` away.
 
 After the bot is online, run `.sync_global` once (as an `AUTHORIZED_USERS` member; replace `.` with your configured `COMMAND_PREFIX`) to register the slash commands globally. Or set `SYNC_COMMANDS=true` and restart for an automatic sync. Global syncs are rate-limited to one per minute, so on-demand `.sync_global` is the preferred way to ship command changes.
 
@@ -122,13 +122,13 @@ After the bot is online, run `.sync_global` once (as an `AUTHORIZED_USERS` membe
 
 **Unified pool table.** Nominations and picks share `vn_titles` with a `status` column (`nominated`, `monthly`, `seasonal`, `special`, etc.). One ID space means `/pool_entry id:N` is unambiguous.
 
-**Vote lifecycle.** A cycle starts with nominations, then opens for voting, then closes (either manually or at a scheduled time), and the winning row gets promoted in place. Vote UI is set per guild but can be overridden per cycle. Persistent views are re-attached on boot so existing announcement messages keep working through restarts. Reopening a closed vote falls back to a period-based sweep, because later cycles can overwrite `cycle_id` and we still want the original nominees back.
+**Vote lifecycle.** A cycle starts with nominations, then opens for voting, then closes (either manually or at a scheduled time), and the winning row gets promoted in place. Ties resolve deterministically to the earliest nomination (lowest `vn_titles.id`). Vote UI is set per guild but can be overridden per cycle. Persistent views are re-attached on boot so existing announcement messages keep working through restarts. Reopening a closed vote falls back to a period-based sweep, because later cycles can overwrite `cycle_id` and we still want the original nominees back.
 
 **Image rendering** lives in `lib/monthly_banner.py`, `lib/profile_card.py`, and `lib/club_stats_card.py`. PIL-based, with 2x oversample plus LANCZOS downsample for anti-aliased edges. Cover fetches and renders run off the event loop via `asyncio.to_thread`.
 
 **VNDB and jiten.moe integration.** Cached per-VN in `vndb_cache`. Banner-time pulls extras (rating, votecount, year, tag set, platforms, developer, tag count) via a fresh `/vn` query. Jiten provides character count, difficulty, unique kanji, and dialogue percentage for the dense banner layout.
 
-**Migrations** in [`lib/migrations.py`](lib/migrations.py) are idempotent and run before any cog loads. They re-raise on failure so the container restart-loops rather than running on a half-applied schema. Each destructive step persists a `*_backup` table inside the DB.
+**Migrations** in [`lib/migrations.py`](lib/migrations.py) are idempotent and run before any cog loads. They re-raise on failure so the container restart-loops rather than running on a half-applied schema. Each destructive schema step persists a `*_backup` table inside the DB. Pure data-invalidation steps (e.g. the cover-blur cache wipe) skip the backup, since the data is recoverable from external sources.
 
 ## Role rewards (optional)
 
