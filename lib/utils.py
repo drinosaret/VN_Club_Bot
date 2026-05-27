@@ -1244,7 +1244,7 @@ class DatabaseQueries:
     LEFT JOIN vn_votes v ON v.nomination_id = vt.id AND v.cycle_id = vt.cycle_id
     WHERE vt.cycle_id = ? AND vt.status IN ('nominated', 'monthly', 'seasonal')
     GROUP BY vt.id
-    ORDER BY votes DESC, vt.created_at ASC;
+    ORDER BY votes DESC, vt.id ASC;
     """
 
     # Per-guild vn_titles queries (legacy ADD_VN_TITLE / GET_CURRENT_MONTHLY_VNS

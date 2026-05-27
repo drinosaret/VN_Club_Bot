@@ -338,35 +338,26 @@ def _votes_phrase(n: int) -> str:
 
 
 def _winners_after_tiebreak(tally: list, winner_count: int) -> list:
-    """Resolve winners with tie-rejection.
-
-    Walks the (vote-DESC) tally row by row, claiming a winner seat
-    only when the row is strictly ahead of the next-place row and has
-    at least one vote. If a seat boundary is tied, that seat (and all
-    seats below it) are forfeit — no auto-promotion. A 0-vote "winner"
-    never claims a seat either (no support = no win).
+    """Top `winner_count` rows by vote count. Ties between rows with the
+    same vote count are broken by the SQL caller's secondary sort
+    (vn_titles.id ASC) so the earliest nomination wins. 0-vote rows
+    never claim a seat.
 
     Examples (winner_count=1):
-      [10, 5]    → [10]   (clean winner)
-      [5, 5]     → []     (top tied)
-      [0, 0]     → []     (no votes at all)
-      [10]       → [10]   (sole nominee with votes)
+      [10, 5]    -> [10]
+      [5, 5]     -> [first-by-id]
+      [0, 0]     -> []
+      [10]       -> [10]
 
     Examples (winner_count=2):
-      [10, 5, 3] → [10, 5]  (both seats clean)
-      [10, 5, 5] → [10]     (seat 2 contested, dropped)
-      [5, 5, 3]  → []       (seat 1 contested, drops everything)
+      [10, 5, 3] -> [10, 5]
+      [10, 5, 5] -> [10, first-of-the-tied-5s]
+      [5, 5, 3]  -> [both-tied-5s, lower-id first]
     """
-    if not tally:
-        return []
-    cap = min(winner_count, len(tally))
     winners: list = []
+    cap = min(winner_count, len(tally))
     for i in range(cap):
-        votes = tally[i][6]
-        if votes <= 0:
-            break
-        next_row = tally[i + 1] if i + 1 < len(tally) else None
-        if next_row is not None and next_row[6] == votes:
+        if tally[i][6] <= 0:
             break
         winners.append(tally[i])
     return winners
@@ -378,40 +369,53 @@ def _build_close_voting_summary(
     winners,
     promoted_pool_ids: dict,
     *,
-    tally_was_nonempty: bool = False,
+    tally=(),
 ) -> str:
     """Compose the admin's ephemeral followup after Close voting.
 
-    User-facing copy says the VN "wins" the vote — admins shouldn't need
-    to know about the internal pool-entry promotion to read the result.
-    The pool ID is still tucked in for reference (admins use it for
-    /pool_entry).
+    Ties are resolved by lowest-id ('nominated first'); winners whose
+    seat was contested at the same vote count are flagged inline so the
+    admin can see when a tie was broken.
 
-    The empty-`winners` case has two shapes:
-      - No nominees in the cycle (tally_was_nonempty=False) → there
-        was nothing to promote, period.
-      - Tie or zero-vote race (tally_was_nonempty=True) → nothing was
-        promoted automatically; admin can hand-pick via /manage_pool.
+    Empty-`winners` cases:
+      - No nominees in the cycle (empty tally): nothing to promote.
+      - Tally exists but every row has zero votes: voting happened but
+        no one actually voted. Same outcome (nothing promoted) but
+        worth distinguishing in the message.
     """
     if not winners:
-        if tally_was_nonempty:
+        if tally:
             return (
-                f"⚖️ {cycle_kind.capitalize()} voting closed for "
-                f"**{period_label}** with a tie at the top (or no votes "
-                "cast) — no entry was promoted. Use "
-                "`/manage_pool action:Edit … status:Monthly pick` "
-                "(or seasonal/special) on whichever entry you want to "
-                "promote manually."
+                f"✅ {cycle_kind.capitalize()} voting closed for "
+                f"**{period_label}** (no votes cast, nothing to promote)."
             )
         return (
             f"✅ {cycle_kind.capitalize()} voting closed for **{period_label}** "
             "(no nominees, nothing to promote)."
         )
+
+    # A winner's seat was contested if the next tally row has the same
+    # vote count. The SQL secondary sort guarantees the lower-id row of
+    # the tied set is the one we picked, so "tied" here means "we won by
+    # the id-tiebreak rule".
+    tied_winners: set = set()
+    for i, w in enumerate(winners):
+        if i + 1 < len(tally) and tally[i + 1][6] == w[6]:
+            tied_winners.add(w[0])
+
     if len(winners) == 1:
         w = winners[0]
         votes_str = _votes_phrase(w[6])
+        tied = w[0] in tied_winners
         if w[1] in promoted_pool_ids:
             pid = promoted_pool_ids[w[1]]
+            if tied:
+                return (
+                    f"⚖️ {cycle_kind.capitalize()} voting closed for "
+                    f"**{period_label}**. Tied at {votes_str}; "
+                    f"**{w[2]}** wins as the earliest nomination "
+                    f"(pool **#{pid}**)."
+                )
             return (
                 f"✅ **{w[2]}** wins the {cycle_kind} vote for "
                 f"**{period_label}** ({votes_str}, pool **#{pid}**)."
@@ -426,9 +430,11 @@ def _build_close_voting_summary(
     parts = []
     for w in winners:
         votes_str = _votes_phrase(w[6])
+        tie_note = ", earliest of a tie" if w[0] in tied_winners else ""
         if w[1] in promoted_pool_ids:
             parts.append(
-                f"**{w[2]}** ({votes_str}, pool **#{promoted_pool_ids[w[1]]}**)"
+                f"**{w[2]}** ({votes_str}, pool "
+                f"**#{promoted_pool_ids[w[1]]}**{tie_note})"
             )
         else:
             parts.append(
@@ -3020,8 +3026,7 @@ class VNCycleCog(commands.Cog):
                         )
                     else:
                         closed_lines.append(
-                            "⚖️ Tied at the top (or no votes cast) — "
-                            "no winner."
+                            "No votes cast. No winner."
                         )
                     closed_lines.append(
                         f"Mode: `{cycle[CYCLE_CHOICE_MODE] or 'single'}` · "
@@ -3062,7 +3067,7 @@ class VNCycleCog(commands.Cog):
             await interaction.followup.send(
                 _build_close_voting_summary(
                     cycle_kind, period_label, winners, promoted_pool_ids,
-                    tally_was_nonempty=bool(tally),
+                    tally=tally,
                 ),
                 ephemeral=True,
             )
