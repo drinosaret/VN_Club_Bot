@@ -52,6 +52,20 @@ async def get_username_db(bot: VNClubBot, user_id: int) -> str:
             return "Unknown User"
 
 
+async def cache_user(bot: VNClubBot, user) -> None:
+    """Upsert a user's display_name into the local `users` table.
+    Call from write-time paths (vote, nominate) so the cache populates
+    organically as users interact with the bot. Failures are swallowed
+    (logged) so a cache write never disrupts the user's primary action.
+    """
+    if user is None:
+        return
+    try:
+        await bot.RUN(INSERT_USER_QUERY, (user.id, user.display_name))
+    except Exception:  # noqa: BLE001
+        _log.exception("cache_user failed for user_id=%s", getattr(user, "id", "?"))
+
+
 class UsernameFetcher(commands.Cog):
     def __init__(self, bot: VNClubBot):
         self.bot = bot

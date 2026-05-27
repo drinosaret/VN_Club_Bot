@@ -73,6 +73,7 @@ from lib.utils import (
 )
 from lib.vndb_api import VN_Entry, fetch_vndb_extras, from_vndb_id
 from lib.autocomplete import vn_autocomplete, month_picker_future_autocomplete
+from cogs.username_fetcher import cache_user
 
 _log = logging.getLogger(__name__)
 
@@ -248,12 +249,7 @@ class VoteSelect(discord.ui.Select):
 
 
 class ParticipantsButton(discord.ui.Button):
-    """Opens an ephemeral panel showing who voted for each nominee.
-
-    The whole nominee list with voters is bundled into a single ephemeral
-    embed so the requester sees per-option breakdowns at a glance — closer
-    to EasyPoll's 'Participants' UI than a per-option drill-in would be.
-    """
+    """Opens the paginated voter panel for this vote."""
 
     def __init__(self, cycle_id: int):
         super().__init__(
@@ -273,6 +269,225 @@ class ParticipantsButton(discord.ui.Button):
             cycle=self.cycle_id,
             user=interaction.user.id,
         )
+
+
+# 10 rows/page keeps the embed description well under Discord's 4096-char cap.
+PARTICIPANTS_PAGE_SIZE = 10
+
+
+class _ParticipantsNomineeSelect(discord.ui.Select):
+    """Dropdown that picks which nominee's voters to display."""
+
+    def __init__(self, nominees, votes_by_nom):
+        options = [
+            discord.SelectOption(
+                label=_truncate_label(
+                    f"{_VOTE_LETTERS[i] if i < len(_VOTE_LETTERS) else '?'} - "
+                    f"{n[NOM_TITLE]}",
+                    100,
+                ),
+                value=str(n[NOM_ID]),
+                description=f"{votes_by_nom.get(n[NOM_ID], 0)} voter(s)",
+                default=(i == 0),
+            )
+            for i, n in enumerate(nominees[:25])
+        ]
+        super().__init__(
+            placeholder="Pick a nominee to see voters…",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        # discord.py auto-populates `self.view` when this item is added
+        # to a View. Don't shadow `_parent`; that's the lib's internal
+        # back-reference and clobbering it breaks the check chain.
+        view: "ParticipantsView" = self.view  # type: ignore[assignment]
+        await view._on_nominee_change(interaction, int(self.values[0]))
+
+
+class _ParticipantsPrevButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="◀ Prev",
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "ParticipantsView" = self.view  # type: ignore[assignment]
+        await view._on_page_change(interaction, -1)
+
+
+class _ParticipantsNextButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="Next ▶",
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "ParticipantsView" = self.view  # type: ignore[assignment]
+        await view._on_page_change(interaction, +1)
+
+
+class ParticipantsView(discord.ui.View):
+    """Ephemeral paginated voter panel. Dropdown picks a nominee,
+    prev/next buttons page through that nominee's voters. Voter rows
+    are lazy-fetched and cached on the view for the panel's lifetime."""
+
+    def __init__(self, bot, cycle_id: int, nominees, votes_by_nom):
+        super().__init__(timeout=600)  # 10 minutes idle
+        self.bot = bot
+        self.cycle_id = cycle_id
+        self.nominees = nominees
+        self.votes_by_nom = votes_by_nom
+        self.selected_nom_id = nominees[0][NOM_ID]
+        self.voter_page = 0
+        self.voters_cache: dict = {}  # nom_id -> list of (user_id, created_at)
+        self.message = None  # WebhookMessage set by _handle_participants after send
+        # Serialises update callbacks so a rapid double-click on Prev/Next
+        # can't trigger `InteractionResponded` from the second handler racing
+        # the first's edit_message.
+        self._lock = asyncio.Lock()
+
+        self._select = _ParticipantsNomineeSelect(nominees, votes_by_nom)
+        self._prev_btn = _ParticipantsPrevButton()
+        self._next_btn = _ParticipantsNextButton()
+        self.add_item(self._select)
+        self.add_item(self._prev_btn)
+        self.add_item(self._next_btn)
+
+    async def _voters_for(self, nom_id: int) -> list:
+        if nom_id not in self.voters_cache:
+            rows = await self.bot.GET(
+                DatabaseQueries.GET_VOTERS_FOR_NOMINATION,
+                (self.cycle_id, nom_id),
+            )
+            self.voters_cache[nom_id] = list(rows)
+            # Persist all of this nominee's resolvable voters once per panel
+            # session. Page flips reuse the cache, so this never re-fires
+            # for the same nominee. Bonus: covers ALL voters for the
+            # nominee, not just the currently-visible page.
+            await _persist_resolved_users(
+                self.bot, [uid for uid, _ in self.voters_cache[nom_id]],
+            )
+        return self.voters_cache[nom_id]
+
+    def _selected_nominee(self):
+        for n in self.nominees:
+            if n[NOM_ID] == self.selected_nom_id:
+                return n
+        return self.nominees[0]
+
+    def _selected_letter(self) -> str:
+        for i, n in enumerate(self.nominees):
+            if n[NOM_ID] == self.selected_nom_id:
+                return _VOTE_LETTERS[i] if i < len(_VOTE_LETTERS) else "?"
+        return "?"
+
+    @staticmethod
+    def _max_page(voters: list) -> int:
+        if not voters:
+            return 0
+        return (len(voters) - 1) // PARTICIPANTS_PAGE_SIZE
+
+    async def render_embed(self) -> discord.Embed:
+        nominee = self._selected_nominee()
+        voters = await self._voters_for(self.selected_nom_id)
+        max_page = self._max_page(voters)
+        # Clamp in case voters shrank between renders.
+        if self.voter_page > max_page:
+            self.voter_page = max_page
+
+        # Sync button enabled state for the new render.
+        self._prev_btn.disabled = self.voter_page <= 0 or not voters
+        self._next_btn.disabled = self.voter_page >= max_page or not voters
+
+        letter = self._selected_letter()
+        title_display = _truncate_label(nominee[NOM_TITLE], 200)
+        header = f"**{len(voters)} voter(s)** · Vote ID `{self.cycle_id}`"
+
+        if not voters:
+            body = "_No voters yet._"
+        else:
+            start = self.voter_page * PARTICIPANTS_PAGE_SIZE
+            end = start + PARTICIPANTS_PAGE_SIZE
+            page_slice = voters[start:end]
+            # Batch the cache lookup for voters not in the in-process member
+            # cache. One SQLite round-trip instead of N. `bot.get_user` is a
+            # sync dict lookup so we can resolve cache hits inline. Note
+            # that `_voters_for` already persisted resolvable voters for
+            # this nominee on first fetch, so no persist call here.
+            missing = [uid for uid, _ in page_slice if self.bot.get_user(uid) is None]
+            name_map: dict = {}
+            if missing:
+                ph = ",".join("?" * len(missing))
+                rows = await self.bot.GET(
+                    f"SELECT discord_user_id, user_name FROM users "
+                    f"WHERE discord_user_id IN ({ph})",
+                    tuple(missing),
+                )
+                name_map = {r[0]: r[1] for r in rows if r[1]}
+            lines = []
+            for user_id, created_at in page_slice:
+                user = self.bot.get_user(user_id)
+                if user is not None:
+                    name = user.display_name
+                else:
+                    name = name_map.get(user_id) or "Unknown User"
+                ts = _format_closes_at_relative(created_at)
+                line = f"• @{name} (<@{user_id}>)"
+                if ts:
+                    line += f" · {ts}"
+                lines.append(line)
+            body = "\n".join(lines)
+
+        embed = discord.Embed(
+            title=f"👥 Participants · {letter} {title_display}",
+            description=f"{header}\n\n{body}",
+            color=discord.Color.blurple(),
+        )
+        if max_page > 0:
+            embed.set_footer(
+                text=f"Page {self.voter_page + 1}/{max_page + 1} · "
+                     "use the dropdown above to switch nominee",
+            )
+        else:
+            embed.set_footer(text="Use the dropdown above to switch nominee")
+        return embed
+
+    async def _on_nominee_change(self, interaction, new_nom_id: int):
+        async with self._lock:
+            self.selected_nom_id = new_nom_id
+            self.voter_page = 0
+            # Reflect the new choice as the dropdown's default so it stays
+            # visually selected when Discord re-renders the view.
+            for opt in self._select.options:
+                opt.default = (opt.value == str(new_nom_id))
+            embed = await self.render_embed()
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    async def _on_page_change(self, interaction, delta: int):
+        async with self._lock:
+            voters = await self._voters_for(self.selected_nom_id)
+            new_page = max(0, min(self._max_page(voters), self.voter_page + delta))
+            self.voter_page = new_page
+            embed = await self.render_embed()
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        # Disable components so the ephemeral can't be re-poked after timeout.
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.HTTPException):
+                pass
 
 
 class ManageVotesButton(discord.ui.Button):
@@ -335,6 +550,37 @@ def _truncate_label(text: str, limit: int) -> str:
 def _votes_phrase(n: int) -> str:
     """Singular/plural-aware vote count, e.g. '1 vote' / '5 votes'."""
     return "1 vote" if n == 1 else f"{n} votes"
+
+
+async def _persist_resolved_users(bot, user_ids) -> None:
+    """Upsert display_names into the local `users` table for any user_id
+    in `user_ids` that bot.get_user can resolve. One batched write,
+    deduped. Lets vote-menu surfaces survive guild departures: even if
+    a member later leaves, their name stays in the table for future
+    renders. Failures swallowed; this is best-effort caching."""
+    to_persist: list = []
+    seen: set = set()
+    for uid in user_ids:
+        if uid in seen:
+            continue
+        seen.add(uid)
+        user = bot.get_user(uid)
+        if user is not None:
+            to_persist.append((user.id, user.display_name))
+    if not to_persist:
+        return
+    placeholders = ",".join("(?, ?)" for _ in to_persist)
+    flat: list = []
+    for uid, name in to_persist:
+        flat.extend([uid, name])
+    try:
+        await bot.RUN(
+            f"INSERT INTO users (discord_user_id, user_name) VALUES {placeholders} "
+            "ON CONFLICT(discord_user_id) DO UPDATE SET user_name = excluded.user_name",
+            tuple(flat),
+        )
+    except Exception:  # noqa: BLE001
+        _log.exception("_persist_resolved_users failed for %d users", len(to_persist))
 
 
 def _winners_after_tiebreak(tally: list, winner_count: int) -> list:
@@ -650,6 +896,7 @@ async def _handle_vote(interaction: discord.Interaction, cycle_id: int, nominati
                 (DatabaseQueries.DELETE_USER_VOTES_IN_CYCLE, (cycle_id, user_id)),
                 (DatabaseQueries.INSERT_VOTE, (cycle_id, user_id, guild_id, nomination_id)),
             ])
+            await cache_user(bot, interaction.user)
             action = "replaced" if existing else "cast"
             _log.info(
                 "vote %s: cycle=%d user=%d nomination=%d mode=single",
@@ -694,6 +941,7 @@ async def _handle_vote(interaction: discord.Interaction, cycle_id: int, nominati
             )
             return
         await bot.RUN(DatabaseQueries.INSERT_VOTE, (cycle_id, user_id, guild_id, nomination_id))
+        await cache_user(bot, interaction.user)
         _log.info(
             "vote cast: cycle=%d user=%d nomination=%d mode=multi total=%d/%d",
             cycle_id, user_id, nomination_id, len(existing) + 1, winner_count,
@@ -797,6 +1045,22 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
     running_len = sum(len(line) + 1 for line in meta_lines) + 1 + len(footer_text)
     truncated = 0
     total_nominees = min(len(nominees), 25)
+    # Persist every visible nominator's name so the cache stays warm for
+    # future renders even if a nominator later leaves the guild.
+    nom_user_ids = [n[NOM_USER_ID] for n in nominees[:25]]
+    await _persist_resolved_users(bot, nom_user_ids)
+    # Batch the cache fallback lookup for nominators not in the in-process
+    # member cache. One SQLite round-trip instead of N inside the loop.
+    missing_nominators = [uid for uid in nom_user_ids if bot.get_user(uid) is None]
+    nom_name_map: dict = {}
+    if missing_nominators:
+        ph = ",".join("?" * len(missing_nominators))
+        rows = await bot.GET(
+            f"SELECT discord_user_id, user_name FROM users "
+            f"WHERE discord_user_id IN ({ph})",
+            tuple(missing_nominators),
+        )
+        nom_name_map = {r[0]: r[1] for r in rows if r[1]}
     for idx, n in enumerate(nominees[:25]):
         letter = _VOTE_LETTERS[idx]
         votes = votes_by_nom.get(n[NOM_ID], 0)
@@ -809,11 +1073,16 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
         # links inside embeds.
         safe_title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
         title_link = f"[{safe_title}](https://vndb.org/{n[NOM_VNDB_ID]})"
-        # Nominator is rendered as a Discord user-mention so it shows the
-        # user's display name client-side. Pings are suppressed at send/edit
-        # time via allowed_mentions=none so nominators aren't notified on
-        # every tally refresh.
-        nominator_mention = f"<@{n[NOM_USER_ID]}>"
+        # Render the nominator as `@CachedName (<@id>)` so the plain-text
+        # name always shows even when Discord's client-side cache can't
+        # resolve the embed mention. Pings are still suppressed via
+        # allowed_mentions=none at send/edit time.
+        nom_user = bot.get_user(n[NOM_USER_ID])
+        if nom_user is not None:
+            nom_name = nom_user.display_name
+        else:
+            nom_name = nom_name_map.get(n[NOM_USER_ID]) or "Unknown User"
+        nominator_mention = f"@{nom_name} (<@{n[NOM_USER_ID]}>)"
         line = (
             f"`{letter}` — {title_link} · {nominator_mention} · "
             f"`{pct:5.1f}%` ({votes})"
@@ -886,56 +1155,38 @@ async def _refresh_vote_message(bot, cycle_id: int) -> None:
 
 
 async def _handle_participants(interaction: discord.Interaction, cycle_id: int):
-    """Render an ephemeral participants panel — voter list per nominee."""
+    """Spawn the paginated participants panel for this vote. Voters
+    are lazy-loaded per nominee on the view; this handler only does the
+    initial render for the default-selected first nominee."""
     _log.debug(
         "_handle_participants: entry cycle=%d user=%d",
         cycle_id, interaction.user.id,
     )
-    # Defer first: this handler can make up to ~25 sequential SQLite
-    # queries (one per nominee for voter list, plus tally + nominee
-    # list). On a 25-nominee vote that's a real risk of busting
-    # Discord's 3s interaction-ack budget. Defer carves us a 15-minute
-    # followup window instead.
     await interaction.response.defer(ephemeral=True)
     bot: VNClubBot = interaction.client  # type: ignore
     cycle = await _cycle_by_id(bot, cycle_id)
     if not cycle:
         await interaction.followup.send(
-            "❌ This voting no longer exists.", ephemeral=True
+            "❌ This voting no longer exists.", ephemeral=True,
         )
         return
     nominees = await bot.GET(DatabaseQueries.GET_CYCLE_NOMINEES, (cycle_id,))
+    if not nominees:
+        await interaction.followup.send(
+            f"👥 **Participants — Vote ID `{cycle_id}`**\n\n"
+            "_No nominees in this voting._",
+            ephemeral=True,
+        )
+        return
     tally = await bot.GET(DatabaseQueries.TALLY_VOTES, (cycle_id,))
     votes_by_nom = {row[0]: row[6] for row in tally}
 
-    sections: list[str] = []
-    for idx, n in enumerate(nominees[:25]):
-        letter = _VOTE_LETTERS[idx]
-        title = _truncate_label(n[NOM_TITLE], 80)
-        votes_count = votes_by_nom.get(n[NOM_ID], 0)
-        sections.append(f"**{letter}** — {title} · **{votes_count}** vote(s)")
-        if votes_count == 0:
-            sections.append("> _No voters yet._")
-            continue
-        voter_rows = await bot.GET(
-            DatabaseQueries.GET_VOTERS_FOR_NOMINATION, (cycle_id, n[NOM_ID]),
-        )
-        # Cap at ~15 voters per nominee in the panel so a wildly popular
-        # option doesn't blow past Discord's 2000-char message limit.
-        # Older voters get an "+N more" tail.
-        shown = voter_rows[:15]
-        rest = max(0, len(voter_rows) - len(shown))
-        mentions = ", ".join(f"<@{r[0]}>" for r in shown)
-        sections.append(f"> {mentions}" + (f" _(+{rest} more)_" if rest else ""))
-
-    body = "\n".join(sections) if sections else "_No nominees in this voting._"
-    # Truncate if it ever overshoots — Discord caps message content at 2000.
-    if len(body) > 1900:
-        body = body[:1900].rstrip() + "\n…"
-    await interaction.followup.send(
-        f"👥 **Participants — Vote ID `{cycle_id}`**\n\n{body}",
-        ephemeral=True,
+    view = ParticipantsView(bot, cycle_id, list(nominees[:25]), votes_by_nom)
+    embed = await view.render_embed()
+    msg = await interaction.followup.send(
+        embed=embed, view=view, ephemeral=True, wait=True,
     )
+    view.message = msg
 
 
 async def _handle_manage_votes(interaction: discord.Interaction, cycle_id: int):
@@ -3459,6 +3710,7 @@ class VNCycleCog(commands.Cog):
                     DatabaseQueries.UPDATE_NOMINATION_VN,
                     (vndb_id, display_title, existing_id),
                 )
+                await cache_user(self.bot, interaction.user)
                 update_mode = True
             else:
                 # cycle_id stays NULL — nominations are unattached until
@@ -3481,6 +3733,7 @@ class VNCycleCog(commands.Cog):
                         "to swap your pick."
                     )
                     return
+                await cache_user(self.bot, interaction.user)
                 update_mode = False
 
             jiten_data = None
