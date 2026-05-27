@@ -994,18 +994,21 @@ def _seconds_until(closes_at) -> Optional[float]:
 
 
 async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
-    """Build the live vote embed with running tally per nominee.
+    """Build the live vote embed with two sections: Choices (alphabetical
+    A-Z list of nominees with their nominator) and Standings (ranked by
+    votes DESC, ties share rank, zero-vote entries collapsed into a
+    tail line).
 
     ``nominees`` is the ordered list (display order = letter labels A, B, …).
-    ``tally`` is the row list from TALLY_VOTES — keyed by nomination_id; we
-    re-key it here so we can render in nominee display order rather than
-    tally order (which is sorted by votes DESC).
+    ``tally`` is the row list from TALLY_VOTES — keyed by nomination_id;
+    Choices renders in display order, Standings re-sorts by votes.
 
-    Returns an Embed because 25 nominees of ~145 chars/row overflow Discord's
-    2000-char message-content cap; the 4096-char embed description fits.
+    Returns an Embed because the two-section layout would overflow
+    Discord's 2000-char message-content cap; the 4096-char embed
+    description fits with headroom.
 
-    Async because seasonal cycles get a "· Season N" suffix on their period
-    label that needs a reading_logs lookup.
+    Async because seasonal cycles get a "· Season N" suffix on their
+    period label that needs a reading_logs lookup.
     """
     period_label = await cycle_period_label_with_season(bot, cycle_row)
     kind = cycle_row[CYCLE_KIND] or "monthly"
@@ -1014,10 +1017,11 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
     winner_count = cycle_row[CYCLE_WINNER_COUNT] or 1
     closes_at = cycle_row[CYCLE_CLOSES_AT]
 
-    # tally is shaped as (nomination_id, vndb_id, title, user_id, guild_id,
-    # created_at, votes). Build a votes-by-nomination_id lookup.
+    # tally shape: (nomination_id, vndb_id, title, user_id, guild_id,
+    # created_at, votes). Re-key by nomination_id for fast lookup.
     votes_by_nom = {row[0]: row[6] for row in tally}
     total_votes = sum(votes_by_nom.values())
+    total_nominees = min(len(nominees), 25)
 
     meta_lines = [
         f"Mode: `{choice_mode}` · Winners: `{winner_count}` · "
@@ -1030,24 +1034,9 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
     if allowed_role_id:
         meta_lines.append(f"🔒 Allowed role: <@&{allowed_role_id}>")
 
-    footer_lines = [
-        f"**{total_votes}** total vote(s)",
-        "Tap a button below or use `/vote` for a personal voting menu.",
-    ]
-    footer_text = "\n".join(footer_lines)
-
-    body_lines: list[str] = []
-    # Track running description length so we can stop appending if a
-    # pathological row pushes us toward the 4096 cap. Math: 25 rows of
-    # ~145 chars + meta/footer ~250 chars ≈ 3875 chars — fits with
-    # headroom. This guard is defense-in-depth for unusually long mentions
-    # or escapes Discord-side.
-    running_len = sum(len(line) + 1 for line in meta_lines) + 1 + len(footer_text)
-    truncated = 0
-    total_nominees = min(len(nominees), 25)
     # Persist every visible nominator's name so the cache stays warm for
     # future renders even if a nominator later leaves the guild.
-    nom_user_ids = [n[NOM_USER_ID] for n in nominees[:25]]
+    nom_user_ids = [n[NOM_USER_ID] for n in nominees[:total_nominees]]
     await _persist_resolved_users(bot, nom_user_ids)
     # Batch the cache fallback lookup for nominators not in the in-process
     # member cache. One SQLite round-trip instead of N inside the loop.
@@ -1061,45 +1050,100 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
             tuple(missing_nominators),
         )
         nom_name_map = {r[0]: r[1] for r in rows if r[1]}
-    for idx, n in enumerate(nominees[:25]):
+
+    # ---- Choices section: alphabetical, title link + nominator ----
+    choices_lines = ["📋 **Choices**"]
+    for idx, n in enumerate(nominees[:total_nominees]):
         letter = _VOTE_LETTERS[idx]
-        votes = votes_by_nom.get(n[NOM_ID], 0)
-        pct = (votes / total_votes * 100.0) if total_votes else 0.0
         title = _truncate_label(n[NOM_TITLE], 60)
-        # Markdown-link the title to its VNDB page. Escape any [ or ] in the
-        # label so the link parser doesn't choke on unusual VN titles. The
-        # `<URL>` wrapping used in the legacy plain-message format isn't
-        # needed in an embed description — Discord doesn't auto-preview
-        # links inside embeds.
+        # Escape `[` `]` in titles so the markdown link parser doesn't
+        # choke on unusual VN names.
         safe_title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
         title_link = f"[{safe_title}](https://vndb.org/{n[NOM_VNDB_ID]})"
-        # Render the nominator as `@CachedName (<@id>)` so the plain-text
-        # name always shows even when Discord's client-side cache can't
-        # resolve the embed mention. Pings are still suppressed via
-        # allowed_mentions=none at send/edit time.
         nom_user = bot.get_user(n[NOM_USER_ID])
         if nom_user is not None:
             nom_name = nom_user.display_name
         else:
             nom_name = nom_name_map.get(n[NOM_USER_ID]) or "Unknown User"
-        nominator_mention = f"@{nom_name} (<@{n[NOM_USER_ID]}>)"
-        line = (
-            f"`{letter}` — {title_link} · {nominator_mention} · "
-            f"`{pct:5.1f}%` ({votes})"
+        choices_lines.append(f"`{letter}` · {title_link} · @{nom_name}")
+
+    # ---- Standings section: ranked DESC, ties share rank ----
+    # Secondary sort by nomination id ASC mirrors TALLY_VOTES' tie-break,
+    # so the standings ordering matches the rule used to pick the winner.
+    ranked = sorted(
+        enumerate(nominees[:total_nominees]),
+        key=lambda iv: (-votes_by_nom.get(iv[1][NOM_ID], 0), iv[1][NOM_ID]),
+    )
+    standings_header = f"📊 **Standings** · {_votes_phrase(total_votes)}"
+    standings_body: list[str] = []
+    zero_vote_letters: list[str] = []
+    prev_votes: Optional[int] = None
+    rank = 0
+    for display_pos, (idx, n) in enumerate(ranked):
+        votes = votes_by_nom.get(n[NOM_ID], 0)
+        letter = _VOTE_LETTERS[idx]
+        if votes <= 0:
+            zero_vote_letters.append(letter)
+            continue
+        # Standard competition ranking: ties share the same rank, the
+        # next distinct count skips past the tied positions
+        # (e.g. 1, 2, 3, 3, 5).
+        if votes != prev_votes:
+            rank = display_pos + 1
+            prev_votes = votes
+        pct = (votes / total_votes * 100.0) if total_votes else 0.0
+        title_short = _truncate_label(n[NOM_TITLE], 40)
+        standings_body.append(
+            f"`{rank:>2}.` `{letter}` · {title_short} · **{pct:.1f}%** ({votes})"
         )
-        # +1 for the joining newline.
-        if running_len + len(line) + 1 > _VOTE_DESC_BUDGET:
-            truncated = total_nominees - idx
+    if not standings_body and not zero_vote_letters:
+        zero_tail: Optional[str] = "_No votes yet._"
+    elif zero_vote_letters:
+        zero_tail = f"_No votes: {', '.join(zero_vote_letters)}_"
+    else:
+        zero_tail = None
+
+    footer_text = "Tap a button below or use `/vote` for a personal voting menu."
+
+    # Per-section sizing: Choices is never truncated (knowing who nominated
+    # each title is the whole point of that section). Standings shrinks
+    # from the bottom if we'd overflow — drop the zero-vote tail first
+    # since it's the lowest-information line, then pop ranked entries.
+    def _assemble(
+        body: list[str], tail: Optional[str], note: Optional[str]
+    ) -> str:
+        standings = [standings_header, *body]
+        if tail is not None:
+            standings.append(tail)
+        if note is not None:
+            standings.append(note)
+        return "\n".join(
+            meta_lines + [""] + choices_lines + [""] + standings + ["", footer_text]
+        )
+
+    fit_body = list(standings_body)
+    fit_tail = zero_tail
+    overflow_note: Optional[str] = None
+    while len(_assemble(fit_body, fit_tail, overflow_note)) > _VOTE_DESC_BUDGET:
+        if fit_tail is not None:
+            fit_tail = None
+        elif fit_body:
+            fit_body.pop()
+            dropped = len(standings_body) - len(fit_body)
+            overflow_note = f"_…{dropped} more in standings._"
+        else:
+            # Choices + meta + footer alone exceed the budget. Only
+            # reachable at the 25-nom cap with pathologically long
+            # titles and nominator names. Fall through to the byte-cut.
             break
-        body_lines.append(line)
-        running_len += len(line) + 1
 
-    if truncated:
-        body_lines.append(
-            f"_…{truncated} more nominee(s) hidden; use `/vote` for the full list._"
+    description = _assemble(fit_body, fit_tail, overflow_note)
+    if len(description) > _VOTE_DESC_BUDGET:
+        _log.warning(
+            "vote prompt overflowed after Standings trim: %d chars (cap %d)",
+            len(description), _VOTE_DESC_BUDGET,
         )
-
-    description = "\n".join(meta_lines + [""] + body_lines + ["", footer_text])
+        description = description[:_VOTE_DESC_BUDGET].rstrip() + "\n_…truncated._"
     embed = discord.Embed(
         title=f"🗳️ {title_lead} - {period_label}",
         description=description,
