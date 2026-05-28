@@ -457,7 +457,7 @@ class ParticipantsView(discord.ui.View):
         if max_page > 0:
             embed.set_footer(
                 text=f"Page {self.voter_page + 1}/{max_page + 1} · "
-                     "use the dropdown above to switch nominee",
+                     "use the dropdown below to switch nominee",
             )
         else:
             embed.set_footer(text="Use the dropdown above to switch nominee")
