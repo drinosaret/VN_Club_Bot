@@ -57,6 +57,7 @@ async def run_migrations(bot) -> None:
         await _create_migration_markers_table(bot)
         await _invalidate_vndb_cache_for_blur_threshold(bot)
         await _backfill_vndb_cache_after_blur_invalidation(bot)
+        await _add_user_tag_to_users(bot)
     except Exception:
         _log.exception("Migrations failed; aborting startup so the container restart-loops cleanly")
         raise
@@ -768,6 +769,25 @@ async def _add_vote_ui_to_vn_cycles(bot) -> None:
         return
     _log.info("Adding vote_ui column to vn_cycles")
     await bot.RUN("ALTER TABLE vn_cycles ADD COLUMN vote_ui TEXT")
+
+
+async def _add_user_tag_to_users(bot) -> None:
+    """
+    Add `user_tag TEXT` to the users cache table. Stores Discord's
+    unique lowercase handle (`user.name`) alongside the existing
+    `user_name` column which holds the display name. Display surfaces
+    that need to disambiguate users (Participants view) read user_tag;
+    surfaces that prioritise recognition (Choices list) keep using
+    user_name. Existing rows get NULL until the next interaction warms
+    the cache, at which point both columns are upserted together.
+    """
+    cols = await _column_names(bot, "users")
+    if not cols:
+        return
+    if "user_tag" in cols:
+        return
+    _log.info("Adding user_tag column to users")
+    await bot.RUN("ALTER TABLE users ADD COLUMN user_tag TEXT")
 
 
 async def _add_allowed_role_id_to_vn_cycles(bot) -> None:

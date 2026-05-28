@@ -423,24 +423,27 @@ class ParticipantsView(discord.ui.View):
             # that `_voters_for` already persisted resolvable voters for
             # this nominee on first fetch, so no persist call here.
             missing = [uid for uid, _ in page_slice if self.bot.get_user(uid) is None]
-            name_map: dict = {}
+            tag_map: dict = {}
             if missing:
                 ph = ",".join("?" * len(missing))
                 rows = await self.bot.GET(
-                    f"SELECT discord_user_id, user_name FROM users "
+                    f"SELECT discord_user_id, user_tag, user_name FROM users "
                     f"WHERE discord_user_id IN ({ph})",
                     tuple(missing),
                 )
-                name_map = {r[0]: r[1] for r in rows if r[1]}
+                # Prefer the unique handle; legacy rows pre-migration only
+                # have user_name (display) which we fall back to so the
+                # line still identifies the voter.
+                tag_map = {r[0]: (r[1] or r[2]) for r in rows if r[1] or r[2]}
             lines = []
             for user_id, created_at in page_slice:
                 user = self.bot.get_user(user_id)
                 if user is not None:
-                    name = user.display_name
+                    tag = user.name
                 else:
-                    name = name_map.get(user_id) or "Unknown User"
+                    tag = tag_map.get(user_id) or "unknown-user"
                 ts = _format_closes_at_relative(created_at)
-                line = f"• @{name} (<@{user_id}>)"
+                line = f"• @{tag} (<@{user_id}>)"
                 if ts:
                     line += f" · {ts}"
                 lines.append(line)
@@ -566,17 +569,18 @@ async def _persist_resolved_users(bot, user_ids) -> None:
         seen.add(uid)
         user = bot.get_user(uid)
         if user is not None:
-            to_persist.append((user.id, user.display_name))
+            to_persist.append((user.id, user.display_name, user.name))
     if not to_persist:
         return
-    placeholders = ",".join("(?, ?)" for _ in to_persist)
+    placeholders = ",".join("(?, ?, ?)" for _ in to_persist)
     flat: list = []
-    for uid, name in to_persist:
-        flat.extend([uid, name])
+    for uid, name, tag in to_persist:
+        flat.extend([uid, name, tag])
     try:
         await bot.RUN(
-            f"INSERT INTO users (discord_user_id, user_name) VALUES {placeholders} "
-            "ON CONFLICT(discord_user_id) DO UPDATE SET user_name = excluded.user_name",
+            f"INSERT INTO users (discord_user_id, user_name, user_tag) VALUES {placeholders} "
+            "ON CONFLICT(discord_user_id) DO UPDATE SET "
+            "user_name = excluded.user_name, user_tag = excluded.user_tag",
             tuple(flat),
         )
     except Exception:  # noqa: BLE001
@@ -1041,15 +1045,17 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
     # Batch the cache fallback lookup for nominators not in the in-process
     # member cache. One SQLite round-trip instead of N inside the loop.
     missing_nominators = [uid for uid in nom_user_ids if bot.get_user(uid) is None]
-    nom_name_map: dict = {}
+    nom_tag_map: dict = {}
     if missing_nominators:
         ph = ",".join("?" * len(missing_nominators))
         rows = await bot.GET(
-            f"SELECT discord_user_id, user_name FROM users "
+            f"SELECT discord_user_id, user_tag, user_name FROM users "
             f"WHERE discord_user_id IN ({ph})",
             tuple(missing_nominators),
         )
-        nom_name_map = {r[0]: r[1] for r in rows if r[1]}
+        # Prefer the unique handle; legacy rows without a tag fall back to
+        # display name so the line still identifies the nominator.
+        nom_tag_map = {r[0]: (r[1] or r[2]) for r in rows if r[1] or r[2]}
 
     # ---- Choices section: alphabetical, title link + nominator ----
     choices_lines = ["📋 **Choices**"]
@@ -1062,10 +1068,10 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
         title_link = f"[{safe_title}](https://vndb.org/{n[NOM_VNDB_ID]})"
         nom_user = bot.get_user(n[NOM_USER_ID])
         if nom_user is not None:
-            nom_name = nom_user.display_name
+            nom_tag = nom_user.name
         else:
-            nom_name = nom_name_map.get(n[NOM_USER_ID]) or "Unknown User"
-        choices_lines.append(f"`{letter}` · {title_link} · @{nom_name}")
+            nom_tag = nom_tag_map.get(n[NOM_USER_ID]) or "unknown-user"
+        choices_lines.append(f"`{letter}` · {title_link} · @{nom_tag}")
 
     # ---- Standings section: ranked DESC, ties share rank ----
     # Secondary sort by nomination id ASC mirrors TALLY_VOTES' tie-break,
