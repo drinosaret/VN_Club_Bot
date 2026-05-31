@@ -38,7 +38,7 @@ from lib.autocomplete import (
     month_picker_autocomplete, month_int_autocomplete, year_autocomplete,
     bot_guilds_autocomplete,
 )
-from lib.jiten_client import JitenClient
+from lib.jiten_client import JitenClient, resolve_display_cover
 from lib.monthly_banner import (
     MonthlyBannerGenerator,
     render_banner_for_vn_entry,
@@ -1070,13 +1070,8 @@ class VNTitleManagement(commands.Cog):
 
         _log.info(f"Added VN to pool ({status}, pool_id={new_pool_id}): {vn_info}")
 
-        embed = await EmbedBuilder.create_vn_info_embed(
-            vn_info, start_month, end_month, points,
-            title_prefix=f"VN Added ({status}): ", color=discord.Color.green(),
-            pool_id=new_pool_id,
-        )
-
         jiten_deck_id: Optional[int] = None
+        jiten_data = None
         try:
             async with JitenClient() as jiten:
                 jiten_data = await jiten.get_by_vndb_id(vn_info.vndb_id)
@@ -1084,6 +1079,12 @@ class VNTitleManagement(commands.Cog):
                 jiten_deck_id = jiten_data.deck_id
         except Exception as e:  # noqa: BLE001
             _log.warning("jiten lookup failed for %s: %s", vn_info.vndb_id, e)
+
+        embed = await EmbedBuilder.create_vn_info_embed(
+            vn_info, start_month, end_month, points,
+            title_prefix=f"VN Added ({status}): ", color=discord.Color.green(),
+            pool_id=new_pool_id, jiten_data=jiten_data,
+        )
 
         view = build_vn_links_view(vn_info.vndb_id, jiten_deck_id)
         await interaction.followup.send(
@@ -1426,6 +1427,18 @@ class VNTitleManagement(commands.Cog):
          phase, kind, _target_m, _target_end_m, winner_flag) = row
 
         vn_info = await from_vndb_id(self.bot, vndb_id)
+
+        # VNDB + jiten link buttons (mirrors /monthly); the jiten data also
+        # lets an NSFW VNDB cover fall back to the guaranteed-SFW jiten cover.
+        jiten_deck_id: Optional[int] = None
+        jiten_data = None
+        try:
+            async with JitenClient() as jiten:
+                jiten_data = await jiten.get_by_vndb_id(vndb_id)
+            jiten_deck_id = jiten_data.deck_id if jiten_data else None
+        except Exception as e:  # noqa: BLE001
+            _log.warning("jiten lookup failed for /pool_entry %s: %s", vndb_id, e)
+
         tag = _pool_row_tag(row)[1]
         display_title = (
             (vn_info.title_ja if vn_info else None)
@@ -1461,12 +1474,11 @@ class VNTitleManagement(commands.Cog):
                 value=f"<@{nominator_user_id}>",
                 inline=True,
             )
-        if (
-            vn_info
-            and getattr(vn_info, "thumbnail_url", None)
-            and not getattr(vn_info, "thumbnail_is_nsfw", False)
-        ):
-            embed.set_thumbnail(url=vn_info.thumbnail_url)
+        cover_url, cover_is_nsfw = (
+            resolve_display_cover(vn_info, jiten_data) if vn_info else (None, False)
+        )
+        if cover_url and not cover_is_nsfw:
+            embed.set_thumbnail(url=cover_url)
 
         # Top completers (last 5) for this VN in this guild.
         try:
@@ -1509,14 +1521,6 @@ class VNTitleManagement(commands.Cog):
                 inline=False,
             )
 
-        # VNDB + jiten link buttons (mirrors /monthly).
-        jiten_deck_id: Optional[int] = None
-        try:
-            async with JitenClient() as jiten:
-                data = await jiten.get_by_vndb_id(vndb_id)
-            jiten_deck_id = data.deck_id if data else None
-        except Exception as e:  # noqa: BLE001
-            _log.warning("jiten lookup failed for /pool_entry %s: %s", vndb_id, e)
         view = build_vn_links_view(vndb_id, jiten_deck_id)
         await interaction.followup.send(embed=embed, view=view)
 
@@ -1874,7 +1878,7 @@ class VNTitleManagement(commands.Cog):
                         vn_info, start_month, end_month, is_monthly_points,
                         title_prefix=embed_title_prefix,
                         color=discord.Color.blue(),
-                        pool_id=_id,
+                        pool_id=_id, jiten_data=jiten_data,
                     )
                 else:
                     vndb_extras = await fetch_vndb_extras(vndb_id)
@@ -2073,10 +2077,22 @@ class VNTitleManagement(commands.Cog):
                     if not m_vn:
                         _log.warning("season_overview: VNDB miss for monthly %s", m_vndb_id)
                         continue
+                    # Only pay the jiten lookup when the VNDB cover would
+                    # otherwise be blurred; the SFW jiten cover replaces it.
+                    m_jiten = None
+                    if bool(m_vn.thumbnail_is_nsfw):
+                        try:
+                            m_jiten = await jiten.get_by_vndb_id(m_vndb_id)
+                        except Exception as e:  # noqa: BLE001
+                            _log.warning(
+                                "jiten lookup failed for monthly pick %s: %s",
+                                m_vndb_id, e,
+                            )
+                    m_cover_url, m_is_nsfw = resolve_display_cover(m_vn, m_jiten)
                     picks.append({
-                        "cover_url": m_vn.thumbnail_url,
+                        "cover_url": m_cover_url,
                         "title": m_vn.title_ja or m_vn.title_en or m_vndb_id,
-                        "is_nsfw": bool(m_vn.thumbnail_is_nsfw),
+                        "is_nsfw": m_is_nsfw,
                     })
                 monthly_picks_by_month.append((month_label_for(month), picks))
 

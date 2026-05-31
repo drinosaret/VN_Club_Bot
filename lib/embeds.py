@@ -15,6 +15,7 @@ from lib.utils import (
 )
 from lib.monthly_banner import format_length_tier
 from lib.vndb_api import VN_Entry
+from lib.jiten_client import resolve_display_cover
 
 _log = logging.getLogger(__name__)
 
@@ -47,7 +48,8 @@ class EmbedBuilder:
         current_points: int,
         new_points: int,
         rating: int,
-        log_id: int
+        log_id: int,
+        jiten_data=None,
     ) -> discord.Embed:
         """
         Create embed for VN completion.
@@ -60,6 +62,8 @@ class EmbedBuilder:
             new_points: User's points after completion
             rating: User's rating (1-5)
             log_id: Database log entry ID
+            jiten_data: optional JitenInfo; lets an NSFW VNDB cover fall back
+                to the guaranteed-SFW jiten cover instead of being hidden.
 
         Returns:
             Configured embed for VN completion
@@ -74,8 +78,9 @@ class EmbedBuilder:
             author_icon=user.display_avatar.url
         )
 
-        if not vn_info.thumbnail_is_nsfw and vn_info.thumbnail_url:
-            embed.set_thumbnail(url=vn_info.thumbnail_url)
+        cover_url, cover_is_nsfw = resolve_display_cover(vn_info, jiten_data)
+        if not cover_is_nsfw and cover_url:
+            embed.set_thumbnail(url=cover_url)
 
         header = "**Comment**\n"
         embed.description = header + truncate_text(comment, MAX_EMBED_DESCRIPTION - len(header))
@@ -116,8 +121,9 @@ class EmbedBuilder:
             embed.set_author(name=f"Nominated by {nominator.name}",
                              icon_url=nominator.display_avatar.url)
 
-        if not vn_info.thumbnail_is_nsfw and vn_info.thumbnail_url:
-            embed.set_image(url=vn_info.thumbnail_url)
+        cover_url, cover_is_nsfw = resolve_display_cover(vn_info, jiten_data)
+        if not cover_is_nsfw and cover_url:
+            embed.set_image(url=cover_url)
 
         embed.add_field(name="VNDB", value=f"[{vn_info.vndb_id}]({vndb_link})", inline=True)
 
@@ -162,6 +168,7 @@ class EmbedBuilder:
         title_prefix: str = "",
         color: discord.Color = discord.Color.blue(),
         pool_id: Optional[int] = None,
+        jiten_data=None,
     ) -> discord.Embed:
         """
         Create embed for VN information display.
@@ -176,6 +183,8 @@ class EmbedBuilder:
             pool_id: Pool entry ID. When provided, surfaced as a "Pool ID"
                 field so users/admins can reference the row in chat or with
                 `/manage_pool action:remove`.
+            jiten_data: optional JitenInfo; lets an NSFW VNDB cover fall back
+                to the guaranteed-SFW jiten cover instead of being hidden.
 
         Returns:
             Configured embed for VN information
@@ -197,9 +206,10 @@ class EmbedBuilder:
         description = await vn_info.get_normalized_description()
         embed.add_field(name="Description", value=description, inline=False)
         
-        if not vn_info.thumbnail_is_nsfw and vn_info.thumbnail_url:
-            embed.set_thumbnail(url=vn_info.thumbnail_url)
-        
+        cover_url, cover_is_nsfw = resolve_display_cover(vn_info, jiten_data)
+        if not cover_is_nsfw and cover_url:
+            embed.set_thumbnail(url=cover_url)
+
         embed.set_footer(text="Visual Novel Club")
         return embed
 

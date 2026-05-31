@@ -43,6 +43,7 @@ from lib.pillow_helpers import (
     load_japanese_font as _load_japanese_font,
     format_compact_count as _format_compact_count,
 )
+from lib.jiten_client import resolve_display_cover
 
 logger = logging.getLogger(__name__)
 
@@ -843,11 +844,13 @@ async def render_banner_for_vn_entry(
         description_clean = await vn_info.get_normalized_description(max_length=300)
         if description_clean == "No description available.":
             description_clean = None
+    # Swap an NSFW VNDB cover for the guaranteed-SFW jiten cover when available.
+    display_cover_url, display_is_nsfw = resolve_display_cover(vn_info, jiten_data)
     return await banner_gen.generate(
         title=vn_info.title_ja or vn_info.title_en or vn_info.vndb_id,
         subtitle=vn_info.title_en if vn_info.title_ja else None,
-        cover_url=vn_info.thumbnail_url,
-        cover_is_nsfw=bool(vn_info.thumbnail_is_nsfw),
+        cover_url=display_cover_url,
+        cover_is_nsfw=display_is_nsfw,
         month_label=period_label_override or month_label_for(target_month),
         month_days=target_days,
         total_chars=chars,

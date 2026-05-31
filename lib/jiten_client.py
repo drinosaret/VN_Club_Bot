@@ -321,3 +321,26 @@ class JitenClient:
                 deck_id, character_count, (time.monotonic() - t0) * 1000,
             )
             return info
+
+
+def resolve_display_cover(vn_info, jiten_data) -> "tuple[Optional[str], bool]":
+    """Pick the cover URL + NSFW flag to actually display.
+
+    A VNDB cover flagged NSFW (image.sexual >= COVER_BLUR_THRESHOLD) is
+    replaced by the jiten.moe cover when one exists (jiten covers are always
+    SFW), so the real cover shows instead of a blur/placeholder/hidden
+    thumbnail. Otherwise the VNDB cover and its real flag are returned
+    unchanged (including the NSFW + no-jiten case, which stays flagged).
+
+    Duck-typed so it works with any object exposing the relevant attributes
+    (``VN_Entry``, ``JitenInfo``) without importing them here.
+
+    Returns ``(cover_url: Optional[str], is_nsfw: bool)``.
+    """
+    vndb_url = getattr(vn_info, "thumbnail_url", None)
+    is_nsfw = bool(getattr(vn_info, "thumbnail_is_nsfw", False))
+    if is_nsfw and jiten_data is not None:
+        jiten_cover = getattr(jiten_data, "cover_url", None)
+        if jiten_cover:
+            return jiten_cover, False
+    return vndb_url, is_nsfw

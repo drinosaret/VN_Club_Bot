@@ -9,7 +9,7 @@ from discord.ext import commands
 from lib.autocomplete import HELP_JSON_PATH
 from lib.bot import VNClubBot
 from lib.vndb_api import from_vndb_id, VN_Entry
-from lib.jiten_client import JitenClient
+from lib.jiten_client import JitenClient, JitenInfo, resolve_display_cover
 from lib.pagination import BasePaginationView, GenericPaginationView
 from lib.utils import (
     DatabaseQueries,
@@ -44,14 +44,15 @@ from math import ceil
 _log = logging.getLogger(__name__)
 
 
-async def _cache_jiten_character_count(bot: VNClubBot, vndb_id: str) -> Optional[int]:
+async def _cache_jiten_character_count(bot: VNClubBot, vndb_id: str) -> Optional[JitenInfo]:
     """Background task: look up jiten character_count for ``vndb_id`` and
     persist it onto ``vndb_cache.character_count`` for future /club_stats
-    aggregations. No-op when jiten doesn't have the VN or anything errors —
+    aggregations. No-op when jiten doesn't have the VN or anything errors;
     /club_stats has its own lazy backfill pass for misses.
 
-    Returns the jiten ``deck_id`` so callers can build a jiten.moe link button
-    without re-fetching, or ``None`` if the VN isn't on jiten / lookup failed.
+    Returns the full ``JitenInfo`` so callers can reuse its ``deck_id`` (link
+    button) and ``cover_url`` (NSFW-cover fallback) without re-fetching, or
+    ``None`` if the VN isn't on jiten / lookup failed.
     """
     try:
         async with JitenClient() as jiten:
@@ -60,7 +61,7 @@ async def _cache_jiten_character_count(bot: VNClubBot, vndb_id: str) -> Optional
             await VN_Entry.set_cached_character_count(
                 bot, vndb_id, data.character_count
             )
-        return data.deck_id if data else None
+        return data
     except Exception as e:  # noqa: BLE001
         _log.debug("jiten char-count cache miss for %s: %s", vndb_id, e)
         return None
@@ -998,10 +999,11 @@ class VNUserCommands(commands.Cog):
             # timeout) BEFORE the after-badge snapshot so character-count
             # badges can unlock on the same /finish that pushes the user
             # over a threshold. Falls back to fire-and-forget when slow.
-            # Also captures the deck id for the jiten link button below.
-            jiten_deck_id: Optional[int] = None
+            # Also captures the jiten info for the link button (deck id) and
+            # the NSFW-cover fallback (cover url) below.
+            jiten_info = None
             try:
-                jiten_deck_id = await asyncio.wait_for(
+                jiten_info = await asyncio.wait_for(
                     _cache_jiten_character_count(self.bot, vndb_id),
                     timeout=3.0,
                 )
@@ -1013,6 +1015,7 @@ class VNUserCommands(commands.Cog):
                     _cache_jiten_character_count(self.bot, vndb_id),
                     name=f"jiten-char-cache-late-{vndb_id}",
                 )
+            jiten_deck_id = jiten_info.deck_id if jiten_info else None
 
             # AFTER snapshot — set difference reveals newly-unlocked badges.
             newly_unlocked: list[str] = []
@@ -1039,6 +1042,7 @@ class VNUserCommands(commands.Cog):
                 new_total_points,
                 rating,
                 log_id,
+                jiten_data=jiten_info,
             )
 
             # Create view with undo button and VNDB / jiten.moe link buttons
@@ -2106,6 +2110,7 @@ class VNUserCommands(commands.Cog):
             average_rating = total_score / total_ratings if total_ratings > 0 else 0
 
             jiten_deck_id: Optional[int] = None
+            jiten_data = None
             try:
                 async with JitenClient() as jiten:
                     jiten_data = await jiten.get_by_vndb_id(vn_info.vndb_id)
@@ -2113,6 +2118,13 @@ class VNUserCommands(commands.Cog):
                     jiten_deck_id = jiten_data.deck_id
             except Exception as e:  # noqa: BLE001
                 _log.warning("jiten lookup failed for %s: %s", vn_info.vndb_id, e)
+
+            # Swap an NSFW VNDB cover for the guaranteed-SFW jiten cover when
+            # available; otherwise keep the existing hide-on-NSFW behavior.
+            display_cover_url, display_is_nsfw = resolve_display_cover(vn_info, jiten_data)
+            display_thumb = (
+                display_cover_url if (display_cover_url and not display_is_nsfw) else None
+            )
 
             # If we have 5 or fewer ratings, show all at once without pagination.
             # 5 chosen so each rating gets meaningful breathing room within
@@ -2134,9 +2146,9 @@ class VNUserCommands(commands.Cog):
                     color=discord.Color.blue()
                 )
 
-                # Add VN thumbnail if not NSFW and available
-                if not vn_info.thumbnail_is_nsfw and vn_info.thumbnail_url:
-                    embed.set_thumbnail(url=vn_info.thumbnail_url)
+                # display_thumb already holds the jiten cover when the VNDB one is NSFW (see above)
+                if display_thumb:
+                    embed.set_thumbnail(url=display_thumb)
 
                 embed.set_footer(text=f"{len(rating_entries)} total ratings")
                 view = build_vn_links_view(vn_info.vndb_id, jiten_deck_id)
@@ -2144,14 +2156,9 @@ class VNUserCommands(commands.Cog):
             else:
                 # Use pagination for more than 5 ratings
                 display_title = vn_info.title_ja or vn_info.title_en or "VN"
-                thumb = (
-                    vn_info.thumbnail_url
-                    if (not vn_info.thumbnail_is_nsfw and vn_info.thumbnail_url)
-                    else None
-                )
                 view = VNRatingsView(
                     rating_entries, display_title, average_rating, total_ratings,
-                    per_page=5, thumbnail_url=thumb,
+                    per_page=5, thumbnail_url=display_thumb,
                 )
                 embed = view.create_embed()
 
