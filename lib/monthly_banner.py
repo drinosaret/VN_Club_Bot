@@ -315,6 +315,7 @@ class MonthlyBannerGenerator:
         description: Optional[str] = None,
         developer: Optional[str] = None,
         tag_count: Optional[int] = None,
+        render_cover: bool = True,
     ) -> io.BytesIO:
         # The cover fetch is the only async work in the render path. Pre-fetch
         # it here, then push the heavy synchronous PIL render onto a worker
@@ -322,7 +323,7 @@ class MonthlyBannerGenerator:
         # of milliseconds.
         t0 = time.perf_counter()
         prefetched_cover: Optional[Image.Image] = None
-        if cover_url:
+        if cover_url and render_cover:
             prefetched_cover = await self._fetch_cover(cover_url)
         try:
             buf = await asyncio.to_thread(
@@ -340,6 +341,7 @@ class MonthlyBannerGenerator:
                 description=description,
                 developer=developer,
                 tag_count=tag_count,
+                render_cover=render_cover,
             )
         except Exception:
             logger.exception(
@@ -378,8 +380,13 @@ class MonthlyBannerGenerator:
         description: Optional[str] = None,
         developer: Optional[str] = None,
         tag_count: Optional[int] = None,
+        render_cover: bool = True,
     ) -> io.BytesIO:
         S = self.SCALE
+        # When the cover is hidden the text block reclaims its column: it
+        # starts at the left margin and runs the full width. With a cover it
+        # starts to the cover's right.
+        text_x = self.TEXT_X if render_cover else self.COVER_X
         img = Image.new("RGB", (self.BANNER_WIDTH, self.BANNER_HEIGHT), self.BG)
         draw = ImageDraw.Draw(img)
 
@@ -390,41 +397,44 @@ class MonthlyBannerGenerator:
         )
 
         # ---- cover ----
-        cover_box = (self.COVER_X, self.COVER_Y,
-                     self.COVER_X + self.COVER_WIDTH, self.COVER_Y + self.COVER_HEIGHT)
-        if prefetched_cover is not None:
-            raw = prefetched_cover
-            if raw is not None:
-                fitted = self._fit_cover(raw)
-                if cover_is_nsfw:
-                    # Blur flagged covers; see COVER_BLUR_THRESHOLD in lib/vndb_api.py.
-                    fitted = fitted.filter(ImageFilter.GaussianBlur(radius=20))
-                # Mask the cover with the same rounded shape as its border so
-                # the image's square corners don't poke past the rounded
-                # outline. Render the mask at OVERSAMPLE× and downsample with
-                # LANCZOS so the cover's clipped corners get anti-aliased
-                # transitions, matching the AA outline drawn over them.
-                cover_radius = 4 * S
-                oversample = 4
-                ow, oh = fitted.size[0] * oversample, fitted.size[1] * oversample
-                big_mask = Image.new("L", (ow, oh), 0)
-                ImageDraw.Draw(big_mask).rounded_rectangle(
-                    [(0, 0), (ow - 1, oh - 1)],
-                    radius=cover_radius * oversample,
-                    fill=255,
-                )
-                mask = big_mask.resize(fitted.size, Image.Resampling.LANCZOS)
-                img.paste(fitted, (self.COVER_X, self.COVER_Y), mask)
+        # Skipped entirely in coverless mode (render_cover=False) so the cover
+        # column is reclaimed by the text block rather than left as an empty box.
+        if render_cover:
+            cover_box = (self.COVER_X, self.COVER_Y,
+                         self.COVER_X + self.COVER_WIDTH, self.COVER_Y + self.COVER_HEIGHT)
+            if prefetched_cover is not None:
+                raw = prefetched_cover
+                if raw is not None:
+                    fitted = self._fit_cover(raw)
+                    if cover_is_nsfw:
+                        # Blur flagged covers; see COVER_BLUR_THRESHOLD in lib/vndb_api.py.
+                        fitted = fitted.filter(ImageFilter.GaussianBlur(radius=20))
+                    # Mask the cover with the same rounded shape as its border so
+                    # the image's square corners don't poke past the rounded
+                    # outline. Render the mask at OVERSAMPLE× and downsample with
+                    # LANCZOS so the cover's clipped corners get anti-aliased
+                    # transitions, matching the AA outline drawn over them.
+                    cover_radius = 4 * S
+                    oversample = 4
+                    ow, oh = fitted.size[0] * oversample, fitted.size[1] * oversample
+                    big_mask = Image.new("L", (ow, oh), 0)
+                    ImageDraw.Draw(big_mask).rounded_rectangle(
+                        [(0, 0), (ow - 1, oh - 1)],
+                        radius=cover_radius * oversample,
+                        fill=255,
+                    )
+                    mask = big_mask.resize(fitted.size, Image.Resampling.LANCZOS)
+                    img.paste(fitted, (self.COVER_X, self.COVER_Y), mask)
+                else:
+                    self._draw_cover_placeholder(draw, cover_box, "Cover unavailable")
+            elif cover_is_nsfw:
+                self._draw_cover_placeholder(draw, cover_box, "🔞 NSFW", bg=self.NSFW_BG)
             else:
-                self._draw_cover_placeholder(draw, cover_box, "Cover unavailable")
-        elif cover_is_nsfw:
-            self._draw_cover_placeholder(draw, cover_box, "🔞 NSFW", bg=self.NSFW_BG)
-        else:
-            self._draw_cover_placeholder(draw, cover_box, "No cover")
+                self._draw_cover_placeholder(draw, cover_box, "No cover")
 
-        # subtle frame around cover area (anti-aliased)
-        self._paste_aa_rounded(img, cover_box, radius=4 * S,
-                               outline=self.HAIRLINE, outline_w=1 * S)
+            # subtle frame around cover area (anti-aliased)
+            self._paste_aa_rounded(img, cover_box, radius=4 * S,
+                                   outline=self.HAIRLINE, outline_w=1 * S)
 
         # ---- fonts (logical sizes; rendered at SCALE×) ----
         font_eyebrow = _load_japanese_font(20 * S, bold=True)
@@ -437,7 +447,7 @@ class MonthlyBannerGenerator:
         font_callout_sub = _load_japanese_font(18 * S)
 
         # ---- header (eyebrow + attribution) ----
-        bar_x = self.TEXT_X
+        bar_x = text_x
         # Top of the bar aligns with the cover's top edge — keeps the right
         # column's top margin equal to the cover's top margin, and the
         # bottom margins land closer to balanced for both subtitle cases.
@@ -472,7 +482,7 @@ class MonthlyBannerGenerator:
             year_text = ""
             year_w = 0
 
-        max_title_w = self.TEXT_RIGHT - self.TEXT_X - int(year_w)
+        max_title_w = self.TEXT_RIGHT - text_x - int(year_w)
         title_drawn = self._truncate_to_width(draw, title, font_title, max_title_w)
         title_ascent, title_descent = font_title.getmetrics()
         title_baseline = title_y + title_ascent
@@ -480,18 +490,18 @@ class MonthlyBannerGenerator:
         # center the smaller inline year so it doesn't sit visually below
         # the title's center despite sharing its baseline.
         title_visual_middle = title_baseline - (title_ascent - title_descent) // 2
-        draw.text((self.TEXT_X, title_baseline), title_drawn,
+        draw.text((text_x, title_baseline), title_drawn,
                   fill=self.INK_PRIMARY, font=font_title, anchor="ls")
         if year_text:
             title_w = draw.textlength(title_drawn, font=font_title)
-            draw.text((self.TEXT_X + title_w, title_visual_middle),
+            draw.text((text_x + title_w, title_visual_middle),
                       year_text, fill=self.INK_TERTIARY, font=font_year, anchor="lm")
 
         subtitle_y = title_y + 50 * S
         if subtitle and subtitle.strip() and subtitle.strip() != title.strip():
             sub = self._truncate_to_width(draw, subtitle, font_subtitle,
-                                          self.TEXT_RIGHT - self.TEXT_X)
-            draw.text((self.TEXT_X, subtitle_y), sub,
+                                          self.TEXT_RIGHT - text_x)
+            draw.text((text_x, subtitle_y), sub,
                       fill=self.INK_SECONDARY, font=font_subtitle)
             after_subtitle_y = subtitle_y + 30 * S
         else:
@@ -499,7 +509,7 @@ class MonthlyBannerGenerator:
 
         # ---- tag pills (between title block and stats panel) ----
         if top_tags:
-            self._draw_tag_pills(img, draw, after_subtitle_y, top_tags)
+            self._draw_tag_pills(img, draw, after_subtitle_y, top_tags, text_x)
             stats_top = after_subtitle_y + (24 + 12) * S  # pill_h + gap below
         else:
             stats_top = after_subtitle_y + 4 * S
@@ -507,7 +517,7 @@ class MonthlyBannerGenerator:
         # ---- stats grid (2 col x 3 row) ----
         # 178 = 18 top pad + 142 content (3 rows) + 18 bottom pad — symmetric.
         stats_panel_h = 178 * S
-        panel = (self.TEXT_X, stats_top, self.TEXT_RIGHT, stats_top + stats_panel_h)
+        panel = (text_x, stats_top, self.TEXT_RIGHT, stats_top + stats_panel_h)
         self._draw_rounded_rect(draw, panel, radius=12 * S,
                                 fill=self.PANEL_BG, outline=None)
 
@@ -576,7 +586,7 @@ class MonthlyBannerGenerator:
         # ---- callout (quote-style: cream fill, accent bar on left) ----
         callout_top = stats_top + stats_panel_h + 14 * S
         callout_h = 70 * S
-        callout = (self.TEXT_X, callout_top, self.TEXT_RIGHT, callout_top + callout_h)
+        callout = (text_x, callout_top, self.TEXT_RIGHT, callout_top + callout_h)
         self._draw_rounded_rect(draw, callout, radius=10 * S,
                                 fill=self.CALLOUT_BG, outline=None)
 
@@ -683,7 +693,7 @@ class MonthlyBannerGenerator:
             y += row_h
 
     def _draw_tag_pills(self, img: Image.Image, draw: ImageDraw.ImageDraw,
-                        y: int, tags: list[str]):
+                        y: int, tags: list[str], text_x: int):
         """Render tags as small left-aligned pills, attached visually to the title block."""
         if not tags:
             return
@@ -695,14 +705,14 @@ class MonthlyBannerGenerator:
 
         widths = [int(draw.textlength(t, font=font)) + pad_x * 2 for t in tags]
 
-        avail = self.TEXT_RIGHT - self.TEXT_X
+        avail = self.TEXT_RIGHT - text_x
         kept = list(zip(tags, widths))
         while kept and (sum(w for _, w in kept) + gap * (len(kept) - 1)) > avail:
             kept.pop()
         if not kept:
             return
 
-        x = self.TEXT_X
+        x = text_x
         pill_center_y = y + pill_h // 2
 
         # Pre-render an anti-aliased pill shape by drawing at OVERSAMPLE×
@@ -812,6 +822,7 @@ async def render_banner_for_vn_entry(
     target_end_month: Optional[str] = None,
     eyebrow_label: Optional[str] = None,
     period_label_override: Optional[str] = None,
+    cover_mode: str = "shown",
 ) -> io.BytesIO:
     """
     Build a banner from a hikaru `VN_Entry` + optional `JitenInfo` + optional
@@ -826,6 +837,11 @@ async def render_banner_for_vn_entry(
     banner's eyebrow. Defaults to "VN OF THE MONTH"; pass "VN OF THE SEASON"
     for seasonal renders. `period_label_override` replaces the period text
     itself (e.g., "Spring 2026" instead of the start-month label).
+
+    ``cover_mode`` controls the cover region: ``"shown"`` (default) uses the
+    real cover (the jiten SFW swap for an NSFW VNDB cover); ``"blurred"`` forces
+    the blur on the original VNDB cover, for comparison; ``"hidden"`` drops the
+    cover and reflows the text block to the full width.
     """
     end_month = target_end_month or target_month
     target_days = (
@@ -834,7 +850,10 @@ async def render_banner_for_vn_entry(
         else days_in_month(target_month)
     )
     chars = jiten_data.character_count if jiten_data else None
-    cpd = (chars // target_days) if (chars and target_days) else None
+    # Ceil, not floor: the figure is the minimum daily pace that actually
+    # finishes the VN within the window. Floor would land a few hundred chars
+    # short over a full month.
+    cpd = (-(-chars // target_days)) if (chars and target_days) else None
     extras = vndb_extras or {}
     # Pre-clean the description text for the no-jiten callout. The
     # generate() call ignores it on the jiten-present path, so this is
@@ -844,8 +863,21 @@ async def render_banner_for_vn_entry(
         description_clean = await vn_info.get_normalized_description(max_length=300)
         if description_clean == "No description available.":
             description_clean = None
-    # Swap an NSFW VNDB cover for the guaranteed-SFW jiten cover when available.
-    display_cover_url, display_is_nsfw = resolve_display_cover(vn_info, jiten_data)
+    # Cover region per cover_mode. "shown": real cover (jiten SFW swap for an
+    # NSFW VNDB cover). "blurred": force the blur on the original VNDB cover
+    # (not the jiten swap) so the comparison shows the blur on the real art.
+    # "hidden": no cover, text reflows full-width.
+    if cover_mode == "hidden":
+        display_cover_url, display_is_nsfw, show_cover = None, False, False
+    elif cover_mode == "blurred":
+        # Force the blur only when there's actually a cover to blur; a coverless
+        # VN keeps is_nsfw False so it falls to the neutral "No cover" box rather
+        # than a misleading NSFW placeholder.
+        url = getattr(vn_info, "thumbnail_url", None) or None
+        display_cover_url, display_is_nsfw, show_cover = url, bool(url), True
+    else:
+        display_cover_url, display_is_nsfw = resolve_display_cover(vn_info, jiten_data)
+        show_cover = True
     return await banner_gen.generate(
         title=vn_info.title_ja or vn_info.title_en or vn_info.vndb_id,
         subtitle=vn_info.title_en if vn_info.title_ja else None,
@@ -869,6 +901,7 @@ async def render_banner_for_vn_entry(
         developer=extras.get("developer"),
         tag_count=extras.get("tag_count"),
         description=description_clean,
+        render_cover=show_cover,
     )
 
 

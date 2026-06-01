@@ -49,10 +49,8 @@ from lib.bot import VNClubBot
 from lib.embeds import EmbedBuilder, build_vn_links_view
 from lib.jiten_client import JitenClient
 from lib.monthly_banner import (
-    MonthlyBannerGenerator,
     days_in_month as _days_in_month_shared,
     month_label_for as _month_label_shared,
-    render_banner_for_vn_entry,
 )
 from lib.utils import (
     ANIME_SEASONS,
@@ -71,7 +69,7 @@ from lib.utils import (
     validate_month_format,
     validate_user_permission,
 )
-from lib.vndb_api import VN_Entry, fetch_vndb_extras, from_vndb_id
+from lib.vndb_api import from_vndb_id
 from lib.autocomplete import vn_autocomplete, month_picker_future_autocomplete
 from cogs.username_fetcher import cache_user
 
@@ -158,11 +156,6 @@ async def cycle_period_label_with_season(bot, cycle_row) -> str:
     if kind == "monthly":
         return _month_label(target_month)
     return await format_season_label_from_yyyy_mm(bot, target_month)
-
-
-def _eyebrow_for_kind(kind: str) -> str:
-    """Suffix that follows the period label in the banner eyebrow."""
-    return "VN OF THE SEASON" if kind == "seasonal" else "VN OF THE MONTH"
 
 
 # Nominee row column order (matches GET_CYCLE_NOMINEES SELECT).
@@ -3209,8 +3202,6 @@ class VNCycleCog(commands.Cog):
         # seat. The cycle still closes; admin can promote manually via
         # /manage_pool action:Edit if they want a different outcome.
         winners = _winners_after_tiebreak(tally, winner_count)
-        target_month = cycle[CYCLE_TARGET_MONTH]
-        target_end_month = cycle[CYCLE_TARGET_END_MONTH] or target_month
         guild_id = cycle[CYCLE_GUILD_ID]
         cycle_kind = cycle[CYCLE_KIND] or "monthly"
         period_label = await cycle_period_label_with_season(self.bot, cycle)
@@ -3268,80 +3259,22 @@ class VNCycleCog(commands.Cog):
         if vn_mgmt is not None:
             vn_mgmt._invalidate_season_overview_cache()
 
-        # Post banners for the winners in the announcement channel.
-        # When auto-closing, ``interaction`` is None and we must rely on the
-        # cycle's stored channel id (interaction.channel isn't available).
-        eyebrow_suffix = _eyebrow_for_kind(cycle_kind)
+        # Winner banners are NOT auto-posted on close. The close promotes the
+        # winner(s) and (below) edits the vote message to the final standings
+        # with the winner marked; an admin announces the banner deliberately via
+        # /monthly or /seasonal, where they can also drop the cover for a
+        # title. Resolve the channel for that vote-message edit; when
+        # auto-closing, ``interaction`` is None so rely on the stored channel id.
         channel = self.bot.get_channel(cycle[CYCLE_CHANNEL_ID])
         if channel is None and interaction is not None:
             channel = interaction.channel
         if channel is None:
             _log.error(
                 "_close_voting: no channel available for cycle %s (channel_id=%s); "
-                "skipping banner + vote-message edit.",
+                "skipping vote-message edit.",
                 cycle[CYCLE_ID], cycle[CYCLE_CHANNEL_ID],
             )
         if channel is not None:
-            async with JitenClient() as jiten, MonthlyBannerGenerator() as banner_gen:
-                for winner in winners:
-                    vndb_id = winner[1]
-                    # Per-winner try/except: the DB-side close already
-                    # committed at this point, so a Discord.HTTPException
-                    # or a VNDB outage on winner #2 must not stop us
-                    # from posting winners #3+. Each iteration is
-                    # independent. On failure, log the vndb_id so an
-                    # admin can re-post manually via /monthly or
-                    # /seasonal.
-                    try:
-                        vn_info: Optional[VN_Entry] = await from_vndb_id(self.bot, vndb_id)
-                        if not vn_info:
-                            _log.warning(
-                                "_close_voting: skipping winner %s — VNDB info unavailable",
-                                vndb_id,
-                            )
-                            continue
-                        jiten_data = None
-                        try:
-                            jiten_data = await jiten.get_by_vndb_id(vndb_id)
-                        except Exception as e:  # noqa: BLE001
-                            _log.warning("jiten lookup failed for winner %s: %s", vndb_id, e)
-                        vndb_extras = await fetch_vndb_extras(vndb_id)
-                        buf = await render_banner_for_vn_entry(
-                            banner_gen, vn_info, jiten_data, target_month,
-                            vndb_extras=vndb_extras,
-                            target_end_month=target_end_month,
-                            eyebrow_label=eyebrow_suffix,
-                            period_label_override=period_label,
-                        )
-                        file = discord.File(buf, filename=f"vn-of-the-{cycle_kind}-{vndb_id}.png")
-                        view = build_vn_links_view(
-                            vndb_id, jiten_data.deck_id if jiten_data else None,
-                        )
-                        title_str = vn_info.title_ja or vn_info.title_en or vndb_id
-                        votes_str = _votes_phrase(winner[6])
-                        vote_id_tag = f"Vote ID `{cycle[CYCLE_ID]}`"
-                        if vndb_id in promoted_pool_ids:
-                            pid = promoted_pool_ids[vndb_id]
-                            body = (
-                                f"🏆 **{period_label} winner — {title_str}**\n"
-                                f"{votes_str} · pool **#{pid}** · "
-                                f"{vote_id_tag} · "
-                                f"`/pool_entry id:{pid}` for full detail"
-                            )
-                        else:
-                            body = (
-                                f"🏆 **{period_label} winner — {title_str}**\n"
-                                f"{votes_str} · {vote_id_tag}"
-                            )
-                        await channel.send(body, file=file, view=view)
-                    except Exception:  # noqa: BLE001
-                        _log.exception(
-                            "_close_voting: failed to post winner banner for "
-                            "vndb=%s in cycle %s (other winners still posting)",
-                            vndb_id, cycle[CYCLE_ID],
-                        )
-                        continue
-
             # Edit the vote-control message: keep the final tally
             # visible (people want to see what they voted for after the
             # fact, like EasyPoll's "Final Result" section), but swap

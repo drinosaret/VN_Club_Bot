@@ -4,7 +4,7 @@ import discord.app_commands as app_commands
 import io
 import logging
 from collections import OrderedDict
-from typing import Optional
+from typing import Literal, Optional
 from discord.ext import commands
 from lib.bot import VNClubBot
 from lib.vndb_api import from_vndb_id, fetch_vndb_extras, VN_Entry, CREATE_VNDB_CACHE_TABLE
@@ -1782,15 +1782,17 @@ class VNTitleManagement(commands.Cog):
     )
     @app_commands.describe(
         embed="Switch to the legacy text embed instead of the banner image (off by default).",
+        cover="Banner cover: shown (default), blurred (force NSFW blur), or hidden. Ignored with embed:true.",
     )
     @app_commands.guild_only()
     async def monthly(
         self,
         interaction: discord.Interaction,
         embed: bool = False,
+        cover: Literal["shown", "blurred", "hidden"] = "shown",
     ):
         await self._post_pool_kind_banners(
-            interaction, kind="monthly", embed=embed,
+            interaction, kind="monthly", embed=embed, cover_mode=cover,
         )
 
     @app_commands.command(
@@ -1799,15 +1801,17 @@ class VNTitleManagement(commands.Cog):
     )
     @app_commands.describe(
         embed="Switch to the legacy text embed instead of the banner image (off by default).",
+        cover="Banner cover: shown (default), blurred (force NSFW blur), or hidden. Ignored with embed:true.",
     )
     @app_commands.guild_only()
     async def seasonal(
         self,
         interaction: discord.Interaction,
         embed: bool = False,
+        cover: Literal["shown", "blurred", "hidden"] = "shown",
     ):
         await self._post_pool_kind_banners(
-            interaction, kind="seasonal", embed=embed,
+            interaction, kind="seasonal", embed=embed, cover_mode=cover,
         )
 
     async def _post_pool_kind_banners(
@@ -1815,6 +1819,7 @@ class VNTitleManagement(commands.Cog):
         interaction: discord.Interaction,
         kind: str,
         embed: bool,
+        cover_mode: str = "shown",
     ):
         """Shared body for /monthly and /seasonal. Pre-renders every active
         ``kind`` row into a payload, then posts a single message — paginated
@@ -1894,6 +1899,7 @@ class VNTitleManagement(commands.Cog):
                         target_end_month=end_month,
                         eyebrow_label=eyebrow_suffix,
                         period_label_override=period_label,
+                        cover_mode=cover_mode,
                     )
                     payload["file_buf"] = buf
                     payload["filename"] = f"vn-of-the-{file_kind_tag}-{vndb_id}.png"
