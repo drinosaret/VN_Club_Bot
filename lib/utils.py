@@ -1167,6 +1167,16 @@ class DatabaseQueries:
     FROM vn_cycles WHERE phase = 'voting';
     """
 
+    # Closed cycles that still have an announcement message. Used on boot to
+    # re-attach a participants-only view so the Participants button keeps
+    # working on closed votes across restarts (LIST_VOTING_CYCLES only covers
+    # the full VoteView for cycles still in voting).
+    LIST_CLOSED_CYCLES = """
+    SELECT id
+    FROM vn_cycles
+    WHERE phase = 'closed' AND announcement_message_id IS NOT NULL;
+    """
+
     # Cycles in voting phase that have a closes_at in the past — picked up
     # by the background auto-close task. Limit to a sane batch so a long
     # outage doesn't try to close 500 cycles at once on first tick.
@@ -1469,6 +1479,22 @@ class DatabaseQueries:
     FROM vn_titles vt
     LEFT JOIN vndb_cache vc ON vc.vndb_id = vt.vndb_id
     WHERE vt.cycle_id = ? AND vt.status = 'nominated'
+    ORDER BY vt.created_at ASC;
+    """
+
+    # Same as GET_CYCLE_NOMINEES but keeps promoted winners (a winner's status
+    # flips to 'monthly'/'seasonal' on close while it retains its cycle_id, so
+    # the status='nominated' filter would otherwise drop it). Used by the
+    # Participants panel so it can still show who voted for the winning title
+    # after a vote closes. Status set mirrors TALLY_VOTES; same column shape
+    # as GET_CYCLE_NOMINEES (the NOM_* indices), so callers are unchanged.
+    GET_CYCLE_NOMINEES_ALL = """
+    SELECT vt.id, vt.cycle_id, vt.vndb_id, vt.nominator_user_id, vt.guild_id,
+           COALESCE(vc.title_ja, vc.title_en, vt.title_cache, vt.vndb_id) AS title,
+           vt.created_at
+    FROM vn_titles vt
+    LEFT JOIN vndb_cache vc ON vc.vndb_id = vt.vndb_id
+    WHERE vt.cycle_id = ? AND vt.status IN ('nominated', 'monthly', 'seasonal')
     ORDER BY vt.created_at ASC;
     """
 

@@ -741,6 +741,26 @@ class VoteView(discord.ui.View):
         self.add_item(ManageVotesButton(cycle_id=cycle_id))
 
 
+class ClosedVoteView(discord.ui.View):
+    """Persistent view left on a closed vote message: just the Participants
+    button, so people can still see who voted for what after voting ends.
+    The vote inputs and "Manage your votes" button are dropped since voting
+    is over.
+
+    Shares the Participants custom_id (``VOTE_PARTICIPANTS_PREFIX:{cycle_id}``)
+    with VoteView. In-session that custom_id is already registered by the live
+    VoteView, so the button keeps working immediately after close; across a
+    restart it is re-registered for closed cycles by
+    ``_register_persistent_vote_views`` (the full VoteView is only re-attached
+    for cycles still in voting).
+    """
+
+    def __init__(self, cycle_id: int):
+        super().__init__(timeout=None)
+        self.cycle_id = cycle_id
+        self.add_item(ParticipantsButton(cycle_id=cycle_id))
+
+
 async def _send_handler_error(interaction: discord.Interaction) -> None:
     """Ephemeral 'something went wrong, logged' fallback that tolerates
     either response state (already-deferred vs. fresh)."""
@@ -1220,7 +1240,10 @@ async def _handle_participants(interaction: discord.Interaction, cycle_id: int):
             "❌ This voting no longer exists.", ephemeral=True,
         )
         return
-    nominees = await bot.GET(DatabaseQueries.GET_CYCLE_NOMINEES, (cycle_id,))
+    # All-status fetch so a closed vote's panel still includes the promoted
+    # winner (its row is no longer status='nominated'). Identical to
+    # GET_CYCLE_NOMINEES during voting (nothing is promoted yet).
+    nominees = await bot.GET(DatabaseQueries.GET_CYCLE_NOMINEES_ALL, (cycle_id,))
     if not nominees:
         await interaction.followup.send(
             f"👥 **Participants — Vote ID `{cycle_id}`**\n\n"
@@ -2655,9 +2678,32 @@ class VNCycleCog(commands.Cog):
                 )
                 failed += 1
                 continue
+        # Closed cycles keep a participants-only view so the Participants
+        # button on a closed vote survives restarts. The voting loop above
+        # only re-attaches full VoteViews for cycles still in voting; a closed
+        # cycle has no live VoteView, so without this its participants
+        # custom_id would be unregistered and the button would go dead.
+        closed_attached = 0
+        try:
+            closed_rows = await self.bot.GET(DatabaseQueries.LIST_CLOSED_CYCLES)
+        except Exception:  # noqa: BLE001
+            _log.exception("register_vote_views: failed to list closed cycles")
+            closed_rows = []
+        for crow in closed_rows:
+            cid = crow[0]
+            try:
+                self.bot.add_view(ClosedVoteView(cid))
+                closed_attached += 1
+            except Exception:  # noqa: BLE001
+                _log.exception(
+                    "register_vote_views: failed to re-register closed cycle "
+                    "%s participants view",
+                    cid,
+                )
         _log.info(
-            "register_vote_views: attached=%d skipped_no_nominees=%d failed=%d (of %d voting cycles)",
-            attached, skipped_no_nominees, failed, len(rows),
+            "register_vote_views: attached=%d skipped_no_nominees=%d failed=%d "
+            "closed_participants=%d (of %d voting cycles)",
+            attached, skipped_no_nominees, failed, closed_attached, len(rows),
         )
 
     # ---------------- background auto-close ----------------
@@ -3334,11 +3380,60 @@ class VNCycleCog(commands.Cog):
                         f"Vote ID: `{cycle[CYCLE_ID]}`"
                     )
                     closed_lines.append("")
-                    body_rows = sorted(tally[:25], key=lambda t: t[5] or "")
+                    closed_lines.append(
+                        f"📊 **Standings** · {_votes_phrase(total_votes)}"
+                    )
+                    # Letters stay in nomination order so they match what
+                    # voters saw on the live message; the standings then
+                    # re-sort by votes. `tally` already arrives votes DESC,
+                    # id ASC, so iterating it is standings order and
+                    # zero-vote entries (sorted last) collapse into a tail
+                    # line, mirroring the live embed's Standings section.
+                    capped = tally[:25]
+                    # created_at, then id, as the tie-break so equal-second
+                    # nominations get the same letters the live message did.
+                    letter_by_nom = {
+                        t[0]: _VOTE_LETTERS[i]
+                        for i, t in enumerate(
+                            sorted(capped, key=lambda t: (t[5] or "", t[0]))
+                        )
+                    }
                     winner_ids = {w[0] for w in winners}
-                    for idx, t in enumerate(body_rows):
+                    # Resolve nominator handles as plain text, the way the live
+                    # embed does (bot-cache username, else the cached
+                    # users-table tag/name, else a placeholder), so the
+                    # standings read `@handle` rather than a clickable mention.
+                    voted_user_ids = [t[3] for t in capped if t[6] > 0 and t[3]]
+                    missing_noms = list({
+                        uid for uid in voted_user_ids
+                        if self.bot.get_user(uid) is None
+                    })
+                    nom_tag_map: dict = {}
+                    if missing_noms:
+                        ph = ",".join("?" * len(missing_noms))
+                        rows = await self.bot.GET(
+                            "SELECT discord_user_id, user_tag, user_name "
+                            f"FROM users WHERE discord_user_id IN ({ph})",
+                            tuple(missing_noms),
+                        )
+                        nom_tag_map = {
+                            r[0]: (r[1] or r[2]) for r in rows if r[1] or r[2]
+                        }
+                    zero_vote_letters: list[str] = []
+                    standings_rows: list[str] = []
+                    prev_votes: Optional[int] = None
+                    rank = 0
+                    for pos, t in enumerate(capped):
                         nom_id, vndb_id, title, user_id, _gid, _ca, votes = t
-                        letter = _VOTE_LETTERS[idx]
+                        letter = letter_by_nom[nom_id]
+                        if votes <= 0:
+                            zero_vote_letters.append(letter)
+                            continue
+                        # Standard competition ranking: ties share a rank,
+                        # the next distinct count skips past them (1,2,3,3,5).
+                        if votes != prev_votes:
+                            rank = pos + 1
+                            prev_votes = votes
                         pct = (votes / total_votes * 100.0) if total_votes else 0.0
                         truncated = _truncate_label(str(title), 60)
                         safe_title = (
@@ -3349,16 +3444,67 @@ class VNCycleCog(commands.Cog):
                         title_link = (
                             f"[{safe_title}](<https://vndb.org/{vndb_id}>)"
                         )
-                        nominator_mention = f"<@{user_id}>" if user_id else "—"
+                        nom_user = self.bot.get_user(user_id) if user_id else None
+                        if nom_user is not None:
+                            nom_tag = nom_user.name
+                        elif user_id:
+                            nom_tag = nom_tag_map.get(user_id) or "unknown-user"
+                        else:
+                            nom_tag = "unknown-user"
+                        nominator = f"@{nom_tag}"
                         winner_marker = " 🏆" if nom_id in winner_ids else ""
-                        closed_lines.append(
-                            f"`{letter}` — {title_link} · {nominator_mention} · "
-                            f"`{pct:5.1f}%` ({votes}){winner_marker}"
+                        standings_rows.append(
+                            f"`{rank:>2}.` `{letter}` · {title_link} · "
+                            f"{nominator} · `{pct:5.1f}%` ({votes})"
+                            f"{winner_marker}"
                         )
-                    closed_lines.extend(["", f"**{total_votes}** total vote(s)"])
+                    zero_tail = (
+                        f"_No votes: {', '.join(zero_vote_letters)}_"
+                        if zero_vote_letters else None
+                    )
+                    # Fit Discord's 2000-char message-content cap (the live
+                    # prompt uses an embed, which has more room; this closed
+                    # message is plain content). Drop the lowest-information
+                    # lines first: the zero-vote tail, then ranked rows from the
+                    # bottom, leaving a "N more" note. Without this a >2000-char
+                    # render makes vote_msg.edit raise, stranding the message on
+                    # the live (now dead) voting view.
+                    def _fit(
+                        body: list[str], tail: Optional[str], note: Optional[str]
+                    ) -> str:
+                        lines = [*closed_lines, *body]
+                        if tail is not None:
+                            lines.append(tail)
+                        if note is not None:
+                            lines.append(note)
+                        return "\n".join(lines)
+
+                    fit_body = list(standings_rows)
+                    fit_tail = zero_tail
+                    overflow_note: Optional[str] = None
+                    while len(_fit(fit_body, fit_tail, overflow_note)) > 1990:
+                        if fit_tail is not None:
+                            fit_tail = None
+                        elif fit_body:
+                            fit_body.pop()
+                            overflow_note = (
+                                f"_{len(standings_rows) - len(fit_body)} more "
+                                "in standings._"
+                            )
+                        else:
+                            break
+                    content = _fit(fit_body, fit_tail, overflow_note)
+                    if len(content) > 2000:
+                        content = content[:1990].rstrip() + "\n_truncated._"
+                    # Keep a participants-only view so people can still see who
+                    # voted for what after close; the vote inputs are gone. The
+                    # participants custom_id is already registered in-session by
+                    # the live VoteView, so we do NOT add_view here (that would
+                    # collide); boot re-registration handles it across restarts.
                     await vote_msg.edit(
-                        content="\n".join(closed_lines),
-                        view=None,
+                        content=content,
+                        embed=None,
+                        view=ClosedVoteView(cycle[CYCLE_ID]),
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 except Exception as e:  # noqa: BLE001
