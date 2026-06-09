@@ -10,11 +10,11 @@ RUN mkdir -p /app/data
 
 COPY . .
 
-# Health = log file touched in the last 10 minutes. discord.py emits heartbeat
-# log lines on the connection, so a wedged event loop or a permanent network
-# disconnect both stop touching the log and trip the check. Combined with
-# `restart: unless-stopped` in compose this turns silent wedges into automatic
-# restarts.
+# Health = log file touched in the last 10 minutes. The connection watchdog
+# (lib/bot.py) bumps the log mtime every 60s while connected, so a wedged event
+# loop or a permanent network disconnect both stop the touches and trip the
+# check. Combined with `restart: unless-stopped` in compose this turns silent
+# wedges into automatic restarts.
 #
 # LOG_FILE is read at runtime so the healthcheck honors any custom value
 # in .env (default `hikaru_bot.log`). os.path.exists guard prevents the

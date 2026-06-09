@@ -29,6 +29,8 @@ class VNClubBot(commands.Bot):
         self.cog_folder = cog_folder
         self.path_to_db = path_to_db
         self._last_heartbeat = time.time()
+        # Healthcheck (Dockerfile) reads this file's mtime; match main.py's default.
+        self._health_file = os.getenv("LOG_FILE", "hikaru_bot.log")
 
         db_directory = os.path.dirname(self.path_to_db)
         if not os.path.exists(db_directory):
@@ -60,12 +62,26 @@ class VNClubBot(commands.Bot):
 
     @tasks.loop(seconds=60)
     async def _connection_watchdog(self):
-        if not self.is_ready():
-            elapsed = time.time() - self._last_heartbeat
-            if elapsed > 300:  # 5 minutes
-                _log.error(f"Connection lost for {elapsed:.0f}s, exiting for restart")
-                await self.close()
-                sys.exit(1)
+        if self.is_ready():
+            # Keep the healthcheck green while connected (see _touch_health).
+            self._touch_health()
+            return
+        elapsed = time.time() - self._last_heartbeat
+        if elapsed > 300:  # 5 minutes
+            _log.error(f"Connection lost for {elapsed:.0f}s, exiting for restart")
+            await self.close()
+            sys.exit(1)
+
+    def _touch_health(self) -> None:
+        """Bump the log mtime so the healthcheck stays green while the bot is
+        connected but idle. Runs from the event loop, so a wedge stops the
+        touches and the check still trips.
+        """
+        try:
+            os.utime(self._health_file, None)
+        except OSError:
+            # A missing/unwritable log already fails the check on its own.
+            pass
 
     async def load_cogs(self):
         # Migrations run before any cog so cogs that read schema during
