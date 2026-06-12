@@ -21,7 +21,7 @@ A Discord bot for visual-novel reading clubs. Members log what they finish, vote
 ### Requirements
 
 - Python 3.12+ (the Docker image uses 3.12-slim)
-- A Discord bot application with a token, `applications.commands` scope, and the Server Members + Message Content intents enabled
+- A Discord bot application with a token, `applications.commands` scope, and the Server Members intent enabled
 
 ### Configuration
 
@@ -29,7 +29,6 @@ Copy [.env.example](.env.example) to `.env` and fill it in:
 
 ```ini
 TOKEN=your_discord_bot_token
-COMMAND_PREFIX=.
 PATH_TO_DB=data/db.sqlite3
 
 AUTHORIZED_USERS=<your_user_id>
@@ -37,10 +36,9 @@ AUTHORIZED_USERS=<your_user_id>
 # Optional
 DB_BACKUP_CHANNEL=0        # Channel ID for startup/scheduled DB backups (0 disables)
 LOG_FILE=hikaru_bot.log    # Log file path
-SYNC_COMMANDS=false        # Set true to auto-sync the command tree on each boot
 ```
 
-`AUTHORIZED_USERS` is the comma-separated list of user IDs treated as bot operators. Operators can run the `sync_global` / `sync_guild` admin commands (prefix commands; see `COMMAND_PREFIX`), grant or revoke per-guild VN-manager permissions via `/manage_managers`, and use admin commands across any server the bot is in without needing a per-guild grant of their own. Keep this list small. Usually just whoever runs the host.
+`AUTHORIZED_USERS` is the comma-separated list of user IDs treated as bot operators. Operators grant or revoke per-guild VN-manager permissions via `/manage_managers`, and use admin commands across any server the bot is in without needing a per-guild grant of their own. Keep this list small. Usually just whoever runs the host.
 
 Per-guild VN managers (who can use `/manage_pool`, `/manage_voting`, etc. inside a given server) are managed at runtime via `/manage_managers`, not the env. After deploy, an `AUTHORIZED_USERS` member runs `/manage_managers action:add guild_id:<server> user:@someone` (or `role:@somerole`). The `guild_id` parameter is required and autocompletes a dropdown of every server the bot is in, so you always pick the target server explicitly. Each guild's list is independent: a manager in one server has no automatic permissions in any other.
 
@@ -63,7 +61,7 @@ python main.py
 
 On first boot the bot creates `data/db.sqlite3` and applies the full migration chain. Subsequent boots re-run migrations idempotently. The schema spans 20 versioned steps in [`lib/migrations.py`](lib/migrations.py). Each destructive schema step writes a `*_backup` table inside the DB before mutating, so rollback is a `DROP TABLE` plus `ALTER TABLE ... RENAME` away.
 
-After the bot is online, run `.sync_global` once (as an `AUTHORIZED_USERS` member; replace `.` with your configured `COMMAND_PREFIX`) to register the slash commands globally. Or set `SYNC_COMMANDS=true` and restart for an automatic sync. Global syncs are rate-limited to one per minute, so on-demand `.sync_global` is the preferred way to ship command changes.
+Slash commands sync automatically on every startup (in `setup_hook`, which runs once per process), so shipping command changes is just a restart. Discord can take a short while to propagate global command updates to clients.
 
 ## Commands
 

@@ -10,7 +10,7 @@ _log = logging.getLogger(__name__)
 
 
 class VNClubBot(commands.Bot):
-    def __init__(self, command_prefix, cog_folder="cogs", path_to_db="data/db.sqlite3"):
+    def __init__(self, cog_folder="cogs", path_to_db="data/db.sqlite3"):
         # AllowedMentions.none() as the bot-wide default means no
         # message the bot sends pings @everyone / @here / a role /
         # a user *unless* the calling code explicitly overrides via
@@ -19,9 +19,20 @@ class VNClubBot(commands.Bot):
         # admin announcements; without this default, a manager
         # writing a `reason` that contains `@everyone` would ring
         # the channel. Backtick formatting does NOT suppress pings.
+        # Request only the Server Members privileged intent. role_rewards resolves
+        # members via guild.get_member to grant milestone roles. Message Content and
+        # Presence are deliberately excluded: nothing reads message text (every
+        # command is a slash command) or member presence. Past Discord's
+        # verification threshold an unapproved privileged intent blocks login, so
+        # do not widen this back to discord.Intents.all().
+        intents = discord.Intents.default()
+        intents.members = True
+        # Slash-command-only bot. when_mentioned (instead of a string prefix) means
+        # there are no prefix commands, so discord.py never warns about the missing
+        # Message Content intent and nothing depends on it.
         super().__init__(
-            command_prefix=command_prefix,
-            intents=discord.Intents.all(),
+            command_prefix=commands.when_mentioned,
+            intents=intents,
             allowed_mentions=discord.AllowedMentions.none(),
             # Disable the auto-registered ``.help`` — /help is the user-facing one.
             help_command=None,
@@ -41,20 +52,20 @@ class VNClubBot(commands.Bot):
         _log.info("Logged in as %s (id=%s)", self.user, getattr(self.user, "id", "?"))
         await self.change_presence(activity=discord.Game(name="装甲悪鬼村正"))
 
-        # Auto-sync commands globally — gated on SYNC_COMMANDS=true so reconnects
-        # don't burn the 1/min global-sync rate-limit and silently fail. For a
-        # routine deploy, leave this unset and use /sync (cogs/sync.py) on demand.
-        if os.getenv("SYNC_COMMANDS", "").lower() == "true":
-            try:
-                synced = await self.tree.sync()
-                _log.info("Synced %d command(s) globally", len(synced))
-            except Exception:
-                _log.exception("Failed to sync commands")
-
     async def setup_hook(self):
         self.tree.on_error = self.on_application_command_error
         if not self._connection_watchdog.is_running():
             self._connection_watchdog.start()
+        # Sync the command tree once per process. setup_hook runs a single time per
+        # login (unlike on_ready, which re-fires on every reconnect), so this never
+        # hammers the global-sync rate limit. Wrapped so a transient Discord error
+        # doesn't abort startup: the previously-synced set stays live and the next
+        # restart re-syncs.
+        try:
+            synced = await self.tree.sync()
+            _log.info("Synced %d command(s) globally", len(synced))
+        except discord.HTTPException as e:
+            _log.error("Command sync failed (keeping existing set; restart to retry): %s", e)
 
     async def on_resumed(self):
         self._last_heartbeat = time.time()
