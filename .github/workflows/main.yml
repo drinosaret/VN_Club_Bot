@@ -6,17 +6,101 @@ on:
       - master
   workflow_dispatch:
 
-env:
-  TOKEN: ${{ secrets.TOKEN }}
-  COMMAND_PREFIX: ${{ vars.COMMAND_PREFIX }}
-  PATH_TO_DB: ${{ vars.PATH_TO_DB }}
-  AUTHORIZED_USERS: ${{ vars.AUTHORIZED_USERS }}
-  DB_BACKUP_CHANNEL: ${{ vars.DB_BACKUP_CHANNEL }}
+# Least privilege: these jobs only read the repo; no GITHUB_TOKEN writes.
+permissions:
+  contents: read
 
 jobs:
+  # Pre-deploy gate: build the image and audit Python deps BEFORE the deploy
+  # job stops the running bot, so a broken build or a vulnerable dependency
+  # blocks the deploy instead of taking hikaru offline. deploy needs this.
+  verify:
+    name: Verify (build + pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Build image
+        run: docker build .
+      - name: Audit Python dependencies
+        run: |
+          python3 -m venv /tmp/audit
+          /tmp/audit/bin/pip install --quiet --upgrade pip pip-audit
+          /tmp/audit/bin/pip-audit -r requirements.txt
+
+  # Hard gate: deploy only if CodeQL has finished and opened no critical/high
+  # alert. Waits for the CodeQL "Analyze" checks to pass, then verifies the open
+  # alert count. Fail-closed: a check that never reports, or an API error, also
+  # blocks. Update REQUIRED if CodeQL's languages change (it posts one
+  # "Analyze (<lang>)" check per language).
+  required-checks:
+    name: Require CodeQL green
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+      security-events: read
+    steps:
+      - name: Wait for CodeQL to pass, then verify no open critical/high alerts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REQUIRED=(
+            "Analyze (actions)"
+            "Analyze (python)"
+          )
+          deadline=$(( $(date +%s) + 1800 ))   # wait up to 30 minutes
+          runs_api="repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100"
+          while :; do
+            runs="$(gh api --paginate "$runs_api" --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+            pending=""; failed=""
+            for name in "${REQUIRED[@]}"; do
+              line="$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1==n{print; exit}')"
+              if [ -z "$line" ]; then pending+="  - ${name} (not reported yet)"$'\n'; continue; fi
+              status="$(printf '%s' "$line" | cut -f2)"
+              conclusion="$(printf '%s' "$line" | cut -f3)"
+              if [ "$status" != "completed" ]; then pending+="  - ${name} (${status})"$'\n'; continue; fi
+              case "$conclusion" in
+                success|neutral|skipped) ;;
+                *) failed+="  - ${name} (${conclusion})"$'\n' ;;
+              esac
+            done
+            if [ -n "$failed" ]; then
+              printf 'Deploy blocked - these checks did not pass:\n%s' "$failed"; exit 1
+            fi
+            if [ -z "$pending" ]; then
+              echo "All required checks passed."; break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              printf 'Deploy blocked - timed out waiting for:\n%s' "$pending"; exit 1
+            fi
+            printf 'Waiting on:\n%s' "$pending"; sleep 20
+          done
+
+          # CodeQL is green. Final guard: refuse to deploy with any open
+          # critical/high CodeQL alert (findings are alerts, not red checks).
+          if ! alerts="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/code-scanning/alerts?state=open&per_page=100" \
+            --jq '.[] | select(.rule.security_severity_level=="critical" or .rule.security_severity_level=="high") | .number')"; then
+            echo "Deploy blocked - could not read CodeQL alerts (failing closed)."; exit 1
+          fi
+          count="$(printf '%s\n' "$alerts" | grep -c '[0-9]' || true)"
+          if [ "$count" -gt 0 ]; then
+            echo "Deploy blocked - ${count} open critical/high CodeQL alert(s). See the Security tab."; exit 1
+          fi
+          echo "No open critical/high CodeQL alerts. Cleared to deploy."
+
   deploy:
     name: Deploy Hikaru
+    needs: [verify, required-checks]
     runs-on: self-hosted
+    # Bot secrets/config scoped to the deploy job only (kept off the
+    # GitHub-hosted build/audit runner).
+    env:
+      TOKEN: ${{ secrets.TOKEN }}
+      COMMAND_PREFIX: ${{ vars.COMMAND_PREFIX }}
+      PATH_TO_DB: ${{ vars.PATH_TO_DB }}
+      AUTHORIZED_USERS: ${{ vars.AUTHORIZED_USERS }}
+      DB_BACKUP_CHANNEL: ${{ vars.DB_BACKUP_CHANNEL }}
 
     steps:
       - name: Checkout code
