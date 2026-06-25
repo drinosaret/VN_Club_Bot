@@ -1376,7 +1376,9 @@ class VNUserCommands(commands.Cog):
         total_entries, total_points, monthly_entries, vn_entries = stats_result
 
         if total_entries == 0:
-            await interaction.followup.send(f"{user.name} has no reading logs yet.")
+            await interaction.followup.send(
+                f"{user.name} hasn't logged any finished VNs yet. Use /finish to log your first one!"
+            )
             return
 
         # Get most active server

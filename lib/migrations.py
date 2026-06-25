@@ -54,6 +54,7 @@ async def run_migrations(bot) -> None:
         await _drop_vn_cycles_target_month_unique(bot)
         await _create_guild_managers_table(bot)
         await _add_vn_titles_nomination_dedup_index(bot)
+        await _add_vn_titles_vn_period_dedup_index(bot)
         await _create_migration_markers_table(bot)
         await _invalidate_vndb_cache_for_blur_threshold(bot)
         await _backfill_vndb_cache_after_blur_invalidation(bot)
@@ -1038,6 +1039,44 @@ async def _add_vn_titles_nomination_dedup_index(bot) -> None:
             "/nominate stays functional via the existing SELECT-then-decide "
             "guard, but the TOCTOU race window is not closed until duplicates "
             "are cleaned up and the bot restarts."
+        )
+
+
+async def _add_vn_titles_vn_period_dedup_index(bot) -> None:
+    """Partial UNIQUE INDEX so the SAME VN can't be nominated twice for the
+    SAME period in a guild, regardless of nominator.
+
+    Companion to idx_vn_titles_nomination_dedup. That one is keyed on the
+    nominator (one slot per user per period); this one is keyed on the VN
+    (one nomination per VN per period) and closes the cross-user gap where
+    two different users nominate the same VN, stacking a duplicate onto one
+    ballot. Keyed on (vndb_id, guild_id, start_month, end_month) scoped to
+    status='nominated' so promoted picks (status='monthly'/'seasonal') don't
+    collide with new nominations in later periods, and the exact-period key
+    leaves monthly + seasonal lanes independent.
+
+    Like its sibling: if a legacy DB already holds duplicate active
+    nominations, index creation raises IntegrityError; log and continue so
+    the cog-level guard keeps /nominate functional. The window closes once
+    the duplicates are cleaned and the bot restarts.
+    """
+    cols = await _column_names(bot, "vn_titles")
+    if not cols:
+        return  # fresh install: cog creates the table; we re-run on next boot
+    try:
+        await bot.RUN(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_vn_titles_vn_period_dedup "
+            "ON vn_titles (vndb_id, guild_id, start_month, end_month) "
+            "WHERE status = 'nominated'"
+        )
+    except Exception:
+        _log.exception(
+            "Could not create idx_vn_titles_vn_period_dedup; likely a legacy "
+            "duplicate-VN nomination (same VN nominated twice for one period). "
+            "/nominate stays functional via the cog-level guard, but the "
+            "TOCTOU race window is not closed until duplicates are cleaned up "
+            "and the bot restarts."
         )
 
 

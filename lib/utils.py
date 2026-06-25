@@ -1451,6 +1451,45 @@ class DatabaseQueries:
     LIMIT 1;
     """
 
+    # Nominator-blind sibling of the dedupe query above: find any pending
+    # nomination of a given VN for the EXACT period in this guild, no matter
+    # who nominated it. The per-user query can't catch a *second* user
+    # nominating an already-nominated VN; without this the same VN stacks
+    # twice onto one ballot (vote-splitting + double-counts the 25 cap).
+    # Exact-period match keeps monthly and seasonal lanes independent, same
+    # as the per-user dedupe. Bind: (vndb_id, start_month, end_month, guild_id).
+    GET_NOMINATION_BY_VN_AND_PERIOD = """
+    SELECT id, nominator_user_id
+    FROM vn_titles
+    WHERE vndb_id = ?
+      AND status = 'nominated'
+      AND start_month = ? AND end_month = ?
+      AND (guild_id IS NULL OR guild_id = ?)
+    LIMIT 1;
+    """
+
+    # Pool-wide sibling of GET_NOMINATION_BY_VN_AND_PERIOD: find ANY pool entry
+    # for a VN in the EXACT period for this guild, whatever the status (a
+    # pending nomination OR an already-decided monthly/seasonal/special pick).
+    # /nominate uses this to block re-nominating a VN that is already in the
+    # pool for that exact period, and branches the message on the returned
+    # status. Picks sort before nominations so a legacy pick+nomination
+    # coexistence reports the pick deterministically rather than relying on
+    # LIMIT 1 order. Exact-period match keeps monthly and seasonal lanes
+    # independent. NULL-guild (legacy global) picks intentionally match in
+    # every guild, mirroring how /pool and /monthly already surface them, so
+    # keep the IS NULL clause rather than narrowing to a strict guild_id = ?.
+    # Bind: (vndb_id, start_month, end_month, guild_id).
+    GET_POOL_ENTRY_BY_VN_AND_PERIOD = """
+    SELECT id, status, nominator_user_id
+    FROM vn_titles
+    WHERE vndb_id = ?
+      AND start_month = ? AND end_month = ?
+      AND (guild_id IS NULL OR guild_id = ?)
+    ORDER BY (status = 'nominated') ASC, id ASC
+    LIMIT 1;
+    """
+
     # Re-point an existing 'nominated' vn_titles row at a different VN.
     # Used when a user re-runs /nominate for a month they've already
     # nominated for and the cycle isn't actively voting — replace the
@@ -1585,6 +1624,33 @@ class DatabaseQueries:
       AND cycle_id IS NOT NULL
       AND start_month = ? AND end_month = ?
       AND (guild_id IS NULL OR guild_id = ?);
+    """
+
+    # Reopen helper, runs just before DEMOTE. After a close the winner is
+    # status='monthly'/'seasonal', invisible to the /nominate dup guard (which
+    # only sees 'nominated'), so a user can re-nominate that exact VN for the
+    # same period, creating a second 'nominated' row. DEMOTE would then flip
+    # the winner back to 'nominated' too and the two rows collide on
+    # idx_vn_titles_vn_period_dedup, rolling the whole reopen back. Drop the
+    # standalone re-nomination first: it is cycle_id IS NULL (never swept, so
+    # it carries no votes) and the VN returns to the ballot via the demoted
+    # winner, so nothing is lost. Rows with votes (cycle_id set) are never
+    # touched, so a multi-attached edge just leaves the index unformed rather
+    # than deleting a voted row.
+    # Bind: (start_month, end_month, guild_id, start_month, end_month, guild_id).
+    DELETE_REDUNDANT_NOMINATIONS_FOR_REOPEN = """
+    DELETE FROM vn_titles
+    WHERE status = 'nominated'
+      AND cycle_id IS NULL
+      AND start_month = ? AND end_month = ?
+      AND (guild_id IS NULL OR guild_id = ?)
+      AND vndb_id IN (
+          SELECT vndb_id FROM vn_titles
+          WHERE status IN ('monthly', 'seasonal')
+            AND cycle_id IS NOT NULL
+            AND start_month = ? AND end_month = ?
+            AND (guild_id IS NULL OR guild_id = ?)
+      );
     """
 
     # Drop any still-nominated rows tied to a cancelled cycle. Without this

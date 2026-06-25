@@ -178,7 +178,9 @@ _SEASON_CHOICES = [
 POOL_FILTER_CHOICES = [
     app_commands.Choice(name="All", value="all"),
     app_commands.Choice(name="Monthly picks only", value="monthly"),
-    app_commands.Choice(name="Seasonal picks only", value="seasonal"),
+    # No "Seasonal picks only": /pool opens in monthly view, which only shows
+    # single-month rows, so seasonal picks (always multi-month) never match.
+    # Seasonal picks live behind the "🌸 Seasonal view" toggle on the embed.
     app_commands.Choice(name="Special picks only", value="special"),
     app_commands.Choice(name="Nominations only", value="nominations"),
 ]

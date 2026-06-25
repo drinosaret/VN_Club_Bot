@@ -3517,7 +3517,8 @@ class VNCycleCog(commands.Cog):
                 "reopening another one of the same kind.",
             )
 
-        # Atomic: reopen + demote winners + re-sweep nominations.
+        # Atomic: reopen + drop redundant re-noms + demote winners +
+        # re-sweep nominations.
         # The demote and sweep are PERIOD-based (not cycle_id based)
         # because a later cycle for the same target month may have
         # already swept these rows' cycle_id away from `cycle_id`.
@@ -3526,6 +3527,12 @@ class VNCycleCog(commands.Cog):
         # sweep then re-attaches them to this reopened cycle so the
         # tally / nominees-list queries (filtered by cycle_id) find
         # them again.
+        # The DELETE runs first: if a user re-nominated a just-won VN
+        # during the closed window, demoting the winner back to
+        # 'nominated' would collide with that standalone re-nom on
+        # idx_vn_titles_vn_period_dedup and roll the reopen back. We
+        # drop the vote-less re-nom so the VN comes back via the
+        # demoted winner row instead.
         target_month = target[CYCLE_TARGET_MONTH]
         target_end_month = target[CYCLE_TARGET_END_MONTH] or target_month
         guild_id = target[CYCLE_GUILD_ID]
@@ -3535,6 +3542,11 @@ class VNCycleCog(commands.Cog):
         )
         await self.bot.RUN_TRANSACTION([
             (DatabaseQueries.REOPEN_CYCLE, (cycle_id,)),
+            (
+                DatabaseQueries.DELETE_REDUNDANT_NOMINATIONS_FOR_REOPEN,
+                (target_month, target_end_month, guild_id,
+                 target_month, target_end_month, guild_id),
+            ),
             (
                 DatabaseQueries.DEMOTE_PERIOD_PICKS_TO_NOMINATIONS,
                 (target_month, target_end_month, guild_id),
@@ -3820,6 +3832,38 @@ class VNCycleCog(commands.Cog):
 
             display_title = vn_info.title_ja or vn_info.title_en or vndb_id
 
+            # Block nominating a VN that is already in the pool for the SAME
+            # exact period, whether as a pending nomination OR an already
+            # decided pick (monthly/seasonal/special). The per-user `existing`
+            # lookup above only sees this user's own pending nomination, so it
+            # misses both a second user nominating the same VN and a VN that
+            # already won (or was admin-set as) the pick for the period. Skip
+            # when the only match is this user's own pending row (the same-VN
+            # re-run no-op / own-nomination swap handled below; that row is
+            # always 'nominated', never a pick). Exact-period match keeps
+            # monthly and seasonal lanes independent.
+            existing_id_for_period = existing[0] if existing else None
+            pool_dup = await self.bot.GET_ONE(
+                DatabaseQueries.GET_POOL_ENTRY_BY_VN_AND_PERIOD,
+                (vndb_id, start_month, end_month, interaction.guild.id),
+            )
+            if pool_dup and pool_dup[0] != existing_id_for_period:
+                dup_id, dup_status, _ = pool_dup
+                if dup_status == "nominated":
+                    raise ValidationError(
+                        "already nominated",
+                        f"**{display_title}** is already nominated for "
+                        f"**{period_label}** (pool entry **#{dup_id}**). It'll "
+                        "be on the ballot when voting opens, so there's no need to "
+                        "nominate it again.",
+                    )
+                raise ValidationError(
+                    "already a pick",
+                    f"**{display_title}** is already the {dup_status} pick for "
+                    f"**{period_label}** (pool entry **#{dup_id}**), so there's "
+                    "no need to nominate it again.",
+                )
+
             if existing:
                 existing_id, existing_vndb_id, _, _ = existing
                 pool_id = existing_id
@@ -3852,10 +3896,13 @@ class VNCycleCog(commands.Cog):
                      interaction.user.id, display_title),
                 )
                 if not pool_id:
-                    # Race: a concurrent /nominate from the same user for
-                    # the same period landed first and the partial unique
-                    # index made this INSERT a no-op. Same UX as the
-                    # SELECT-then-decide "already nominated" path.
+                    # Race: a concurrent /nominate landed first (the same user
+                    # for the same period, or a different user nominating this
+                    # same VN) and a partial unique index made this INSERT a
+                    # no-op. Same UX as the SELECT-then-decide "already
+                    # nominated" path; the wording assumes the same-user case,
+                    # which is by far the likeliest since Discord serializes a
+                    # given user's interactions.
                     await interaction.followup.send(
                         f"ℹ️ You've already nominated a VN for "
                         f"**{period_label}**. Re-run with a different VN "
