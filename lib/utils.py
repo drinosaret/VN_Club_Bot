@@ -102,6 +102,15 @@ def season_to_months(season: str, year: int) -> List[str]:
     return [f"{year:04d}-{m:02d}" for m in months]
 
 
+def next_month(yyyy_mm: str) -> str:
+    """Return the YYYY-MM that follows the given one."""
+    y, m = yyyy_mm.split("-")
+    yi, mi = int(y), int(m)
+    if mi == 12:
+        return f"{yi + 1:04d}-01"
+    return f"{yi:04d}-{mi + 1:02d}"
+
+
 def current_anime_season() -> tuple[str, int]:
     """(season_name, year) for today — used to default `/season_overview`."""
     now = datetime.now()
@@ -478,6 +487,38 @@ async def handle_command_error(
 
 # ==================== VALIDATION HELPERS ====================
 
+async def _requester_is_manager(interaction: discord.Interaction) -> bool:
+    """Pure manager check: True if the requester is an operator
+    (``AUTHORIZED_USERS``) or holds a per-guild user/role grant in
+    ``guild_managers``. No logging, no raising. Shared by
+    ``validate_user_permission`` (which adds the deny log + raise) and
+    ``is_manager`` (a soft gate that must NOT emit an auth_denied log)."""
+    if interaction.user.id in AUTHORIZED_USER_IDS:
+        return True
+    if interaction.guild_id is None:
+        return False
+    bot = interaction.client
+    user_hit = await bot.GET_ONE(
+        "SELECT 1 FROM guild_managers WHERE guild_id = ? "
+        "AND principal_type = 'user' AND principal_id = ? LIMIT 1",
+        (interaction.guild_id, interaction.user.id),
+    )
+    if user_hit:
+        return True
+    role_ids = [r.id for r in interaction.user.roles] if hasattr(interaction.user, "roles") else []
+    if role_ids:
+        placeholders = ",".join("?" * len(role_ids))
+        role_hit = await bot.GET_ONE(
+            f"SELECT 1 FROM guild_managers WHERE guild_id = ? "
+            f"AND principal_type = 'role' AND principal_id IN ({placeholders}) "
+            f"LIMIT 1",
+            (interaction.guild_id, *role_ids),
+        )
+        if role_hit:
+            return True
+    return False
+
+
 async def validate_user_permission(interaction: discord.Interaction, custom_message: str = None) -> bool:
     """
     Validate if the requester is a VN manager for the *current* guild.
@@ -507,14 +548,14 @@ async def validate_user_permission(interaction: discord.Interaction, custom_mess
     Raises:
         ValidationError: If user lacks permission
     """
-    # Tier 1: global bypass for bot operators.
-    if interaction.user.id in AUTHORIZED_USER_IDS:
+    if await _requester_is_manager(interaction):
         return True
 
-    # DM context — no guild to scope against; manager perms are
-    # inherently per-guild so this can't pass.
+    # Denied. Log + raise, distinguishing DM context (no guild to scope
+    # against) from a real in-guild non-manager. Operators already returned
+    # True above, so reaching here in a DM means a non-operator in a DM.
+    command_name = getattr(getattr(interaction, "command", None), "name", "<no-command>")
     if interaction.guild_id is None:
-        command_name = getattr(getattr(interaction, "command", None), "name", "<no-command>")
         _log.info(
             "auth_denied: user=%s command=%s reason=dm-context",
             interaction.user.id, command_name,
@@ -523,33 +564,6 @@ async def validate_user_permission(interaction: discord.Interaction, custom_mess
             f"User {interaction.user.id} attempted manager command in DM",
             custom_message or "This command must be run inside a server.",
         )
-
-    bot = interaction.client
-
-    # Tier 2a: per-guild user grant.
-    user_hit = await bot.GET_ONE(
-        "SELECT 1 FROM guild_managers WHERE guild_id = ? "
-        "AND principal_type = 'user' AND principal_id = ? LIMIT 1",
-        (interaction.guild_id, interaction.user.id),
-    )
-    if user_hit:
-        return True
-
-    # Tier 2b: per-guild role grant. interaction.user is discord.Member
-    # under @guild_only() so .roles is always present.
-    role_ids = [r.id for r in interaction.user.roles] if hasattr(interaction.user, "roles") else []
-    if role_ids:
-        placeholders = ",".join("?" * len(role_ids))
-        role_hit = await bot.GET_ONE(
-            f"SELECT 1 FROM guild_managers WHERE guild_id = ? "
-            f"AND principal_type = 'role' AND principal_id IN ({placeholders}) "
-            f"LIMIT 1",
-            (interaction.guild_id, *role_ids),
-        )
-        if role_hit:
-            return True
-
-    command_name = getattr(getattr(interaction, "command", None), "name", "<no-command>")
     _log.info(
         "auth_denied: user=%s guild=%s command=%s reason=not-manager",
         interaction.user.id, interaction.guild_id, command_name,
@@ -558,6 +572,14 @@ async def validate_user_permission(interaction: discord.Interaction, custom_mess
         f"User {interaction.user.id} lacks manager permission in guild {interaction.guild_id}",
         custom_message or "You don't have permission to use this command in this server.",
     )
+
+
+async def is_manager(interaction: discord.Interaction) -> bool:
+    """Non-logging permission probe. True if the requester is an operator or a
+    manager for the current guild, else False. Used by the /nominate theme gate:
+    a non-manager is the normal case there (not a denied action), so unlike
+    validate_user_permission this emits NO auth_denied log."""
+    return await _requester_is_manager(interaction)
 
 
 async def validate_month_input(interaction: discord.Interaction, month: str = None) -> str:
@@ -1024,6 +1046,66 @@ class DatabaseQueries:
     FROM guild_managers
     WHERE guild_id = ?
     ORDER BY added_at ASC;
+    """
+
+    # ---------------- theme templates + assignments ----------------
+    # Per-guild reusable theme library + per-period rule snapshots read by
+    # the /nominate gate. guild_id is always a real id (never NULL) so a
+    # theme can't leak across servers.
+    INSERT_THEME_TEMPLATE = """
+    INSERT INTO theme_templates (guild_id, name, rules_json, created_by_user_id)
+    VALUES (?, ?, ?, ?);
+    """
+
+    GET_THEME_TEMPLATE = """
+    SELECT id, name, rules_json FROM theme_templates WHERE id = ? AND guild_id = ?;
+    """
+
+    LIST_THEME_TEMPLATES = """
+    SELECT id, name, rules_json FROM theme_templates
+    WHERE guild_id = ? ORDER BY name COLLATE NOCASE;
+    """
+
+    UPDATE_THEME_TEMPLATE = """
+    UPDATE theme_templates SET name = ?, rules_json = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND guild_id = ?;
+    """
+
+    DELETE_THEME_TEMPLATE = """
+    DELETE FROM theme_templates WHERE id = ? AND guild_id = ?;
+    """
+
+    # Snapshot-on-apply: the assignment carries its own rules_json copy, so
+    # later edits/deletes to the source template never change an applied
+    # period. Upsert keyed by the period identity.
+    UPSERT_THEME_ASSIGNMENT = """
+    INSERT INTO theme_assignments
+        (guild_id, kind, start_month, end_month, label, rules_json, source_template_id, created_by_user_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(guild_id, kind, start_month, end_month) DO UPDATE SET
+        label = excluded.label,
+        rules_json = excluded.rules_json,
+        source_template_id = excluded.source_template_id,
+        updated_at = CURRENT_TIMESTAMP;
+    """
+
+    # The gate lookup. STRICT guild_id (no NULL-or clause): theme rows always
+    # carry a real guild_id, so scoping is exact and a theme never leaks
+    # across guilds.
+    GET_THEME_ASSIGNMENT_FOR_PERIOD = """
+    SELECT label, rules_json FROM theme_assignments
+    WHERE guild_id = ? AND kind = ? AND start_month = ? AND end_month = ?;
+    """
+
+    LIST_THEME_ASSIGNMENTS = """
+    SELECT kind, start_month, end_month, label, rules_json
+    FROM theme_assignments WHERE guild_id = ?
+    ORDER BY start_month DESC, kind;
+    """
+
+    DELETE_THEME_ASSIGNMENT = """
+    DELETE FROM theme_assignments
+    WHERE guild_id = ? AND kind = ? AND start_month = ? AND end_month = ?;
     """
 
     # ---------------- /club_stats aggregates ----------------

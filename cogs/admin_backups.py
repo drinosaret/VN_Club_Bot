@@ -38,7 +38,7 @@ class AdminBackups(commands.Cog):
 
     @app_commands.command(
         name="manage_backups",
-        description="Post a database backup to the backup channel now (bot operator only).",
+        description="[ADMIN] Post a database backup to the backup channel now.",
     )
     @app_commands.default_permissions(administrator=True)
     async def manage_backups(self, interaction: discord.Interaction):

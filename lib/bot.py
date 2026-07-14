@@ -26,7 +26,13 @@ class VNClubBot(commands.Bot):
         # verification threshold an unapproved privileged intent blocks login, so
         # do not widen this back to discord.Intents.all().
         intents = discord.Intents.default()
-        intents.members = True
+        # Env-gated recovery valve: if Discord revokes Server Members approval,
+        # requesting it here fails login with gateway close 4014 and crash-loops
+        # the container. Set MEMBERS_INTENT=false and restart to recover without a
+        # code deploy. Keep it on while approved (role_rewards no-ops without it).
+        intents.members = os.getenv("MEMBERS_INTENT", "true").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
         # Slash-command-only bot. when_mentioned (instead of a string prefix) means
         # there are no prefix commands, so discord.py never warns about the missing
         # Message Content intent and nothing depends on it.
@@ -50,6 +56,11 @@ class VNClubBot(commands.Bot):
     async def on_ready(self):
         self._last_heartbeat = time.time()
         _log.info("Logged in as %s (id=%s)", self.user, getattr(self.user, "id", "?"))
+        if not self.intents.members:
+            _log.warning(
+                "MEMBERS_INTENT is off: role_rewards milestone roles are disabled "
+                "(guild.get_member cold-misses). Set MEMBERS_INTENT=true to re-enable."
+            )
         await self.change_presence(activity=discord.Game(name="装甲悪鬼村正"))
 
     async def setup_hook(self):

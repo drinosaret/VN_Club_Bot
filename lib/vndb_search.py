@@ -92,6 +92,42 @@ class VNDBClient:
             logger.error("Error searching VNDB for '%s': %s", query, exc)
             return []
 
+    async def search_tags(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search VNDB tags (the /kana/tag endpoint) for the dashboard picker."""
+        query = (query or "").strip()
+        if not query:
+            return []
+        limit = max(1, min(limit, 25))
+        payload = {
+            "filters": ["search", "=", query],
+            "fields": "id,name,category",
+            "results": limit,
+        }
+        try:
+            resp = await self._make_request("tag", payload)
+            return resp.get("results", [])
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error searching VNDB tags for '%s': %s", query, exc)
+            return []
+
+    async def search_producers(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search VNDB producers (the /kana/producer endpoint)."""
+        query = (query or "").strip()
+        if not query:
+            return []
+        limit = max(1, min(limit, 25))
+        payload = {
+            "filters": ["search", "=", query],
+            "fields": "id,name,original",
+            "results": limit,
+        }
+        try:
+            resp = await self._make_request("producer", payload)
+            return resp.get("results", [])
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error searching VNDB producers for '%s': %s", query, exc)
+            return []
+
 
 def normalize_vn_titles(vn: Dict[str, Any]) -> Dict[str, Optional[str]]:
     """Extract primary, English, Japanese, and Romaji titles from VNDB payload."""

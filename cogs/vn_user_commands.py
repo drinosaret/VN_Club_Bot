@@ -109,7 +109,7 @@ _HELP_CATEGORY_ORDER = [
     ("stats",   "📊 STATS"),
     ("pool",    "🗓️ POOL & BANNERS"),
     ("voting",  "🗳️ VOTING"),
-    ("admin",   "🛠️ ADMIN"),
+    ("manager", "🛠️ MANAGER"),
     ("help",    "❓ HELP"),
 ]
 _HELP_CATEGORY_LABELS = dict(_HELP_CATEGORY_ORDER)
@@ -1671,7 +1671,7 @@ class VNUserCommands(commands.Cog):
             embed = view.create_embed()
             await interaction.followup.send(embed=embed, view=view)
 
-    @app_commands.command(name="manage_reward_points", description="Reward user with points (admin).")
+    @app_commands.command(name="manage_reward_points", description="[MANAGER] Reward user with points.")
     @app_commands.describe(
         member="The member to reward points to.",
         points="The number of points to reward.",
@@ -1717,7 +1717,7 @@ class VNUserCommands(commands.Cog):
 
     @app_commands.command(
         name="manage_log",
-        description="Record a VN completion on behalf of another user (admin).",
+        description="[MANAGER] Record a VN completion on behalf of another user.",
     )
     @app_commands.describe(
         member="The member to log a completion for.",
@@ -1746,7 +1746,10 @@ class VNUserCommands(commands.Cog):
         """Admin-only manual log insertion. Mirrors `/finish`'s points logic
         so admin-backfilled logs award the same amount a self-finish would.
         """
-        await interaction.response.defer()
+        # Ephemeral defer, same as /manage_reward_points: a permission denial
+        # must not post publicly. The success followup below is sent without
+        # ephemeral so the recorded log still announces to the channel.
+        await interaction.response.defer(ephemeral=True)
         try:
             await validate_user_permission(interaction)
             await validate_rating_input(rating)
@@ -1879,7 +1882,9 @@ class VNUserCommands(commands.Cog):
     async def delete_log(
         self, interaction: discord.Interaction, log_id: int
     ):
-        await interaction.response.defer()
+        # Ephemeral defer so a permission denial (deleting someone else's log
+        # without manager perms) doesn't post publicly. Success stays public.
+        await interaction.response.defer(ephemeral=True)
 
         # Check if the log exists
         result = await self.bot.GET_ONE(DatabaseQueries.GET_LOG_BY_ID, (log_id,))
@@ -1967,7 +1972,9 @@ class VNUserCommands(commands.Cog):
         comment: Optional[app_commands.Range[str, 1, 2000]] = None,
         rating: int = None,
     ):
-        await interaction.response.defer()
+        # Ephemeral defer so a permission denial (editing someone else's log
+        # without manager perms) doesn't post publicly. Success stays public.
+        await interaction.response.defer(ephemeral=True)
 
         try:
             # Check if at least one field is being updated
@@ -1997,7 +2004,7 @@ class VNUserCommands(commands.Cog):
             if user_id != interaction.user.id:
                 await validate_user_permission(
                     interaction,
-                    "Only the log owner or an admin can edit this log.",
+                    "Only the log owner or a VN manager can edit this log.",
                 )
                 # Per-guild VN managers are scoped to their own server's logs.
                 # AUTHORIZED_USERS (bot operators) bypass this check.

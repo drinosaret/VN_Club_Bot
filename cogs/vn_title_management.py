@@ -858,7 +858,7 @@ class VNTitleManagement(commands.Cog):
 
     @app_commands.command(
         name="manage_pool",
-        description="Add, edit, or remove pool entries (admin).",
+        description="[MANAGER] Add, edit, or remove pool entries.",
     )
     @app_commands.choices(action=POOL_ACTIONS, status=POOL_STATUS_CHOICES)
     @app_commands.describe(
@@ -1139,7 +1139,7 @@ class VNTitleManagement(commands.Cog):
             raise ValidationError(
                 f"pool entry #{pool_id} moved between read and delete",
                 f"Pool entry **#{pool_id}** changed under us (its server "
-                f"affiliation was modified by another admin or the web "
+                f"affiliation was modified by another manager or the web "
                 f"console while we were reading it). Re-run the command.",
             )
         self._invalidate_season_overview_cache()
@@ -1300,7 +1300,7 @@ class VNTitleManagement(commands.Cog):
             raise ValidationError(
                 f"pool entry #{pool_id} moved between read and edit",
                 f"Pool entry **#{pool_id}** changed under us (its server "
-                f"affiliation was modified by another admin or the web "
+                f"affiliation was modified by another manager or the web "
                 f"console while we were reading it). Re-run the command.",
             )
         self._invalidate_season_overview_cache()

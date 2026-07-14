@@ -98,7 +98,7 @@ class AdminManagers(commands.Cog):
 
     @app_commands.command(
         name="manage_managers",
-        description="Grant/revoke per-guild VN-manager permission (bot operator only).",
+        description="[ADMIN] Grant/revoke per-guild VN-manager permission.",
     )
     @app_commands.choices(action=_ACTION_CHOICES)
     @app_commands.describe(

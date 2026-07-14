@@ -155,37 +155,46 @@
     },
     {
       "name": "/manage_pool",
-      "category": "admin",
-      "short_description": "Admin: add, edit, or remove pool entries.",
+      "category": "manager",
+      "short_description": "Manager: add, edit, or remove pool entries.",
       "usage": "/manage_pool action:<add|edit|remove> title:<title-or-pool-id> [start_month:<YYYY-MM>] [end_month:<YYYY-MM>] [points:<int>] [status:<monthly|seasonal|special>] [guild_id:<int|NULL>]",
-      "description": "Admin-only. Manage this server's curated pool. The `title` autocomplete is action-aware: searches VNDB on add, lists existing pool entries (with their pool IDs) on edit/remove. Each pool entry has a unique pool ID (visible in `/pool` and `/pool_entry`). For edit, any field omitted stays unchanged; pass `guild_id:NULL` to clear to legacy-global state, or an integer to set a specific guild. The bot edits one row at a time — bulk reassignments are out of scope here.",
+      "description": "Manager-only. Manage this server's curated pool. The `title` autocomplete is action-aware: searches VNDB on add, lists existing pool entries (with their pool IDs) on edit/remove. Each pool entry has a unique pool ID (visible in `/pool` and `/pool_entry`). For edit, any field omitted stays unchanged; pass `guild_id:NULL` to clear to legacy-global state, or an integer to set a specific guild. The bot edits one row at a time — bulk reassignments are out of scope here.",
       "parameters": "• `action`: `add`, `edit`, or `remove`\n• `title`: Search for a VN — autocomplete switches based on action.\n• `start_month`: (add/edit) Active window start. YYYY-MM.\n• `end_month`: (add/edit) Active window end. YYYY-MM.\n• `points`: (add/edit) Points awarded during the active window. Default 10 on add.\n• `status`: (add/edit) Pool kind: `monthly` (default), `seasonal`, or `special`.\n• `guild_id`: (edit) New guild_id for the row — integer or `NULL` to clear.",
       "example": "/manage_pool action:edit title:#5 points:25 status:seasonal"
     },
     {
       "name": "/manage_voting",
-      "category": "admin",
-      "short_description": "Admin: open the voting dashboard (manage cycles + settings).",
+      "category": "manager",
+      "short_description": "Manager: open the voting dashboard (manage cycles + settings).",
       "usage": "/manage_voting",
-      "description": "Admin-only. Opens an ephemeral dashboard panel showing both monthly and seasonal cycle state with state-aware action buttons. From the panel: open voting (modal collects target_month / choice_mode / winner_count / duration), post the vote message in the current channel, close voting, cancel voting, and configure guild-wide defaults (default voting role, default vote UI). Monthly and seasonal cycles run independently — the panel surfaces both. Closing voting auto-promotes the winner(s) into the pool with the matching status (monthly/seasonal) and posts a banner.",
+      "description": "Manager-only. Opens an ephemeral dashboard panel showing both monthly and seasonal cycle state with state-aware action buttons. From the panel: open voting (modal collects target_month / choice_mode / winner_count / duration), post the vote message in the current channel, close voting, cancel voting, and configure guild-wide defaults (default voting role, default vote UI). Monthly and seasonal cycles run independently — the panel surfaces both. Closing voting auto-promotes the winner(s) into the pool with the matching status (monthly/seasonal) and posts a banner.",
       "parameters": "_(none — the dashboard collects every input through the panel and modals.)_",
       "example": "/manage_voting"
     },
     {
+      "name": "/manage_theme",
+      "category": "manager",
+      "short_description": "Manager: set nomination themes for a month or season.",
+      "usage": "/manage_theme",
+      "description": "Manager-only. Opens an ephemeral dashboard for nomination themes. Build reusable theme templates (developer allowlist, required/excluded tags, length, character count, release window, NSFW cover policy) with a search-then-pick flow for tags and developers, then apply one to an upcoming month or season. While a theme is set, /nominate only accepts VNs that fit it and tells the nominator which rule failed; managers bypass the gate. Applying snapshots the template's rules onto the period, so later template edits never change an already-themed month. Clearing a period lifts the restriction.",
+      "parameters": "_(none — the dashboard collects every input through the panel and modals.)_",
+      "example": "/manage_theme"
+    },
+    {
       "name": "/manage_reward_points",
-      "category": "admin",
-      "short_description": "Admin: manually award (or deduct) points to a user.",
+      "category": "manager",
+      "short_description": "Manager: manually award (or deduct) points to a user.",
       "usage": "/manage_reward_points member:<@user> points:<int> reason:<text>",
-      "description": "Admin-only. Manually award points to a user — useful for events, read-alongs, or correcting missed completions. The reward shows up in the user's logs with the supplied reason.",
+      "description": "Manager-only. Manually award points to a user — useful for events, read-alongs, or correcting missed completions. The reward shows up in the user's logs with the supplied reason.",
       "parameters": "• `member`: The user to reward.\n• `points`: How many points to grant (integer; can be negative to deduct).\n• `reason`: Free-text reason recorded on the log entry.",
       "example": "/manage_reward_points member:@JohnDoe points:50 reason:Won read-along contest"
     },
     {
       "name": "/manage_log",
-      "category": "admin",
-      "short_description": "Admin: record a VN completion on behalf of another user.",
+      "category": "manager",
+      "short_description": "Manager: record a VN completion on behalf of another user.",
       "usage": "/manage_log member:<@user> title:<VN_title> rating:<1-5> comment:<text> [reward_month:<YYYY-MM>] [points:<int>]",
-      "description": "Admin-only. Backfill a reading log on behalf of another user — for cases where they completed a VN but didn't run /finish themselves. Defaults reward_month to the current month and computes points the same way /finish does (pool-window match awards the configured monthly points; otherwise the not-monthly fallback). Pass explicit `points` to override. The same VN can be logged for the same user in different reward_months (re-reads); only same-month duplicates are rejected — use /log_edit if you meant to update an existing log instead.",
+      "description": "Manager-only. Backfill a reading log on behalf of another user — for cases where they completed a VN but didn't run /finish themselves. Defaults reward_month to the current month and computes points the same way /finish does (pool-window match awards the configured monthly points; otherwise the not-monthly fallback). Pass explicit `points` to override. The same VN can be logged for the same user in different reward_months (re-reads); only same-month duplicates are rejected — use /log_edit if you meant to update an existing log instead.",
       "parameters": "• `member`: The user to log a completion for.\n• `title`: Search for a VN by title (autocomplete).\n• `rating`: 1-5 (1=Terrible, 5=Masterpiece).\n• `comment`: The comment/review text (max 2000 chars).\n• `reward_month`: Optional override (YYYY-MM). Defaults to current month.\n• `points`: Optional override. Defaults to the same calculation /finish uses.",
       "example": "/manage_log member:@JohnDoe title:Muramasa rating:5 comment:Backfilled their completion from last week"
     },

@@ -30,6 +30,9 @@ _VNDB_EXTRAS_CACHE_CAP = 512
 _vndb_extras_cache: dict[str, tuple[float, dict]] = {}
 _vndb_extras_locks: dict[str, asyncio.Lock] = {}
 
+_theme_attrs_cache: dict[str, tuple[float, dict]] = {}
+_theme_attrs_locks: dict[str, asyncio.Lock] = {}
+
 CREATE_VNDB_CACHE_TABLE = """
 CREATE TABLE IF NOT EXISTS vndb_cache (
     vndb_id TEXT PRIMARY KEY,
@@ -482,4 +485,84 @@ async def fetch_vndb_extras(
         "vndb_extras: fetched key=%s in %.0fms", vndb_id,
         (time.monotonic() - t_fetch) * 1000,
     )
+    return result
+
+
+async def fetch_theme_attributes(
+    vndb_id: str,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Optional[dict]:
+    """Fetch the theme-gate attributes not held in vndb_cache: full tag list
+    (id/rating/spoiler), developer producer ids, and the full release date.
+
+    Returns None on any failure (network, non-200, no results) so the caller
+    fails the theme gate closed rather than silently passing a VN it could not
+    verify. On success returns:
+        {"tags": [{"id","rating","spoiler"}...],
+         "developer_ids": ["p57", ...],
+         "released": "YYYY-MM-DD" | "YYYY-MM" | "YYYY" | None}
+
+    Cached process-locally like fetch_vndb_extras (1h TTL); pass ``session``
+    to reuse a connection.
+    """
+    if not vndb_id.startswith("v"):
+        vndb_id = f"v{vndb_id}"
+
+    now = time.monotonic()
+    cached = _theme_attrs_cache.get(vndb_id)
+    if cached is not None and (now - cached[0]) < _VNDB_EXTRAS_TTL_SECONDS:
+        return cached[1]
+
+    lock = _theme_attrs_locks.get(vndb_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _theme_attrs_locks[vndb_id] = lock
+
+    async with lock:
+        cached = _theme_attrs_cache.get(vndb_id)
+        if cached is not None and (time.monotonic() - cached[0]) < _VNDB_EXTRAS_TTL_SECONDS:
+            return cached[1]
+
+        payload = {
+            "filters": ["id", "=", vndb_id],
+            "fields": "released, tags.id, tags.rating, tags.spoiler, developers.id, developers.name",
+        }
+
+        async def _do(s: aiohttp.ClientSession) -> Optional[dict]:
+            async with s.post(API_URL, json=payload) as resp:
+                if resp.status != 200:
+                    _log.warning("theme attrs %s for %s", resp.status, vndb_id)
+                    return None
+                return await resp.json()
+
+        try:
+            if session is not None:
+                data = await _do(session)
+            else:
+                timeout = aiohttp.ClientTimeout(total=10, connect=5)
+                async with aiohttp.ClientSession(timeout=timeout) as own:
+                    data = await _do(own)
+        except Exception as e:  # noqa: BLE001
+            _log.warning("theme attrs fetch failed for %s: %s", vndb_id, e)
+            return None
+
+    if not data:
+        return None
+    results = data.get("results") or []
+    if not results:
+        return None
+    vn = results[0]
+
+    tags = [
+        {"id": t.get("id"), "rating": float(t.get("rating") or 0), "spoiler": int(t.get("spoiler") or 0)}
+        for t in (vn.get("tags") or []) if t.get("id")
+    ]
+    developer_ids = [d.get("id") for d in (vn.get("developers") or []) if d.get("id")]
+    result = {"tags": tags, "developer_ids": developer_ids, "released": vn.get("released")}
+
+    _theme_attrs_cache[vndb_id] = (time.monotonic(), result)
+    if len(_theme_attrs_cache) > _VNDB_EXTRAS_CACHE_CAP:
+        oldest = min(_theme_attrs_cache, key=lambda k: _theme_attrs_cache[k][0])
+        _theme_attrs_cache.pop(oldest, None)
+        _theme_attrs_locks.pop(oldest, None)
     return result

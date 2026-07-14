@@ -37,6 +37,7 @@ prevents two ACTIVE cycles per (guild, kind).
 """
 
 import asyncio
+import json
 import logging
 from typing import Optional
 
@@ -62,6 +63,7 @@ from lib.utils import (
     format_season_label_from_yyyy_mm,
     get_current_month,
     handle_command_error,
+    is_manager,
     month_to_season_name,
     next_season,
     resolve_vn_from_input,
@@ -69,6 +71,8 @@ from lib.utils import (
     validate_month_format,
     validate_user_permission,
 )
+from lib.theme_service import gather_theme_attributes
+from lib.themes import evaluate_theme, validate_rules, RULES_SCHEMA_VERSION
 from lib.vndb_api import from_vndb_id
 from lib.autocomplete import vn_autocomplete, month_picker_future_autocomplete
 from cogs.username_fetcher import cache_user
@@ -1440,7 +1444,7 @@ async def _fetch_panel_state(bot, guild_id: int) -> dict:
 
 async def _build_panel_text(bot, state: dict) -> str:
     """Render the main panel's status block from a state dict."""
-    lines = ["🛠️ **Voting admin dashboard**", ""]
+    lines = ["🛠️ **Voting dashboard**", ""]
     for kind, kind_label in (("monthly", "Monthly"), ("seasonal", "Seasonal")):
         cycle = state[kind]
         if cycle is None:
@@ -2762,7 +2766,7 @@ class VNCycleCog(commands.Cog):
 
     @app_commands.command(
         name="manage_voting",
-        description="Open the voting admin dashboard (admin).",
+        description="[MANAGER] Open the voting dashboard.",
     )
     @app_commands.guild_only()
     async def manage_voting(self, interaction: discord.Interaction):
@@ -2779,7 +2783,7 @@ class VNCycleCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         try:
             await validate_user_permission(
-                interaction, "Only admins can use the voting dashboard.",
+                interaction, "Only VN managers can use the voting dashboard.",
             )
             state = await _fetch_panel_state(self.bot, interaction.guild.id)
             view = VotingAdminPanelView(self, state)
@@ -3831,6 +3835,52 @@ class VNCycleCog(commands.Cog):
                 )
 
             display_title = vn_info.title_ja or vn_info.title_en or vndb_id
+
+            # Themed-nomination gate. A manager may have declared a theme for
+            # this exact period (kind + window). Non-managers can only nominate
+            # VNs that satisfy it; managers/operators bypass (they can pool-add
+            # off-theme via /manage_pool). Strict guild scoping: a theme in one
+            # server never gates another. Only future nominations are gated;
+            # anything already in the pool is untouched.
+            if not await is_manager(interaction):
+                theme_row = await self.bot.GET_ONE(
+                    DatabaseQueries.GET_THEME_ASSIGNMENT_FOR_PERIOD,
+                    (interaction.guild.id, kind_value, start_month, end_month),
+                )
+                if theme_row:
+                    theme_label, rules_json = theme_row
+                    try:
+                        # Normalize + fill defaults on read: Phase 2's web console
+                        # writes this same column, so don't trust its exact shape.
+                        theme_rules = validate_rules(json.loads(rules_json))
+                    except (TypeError, ValueError):
+                        # Corrupted/incompatible stored rules. Log and skip the gate
+                        # rather than block every nomination on a config error.
+                        _log.error(
+                            "theme rules unparseable for guild=%s %s %s..%s; skipping gate",
+                            interaction.guild.id, kind_value, start_month, end_month,
+                        )
+                        theme_rules = None
+                    # An empty ruleset (just the version stamp) gates nothing.
+                    if theme_rules and theme_rules != {"schema_version": RULES_SCHEMA_VERSION}:
+                        attrs = await gather_theme_attributes(
+                            self.bot, vndb_id, vn_info, theme_rules,
+                        )
+                        if attrs is None:
+                            raise ValidationError(
+                                "theme attr fetch failed",
+                                f"Couldn't check this VN against the "
+                                f"**{theme_label}** theme right now (VNDB may be "
+                                "temporarily unreachable). Try again in a moment.",
+                            )
+                        theme_failures = evaluate_theme(attrs, theme_rules)
+                        if theme_failures:
+                            reasons = "\n".join(f"• {r}" for r in theme_failures)
+                            raise ValidationError(
+                                "theme gate",
+                                f"**{display_title}** doesn't fit the theme for "
+                                f"**{period_label}** (**{theme_label}**):\n{reasons}",
+                            )
 
             # Block nominating a VN that is already in the pool for the SAME
             # exact period, whether as a pending nomination OR an already

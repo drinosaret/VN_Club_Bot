@@ -59,6 +59,7 @@ async def run_migrations(bot) -> None:
         await _invalidate_vndb_cache_for_blur_threshold(bot)
         await _backfill_vndb_cache_after_blur_invalidation(bot)
         await _add_user_tag_to_users(bot)
+        await _create_theme_tables(bot)
     except Exception:
         _log.exception("Migrations failed; aborting startup so the container restart-loops cleanly")
         raise
@@ -996,6 +997,53 @@ async def _create_guild_managers_table(bot) -> None:
     await bot.RUN(
         "CREATE INDEX IF NOT EXISTS idx_guild_managers_guild "
         "ON guild_managers (guild_id)"
+    )
+
+
+async def _create_theme_tables(bot) -> None:
+    """Themed-nomination tables: a per-guild template library and per-period
+    rule assignments read by the /nominate gate.
+
+    Migration-owned (like guild_settings / guild_managers): created here so
+    they exist before any cog loads. Assignments key on the nomination-period
+    identity (guild_id, kind, start_month, end_month) because nominations are
+    submitted before any vn_cycles row exists. guild_id is NOT NULL on both:
+    a NULL would leak a theme into every guild via the pool's
+    `guild_id IS NULL OR guild_id = ?` convention.
+    """
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS theme_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            rules_json TEXT NOT NULL,
+            created_by_user_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(guild_id, name)
+        );
+        """
+    )
+    await bot.RUN(
+        "CREATE INDEX IF NOT EXISTS idx_theme_templates_guild ON theme_templates (guild_id)"
+    )
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS theme_assignments (
+            guild_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            start_month TEXT NOT NULL,
+            end_month TEXT NOT NULL,
+            label TEXT NOT NULL,
+            rules_json TEXT NOT NULL,
+            source_template_id INTEGER,
+            created_by_user_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (guild_id, kind, start_month, end_month)
+        );
+        """
     )
 
 
