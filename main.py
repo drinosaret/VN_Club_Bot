@@ -27,10 +27,26 @@ if _missing:
 my_bot = VNClubBot(cog_folder=COG_FOLDER, path_to_db=PATH_TO_DB)
 
 
+class _CollapseNewlinesFilter(logging.Filter):
+    """Keep each record on one physical line by escaping newlines in the
+    message, so log files stay one-entry-per-line and parse cleanly. Tracebacks
+    (exc_info) are left as-is. Added to the handlers so it also covers records
+    propagated up from child loggers."""
+
+    def filter(self, record):
+        if record.args:
+            record.msg = record.getMessage()
+            record.args = None
+        if isinstance(record.msg, str) and ("\n" in record.msg or "\r" in record.msg):
+            record.msg = record.msg.replace("\r", "\\r").replace("\n", "\\n")
+        return True
+
+
 def setup_logging():
     """Setup logging to both console and file"""
     # Create formatter
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    newline_filter = _CollapseNewlinesFilter()
 
     # Setup root logger
     root_logger = logging.getLogger()
@@ -39,6 +55,7 @@ def setup_logging():
     # Console handler (discord's default)
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
+    console_handler.addFilter(newline_filter)
     root_logger.addHandler(console_handler)
 
     # File handler with rotation (max 5MB, keep 3 backups)
@@ -49,6 +66,7 @@ def setup_logging():
         encoding='utf-8'
     )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(newline_filter)
     root_logger.addHandler(file_handler)
 
     # Also capture discord.py logs
