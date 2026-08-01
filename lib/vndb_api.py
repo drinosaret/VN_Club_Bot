@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from .bot import VNClubBot
-from .desciption_processing import replace_bbcode
+from .desciption_processing import replace_bbcode, to_plain_text
+from .utils import smart_truncate
 import aiohttp
 import asyncio
 import logging
@@ -145,18 +146,24 @@ class VN_Entry:
     async def get_vndb_link(self) -> str:
         return f"https://vndb.org/{self.vndb_id}"
 
-    async def get_normalized_description(self, max_length=1000) -> str:
-        """Get a normalized description for the VN."""
+    async def get_normalized_description(
+        self, max_length: Optional[int] = 1000, *, plain: bool = False,
+    ) -> str:
+        """Get a normalized description for the VN.
+
+        ``plain`` renders markup-free text for the image cards; embeds take
+        the Discord-markdown form. ``max_length=None`` leaves truncation to
+        the caller, which the banner needs because it cuts by pixel width.
+        """
         if not self.description:
             return "No description available."
         desc = self.description.strip()
         if not desc:
             return "No description available."
-        desc = replace_bbcode(desc)
-
-        if len(desc) > max_length:
-            desc = desc[:max_length].rsplit(" ", 1)[0] + "..."
-        return desc
+        desc = to_plain_text(desc) if plain else replace_bbcode(desc)
+        if not desc:
+            return "No description available."
+        return smart_truncate(desc, max_length)
 
     @staticmethod
     async def _fetch_from_vndb(

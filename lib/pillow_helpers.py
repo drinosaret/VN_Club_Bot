@@ -21,6 +21,8 @@ from urllib.parse import urlparse
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
+from lib.utils import ellipsize
+
 logger = logging.getLogger(__name__)
 
 
@@ -289,6 +291,11 @@ def paste_aa_rounded(img: Image.Image, box, radius: int,
     img.paste(layer, (x0, y0), layer)
 
 
+# The Japanese font cascade centers U+2026 on the em box, so it floats at
+# x-height. Three periods sit on the baseline, where a reader expects them.
+IMAGE_ELLIPSIS = "..."
+
+
 def truncate_to_width(draw: ImageDraw.ImageDraw, text: str,
                       font: ImageFont.ImageFont, max_width: int) -> str:
     """Binary-search the longest prefix of ``text`` that fits in ``max_width``,
@@ -297,13 +304,12 @@ def truncate_to_width(draw: ImageDraw.ImageDraw, text: str,
         return ""
     if draw.textlength(text, font=font) <= max_width:
         return text
-    ellipsis = "…"
     lo, hi = 0, len(text)
     while lo < hi:
         mid = (lo + hi) // 2
-        candidate = text[:mid].rstrip() + ellipsis
+        candidate = ellipsize(text[:mid], IMAGE_ELLIPSIS)
         if draw.textlength(candidate, font=font) <= max_width:
             lo = mid + 1
         else:
             hi = mid
-    return text[: max(1, lo - 1)].rstrip() + ellipsis
+    return ellipsize(text[: max(1, lo - 1)], IMAGE_ELLIPSIS)

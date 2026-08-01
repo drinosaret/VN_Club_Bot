@@ -38,6 +38,7 @@ from lib.pillow_helpers import (
     fetch_image_bytes_capped,
     load_japanese_font as _load_japanese_font,
     format_compact_count as _format_compact_count,
+    truncate_to_width,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,20 +211,7 @@ class ProfileCardGenerator:
 
     def _truncate_to_width(self, draw: ImageDraw.ImageDraw, text: str,
                            font: ImageFont.ImageFont, max_width: int) -> str:
-        if not text:
-            return ""
-        if draw.textlength(text, font=font) <= max_width:
-            return text
-        ellipsis = "…"
-        lo, hi = 0, len(text)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            candidate = text[:mid].rstrip() + ellipsis
-            if draw.textlength(candidate, font=font) <= max_width:
-                lo = mid + 1
-            else:
-                hi = mid
-        return text[: max(1, lo - 1)].rstrip() + ellipsis
+        return truncate_to_width(draw, text, font, max_width)
 
     # ------------------------------------------------------------------
     # public API

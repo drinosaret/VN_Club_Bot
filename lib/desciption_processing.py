@@ -62,14 +62,62 @@ def replace_relative_md_links(text: str) -> str:
 
 def replace_spoiler(text: str) -> str:
     # Convert [spoiler]TEXT[/spoiler] to ||TEXT||
-    return re.sub(r"\[spoiler\](.*?)\[/spoiler\]", r"||\1||", text)
+    return re.sub(r"\[spoiler\](.*?)\[/spoiler\]", r"||\1||", text, flags=re.S)
+
+
+# BBCode inline styles with a Discord markdown equivalent. [quote], [raw] and
+# [code] have none that survives a one-line excerpt, so only their tags go.
+_SIMPLE_TAGS = {"b": "**", "i": "*", "u": "__", "s": "~~"}
+_TAG_NAMES = tuple(_SIMPLE_TAGS) + ("quote", "raw", "code")
+_ORPHAN_TAG_RE = re.compile(r"\[/?(?:%s)\]" % "|".join(_TAG_NAMES))
+
+
+def replace_simple_tags(text: str) -> str:
+    """Convert VNDB inline styling BBCode into Discord markdown."""
+    for tag, marker in _SIMPLE_TAGS.items():
+        text = re.sub(
+            rf"\[{tag}\](.*?)\[/{tag}\]",
+            lambda m, marker=marker: f"{marker}{m.group(1)}{marker}",
+            text,
+            flags=re.S,
+        )
+    return text
+
+
+def strip_orphan_tags(text: str) -> str:
+    """Drop BBCode tags with no partner left: unclosed tags in the source, and
+    closers whose opener fell outside a truncated excerpt."""
+    return _ORPHAN_TAG_RE.sub("", text)
 
 
 def replace_bbcode(text: str) -> str:
     text = replace_url(text)
     text = replace_relative_md_links(text)
     text = replace_spoiler(text)
+    text = replace_simple_tags(text)
+    text = strip_orphan_tags(text)
     return text
+
+
+_MD_LINK_RE = re.compile(r"\[([^\[\]]*)\]\([^)\s]*\)")
+
+
+def to_plain_text(text: str) -> str:
+    """Markup-free rendering for the image cards, which draw a raw string:
+    Discord markdown would otherwise show up as literal ``[label](url)`` and
+    ``||`` in the PNG. Spoiler *contents* are dropped rather than unmasked,
+    since an image has no way to hide them.
+    """
+    text = re.sub(r"\[spoiler\].*?\[/spoiler\]", "", text, flags=re.S)
+    text = re.sub(r"\[url=[^\]]*\](.*?)\[/url\]", r"\1", text, flags=re.S)
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = strip_orphan_tags(text)
+    text = re.sub(r"\|\||\*\*|__|~~|\*", "", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    # Removing a spoiler mid-sentence leaves its punctuation stranded.
+    text = re.sub(r"[ \t]+([,.!?;:])", r"\1", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 if __name__ == "__main__":

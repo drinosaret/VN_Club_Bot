@@ -42,7 +42,10 @@ from lib.pillow_helpers import (
     fetch_image_bytes_capped,
     load_japanese_font as _load_japanese_font,
     format_compact_count as _format_compact_count,
+    truncate_to_width,
+    IMAGE_ELLIPSIS,
 )
+from lib.utils import ellipsize
 from lib.jiten_client import resolve_display_cover
 
 logger = logging.getLogger(__name__)
@@ -208,20 +211,7 @@ class MonthlyBannerGenerator:
 
     def _truncate_to_width(self, draw: ImageDraw.ImageDraw, text: str,
                            font: ImageFont.ImageFont, max_width: int) -> str:
-        if not text:
-            return ""
-        if draw.textlength(text, font=font) <= max_width:
-            return text
-        ellipsis = "…"
-        lo, hi = 0, len(text)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            candidate = text[:mid].rstrip() + ellipsis
-            if draw.textlength(candidate, font=font) <= max_width:
-                lo = mid + 1
-            else:
-                hi = mid
-        return text[: max(1, lo - 1)].rstrip() + ellipsis
+        return truncate_to_width(draw, text, font, max_width)
 
     def _wrap_text_to_pixel_width(
         self,
@@ -244,8 +234,14 @@ class MonthlyBannerGenerator:
         if not text or max_lines <= 0:
             return []
         lines: list[str] = []
+        # Tracks text left unrendered, which is what earns the trailing
+        # ellipsis. Word-level bookkeeping, not a length comparison: wrapping
+        # collapses whitespace runs and drops the newlines below, so any
+        # char-count heuristic reports overflow for text that fully fit.
+        overflow = False
         # Honor hard line breaks first (descriptions sometimes contain them).
-        for paragraph in text.split("\n"):
+        paragraphs = text.split("\n")
+        for p_index, paragraph in enumerate(paragraphs):
             if not paragraph.strip():
                 # Preserve blank lines only if they fit within max_lines.
                 if lines and len(lines) < max_lines:
@@ -261,30 +257,35 @@ class MonthlyBannerGenerator:
                 if current:
                     lines.append(current)
                     if len(lines) >= max_lines:
+                        overflow = True
                         break
                 # Word alone overflows the available width — drop it
                 # in alone (truncated by the line-cap below if needed).
                 current = word
-            if current and len(lines) < max_lines:
-                lines.append(current)
-            if len(lines) >= max_lines:
+            if current and not overflow:
+                if len(lines) < max_lines:
+                    lines.append(current)
+                else:
+                    overflow = True
+            if overflow or len(lines) >= max_lines:
+                if any(p.strip() for p in paragraphs[p_index + 1:]):
+                    overflow = True
                 break
-        if not lines:
-            return []
-        # Trim to cap and ellipsize the last line if we ran out of room.
         if len(lines) > max_lines:
             lines = lines[:max_lines]
-        # Detect overflow: did we have remaining text we couldn't fit?
-        # Heuristic: if the original text's char count is meaningfully
-        # larger than what we wrote out, the last line should ellipsize.
-        rendered_len = sum(len(line) for line in lines) + max(0, len(lines) - 1)
-        if rendered_len < len(text.strip()):
-            tail = lines[-1]
-            ellipsized = self._truncate_to_width(
-                draw, tail + "…", font, max_width,
-            )
-            lines[-1] = ellipsized
-        return lines
+            overflow = True
+        # A blank line at the end is padding, never something to ellipsize.
+        while lines and not lines[-1]:
+            lines.pop()
+        if not lines:
+            return []
+        if overflow:
+            lines[-1] = ellipsize(lines[-1], IMAGE_ELLIPSIS)
+        # A word longer than the box would otherwise paint past its edge.
+        return [
+            self._truncate_to_width(draw, line, font, max_width) if line else ""
+            for line in lines
+        ]
 
     # ------------------------------------------------------------------
     # public API
@@ -857,10 +858,14 @@ async def render_banner_for_vn_entry(
     extras = vndb_extras or {}
     # Pre-clean the description text for the no-jiten callout. The
     # generate() call ignores it on the jiten-present path, so this is
-    # a no-op cost on the dense layout.
+    # a no-op cost on the dense layout. Uncapped and markup-free: the
+    # callout cuts by pixel width, so a character cap here would either
+    # ellipsize text that fits or truncate silently before it.
     description_clean: Optional[str] = None
     if jiten_data is None and vn_info.description:
-        description_clean = await vn_info.get_normalized_description(max_length=300)
+        description_clean = await vn_info.get_normalized_description(
+            max_length=None, plain=True,
+        )
         if description_clean == "No description available.":
             description_clean = None
     # Cover region per cover_mode. "shown": real cover (jiten SFW swap for an
@@ -1325,8 +1330,9 @@ def _wrap_lines(
     consumed = " ".join(lines)
     if consumed != text:
         last = lines[-1]
-        ellipsis = "…"
-        while last and draw.textlength(last + ellipsis, font=font) > max_width:
+        while last and draw.textlength(
+            ellipsize(last, IMAGE_ELLIPSIS), font=font
+        ) > max_width:
             last = last[:-1]
-        lines[-1] = (last + ellipsis) if last else ellipsis
+        lines[-1] = ellipsize(last, IMAGE_ELLIPSIS)
     return lines

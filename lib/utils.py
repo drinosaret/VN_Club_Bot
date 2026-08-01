@@ -76,6 +76,57 @@ def truncate_text(text: str, max_length: int, suffix: str = "...") -> str:
     return text[:max_length - len(suffix)] + suffix
 
 
+ELLIPSIS = "…"
+
+# Trailing characters that read as noise once an ellipsis follows them:
+# sentence terminators and separators (a cut can land right after the "……"
+# common in translated prose) plus opening brackets the cut left dangling.
+# Closing brackets and quotes stay: they legitimately end a fragment.
+_ELLIPSIS_NOISE = " \t\r\n.…。·・,、;:；：!?！？—–-‐([{（【「『"
+
+
+def ellipsize(text: str, ellipsis: str = ELLIPSIS) -> str:
+    """Append exactly one ellipsis to ``text``, trimming trailing whitespace
+    and punctuation first. Single decision point for what precedes an
+    ellipsis, so text that passes through two truncators (character budget,
+    then pixel width) still ends with one."""
+    return (text or "").rstrip(_ELLIPSIS_NOISE) + ellipsis
+
+
+def _drop_dangling_markup(text: str) -> str:
+    """Cut back past markup the truncation point split in half.
+
+    A half-open ``||spoiler||`` shows the text it was meant to hide, and a
+    half-written ``[label](url)`` renders as literal junk.
+    """
+    if text.count("||") % 2 == 1:
+        text = text[:text.rindex("||")]
+    idx = text.rfind("[")
+    if idx != -1 and not re.match(r"\[[^\[\]]*\]\([^)\s]*\)", text[idx:]):
+        text = text[:idx]
+    return text.rstrip()
+
+
+def smart_truncate(text: str, max_length: Optional[int],
+                   ellipsis: str = ELLIPSIS) -> str:
+    """Truncate to ``max_length`` characters *including* the ellipsis, cutting
+    on a word boundary where one exists (space-less Japanese text is cut where
+    it falls). ``max_length=None`` skips truncation; an empty ``ellipsis``
+    truncates without marking it."""
+    text = (text or "").strip()
+    if max_length is None or len(text) <= max_length:
+        return text
+    budget = max(1, max_length - len(ellipsis))
+    cut = text[:budget]
+    # Only back off to the previous space when the cut lands mid-word.
+    if " " in cut and not text[budget:budget + 1].isspace():
+        cut = cut.rsplit(" ", 1)[0]
+    cut = _drop_dangling_markup(cut)
+    if not ellipsis:
+        return cut.rstrip()
+    return ellipsize(cut, ellipsis)
+
+
 def get_current_month() -> str:
     """Get current month in YYYY-MM format."""
     return discord.utils.utcnow().strftime("%Y-%m")
