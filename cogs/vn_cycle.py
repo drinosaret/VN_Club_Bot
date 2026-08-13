@@ -37,7 +37,6 @@ prevents two ACTIVE cycles per (guild, kind).
 """
 
 import asyncio
-import json
 import logging
 from typing import Optional
 
@@ -71,8 +70,8 @@ from lib.utils import (
     validate_month_format,
     validate_user_permission,
 )
-from lib.theme_service import gather_theme_attributes
-from lib.themes import evaluate_theme, validate_rules, RULES_SCHEMA_VERSION
+from lib.theme_service import gather_theme_attributes, load_period_theme
+from lib.themes import all_unverified, evaluate_theme
 from lib.vndb_api import from_vndb_id
 from lib.autocomplete import vn_autocomplete, month_picker_future_autocomplete
 from cogs.username_fetcher import cache_user
@@ -161,6 +160,19 @@ async def cycle_period_label_with_season(bot, cycle_row) -> str:
         return _month_label(target_month)
     return await format_season_label_from_yyyy_mm(bot, target_month)
 
+
+# Ballot entries checked against the period theme when voting opens. Each one
+# costs a metadata fetch plus a round trip per themed tag, and VNDB meters per
+# IP across the whole container, so the ceiling here is what keeps an audit
+# from spending the budget the rest of the bot is drawing on. The note says so
+# when a ballot runs past it.
+MAX_THEME_AUDIT_ENTRIES = 12
+# Nominees judged at once. VNDB asks callers to keep only a few requests in
+# flight, and each nominee is already several requests wide on its own.
+THEME_AUDIT_CONCURRENCY = 3
+# Room the theme note may take inside a followup, leaving the rest of the
+# message its own space under Discord's 2000-character cap.
+THEME_NOTE_CHARS = 600
 
 # Nominee row column order (matches GET_CYCLE_NOMINEES SELECT).
 NOM_ID = 0
@@ -2969,6 +2981,8 @@ class VNCycleCog(commands.Cog):
             f", restricted to <@&{allowed_role_id}>" if allowed_role_id else ""
         )
         kind_label = "Seasonal" if kind == "seasonal" else "Monthly"
+        theme_note = await self._off_theme_ballot_note(
+            guild_id, cycle_id, kind, target, target_end)
         await interaction.followup.send(
             f"🗳️ {kind_label} vote `{cycle_id}` is now open for **{period_label}** "
             f"with **{pending_count}** nominee(s) "
@@ -2976,7 +2990,7 @@ class VNCycleCog(commands.Cog):
             "Click **Post vote message** on the dashboard from the channel "
             "where you want the voting menu to appear. "
             "Users can also run `/vote` for a personal voting menu "
-            "without waiting for the public message.",
+            f"without waiting for the public message.{theme_note}",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -3631,12 +3645,14 @@ class VNCycleCog(commands.Cog):
             f" Settings updated: {', '.join(applied_changes)}."
             if applied_changes else ""
         )
+        theme_note = await self._off_theme_ballot_note(
+            guild_id, cycle_id, kind, target_month, target_end_month)
         await interaction.followup.send(
             f"♻️ {kind_label} vote `{cycle_id}` reopened for "
             f"**{period_label}**. Any previous winner is back as a "
             f"nominee.{overrides_note} Click **Repost vote message** "
             "on the dashboard from the channel where you want the "
-            "live tally menu.",
+            f"live tally menu.{theme_note}",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -3667,6 +3683,142 @@ class VNCycleCog(commands.Cog):
         )
 
     # ---------------- /nominate ----------------
+
+    @staticmethod
+    def _join_capped(labels: list[str], limit: int = THEME_NOTE_CHARS // 2) -> str:
+        """Join titles, trading the tail for a count once they stop fitting.
+        VN titles have no length bound, so a full audit's worth does not fit
+        one message."""
+        out, used = [], 0
+        for label in labels:
+            if used + len(label) + 2 > limit and out:
+                return ", ".join(out) + f", and {len(labels) - len(out)} more"
+            out.append(label)
+            used += len(label) + 2
+        return ", ".join(out)
+
+    async def _off_theme_ballot_note(
+        self, guild_id: int, cycle_id: int, kind: str, start_month: str, end_month: str,
+    ) -> str:
+        """A note naming ballot entries that don't fit the period's theme, or ''.
+
+        The gate only sees a VN at /nominate time, so entries banked before the
+        theme existed, restored by a reopen, or moved in with /manage_pool
+        reach the ballot unchecked. Reporting them to the manager opening the
+        vote beats dropping them: the nomination is someone's pick, and only a
+        human should decide whether a late theme retires it.
+        """
+        theme = await load_period_theme(self.bot, guild_id, kind, start_month, end_month)
+        if theme is None:
+            return ""
+        theme_label, theme_rules = theme
+        if theme_rules is None:
+            return (
+                f"\n\n⚠️ The **{theme_label}** theme for this period is "
+                "misconfigured, so the ballot couldn't be checked against it."
+            )
+
+        nominees = await self.bot.GET(DatabaseQueries.GET_CYCLE_NOMINEES, (cycle_id,))
+        checked = nominees[:MAX_THEME_AUDIT_ENTRIES]
+        gate = asyncio.Semaphore(THEME_AUDIT_CONCURRENCY)
+
+        async def _judge(row):
+            """(label, verdict) where verdict is 'off-theme' or 'unchecked'."""
+            label = f"**{row[NOM_TITLE]}** (#{row[NOM_ID]})"
+            async with gate:
+                vn_info = await from_vndb_id(self.bot, row[NOM_VNDB_ID])
+                if not vn_info:
+                    return label, "unchecked"
+                attrs = await gather_theme_attributes(
+                    self.bot, row[NOM_VNDB_ID], vn_info, theme_rules)
+                if attrs is None:
+                    return label, "unchecked"
+                reasons = evaluate_theme(attrs, theme_rules)
+                if not reasons:
+                    return None
+                # Fail-closed reasons mean the answer was unavailable, not
+                # that the VN breaks the theme. Naming those as off-theme
+                # next to a prompt to delete them would cost someone their
+                # pick over a VNDB hiccup.
+                return label, "unchecked" if all_unverified(reasons) else "off-theme"
+
+        results = await asyncio.gather(
+            *(_judge(row) for row in checked), return_exceptions=True)
+
+        offenders, unchecked = [], []
+        for res in results:
+            if isinstance(res, BaseException):
+                _log.warning("theme audit entry failed for cycle=%s: %s", cycle_id, res)
+                continue
+            if not res:
+                continue
+            label, verdict = res
+            (offenders if verdict == "off-theme" else unchecked).append(label)
+
+        parts = []
+        if offenders:
+            parts.append(
+                f"⚠️ On the ballot but off-theme for **{theme_label}**: "
+                + self._join_capped(offenders)
+                + ". These were nominated before the theme applied, or added by a "
+                "manager. Use `/manage_pool` to drop any that shouldn't run.")
+        if unchecked:
+            parts.append(
+                "ℹ️ Couldn't be checked against the theme (VNDB didn't answer for "
+                f"them): {self._join_capped(unchecked)}.")
+        if not parts:
+            return ""
+        if len(nominees) > len(checked):
+            parts.append(f"Only the first {len(checked)} nominees were checked.")
+        return "\n\n" + "\n\n".join(parts)
+
+    async def _check_nomination_theme(
+        self, interaction, kind_value, start_month, end_month,
+        vndb_id, vn_info, display_title, period_label,
+    ) -> Optional[str]:
+        """Evaluate the period's theme against this VN.
+
+        Raises ValidationError to reject an ordinary member. For a manager,
+        returns the same message as a warning string to hang off the
+        confirmation instead, so the person who wrote the theme can see it
+        working without being locked out of their own pool.
+        """
+        theme = await load_period_theme(
+            self.bot, interaction.guild.id, kind_value, start_month, end_month)
+        if theme is None:
+            return None
+        theme_label, theme_rules = theme
+        is_privileged = await is_manager(interaction)
+
+        def outcome(reason: str) -> Optional[str]:
+            if is_privileged:
+                return reason
+            raise ValidationError("theme gate", reason)
+
+        if theme_rules is None:
+            return outcome(
+                f"The **{theme_label}** theme for **{period_label}** is "
+                "misconfigured, so nominations can't be checked against it. "
+                "Ask a manager to re-save the theme.",
+            )
+
+        attrs = await gather_theme_attributes(
+            self.bot, vndb_id, vn_info, theme_rules)
+        if attrs is None:
+            return outcome(
+                f"Couldn't check this VN against the **{theme_label}** theme "
+                "right now (VNDB may be temporarily unreachable). Try again "
+                "in a moment.",
+            )
+
+        theme_failures = evaluate_theme(attrs, theme_rules)
+        if not theme_failures:
+            return None
+        reasons = "\n".join(f"• {r}" for r in theme_failures)
+        return outcome(
+            f"**{display_title}** doesn't fit the theme for "
+            f"**{period_label}** (**{theme_label}**):\n{reasons}",
+        )
 
     @app_commands.command(name="nominate", description="Nominate a VN for an upcoming monthly/seasonal vote.")
     @app_commands.describe(
@@ -3837,50 +3989,18 @@ class VNCycleCog(commands.Cog):
             display_title = vn_info.title_ja or vn_info.title_en or vndb_id
 
             # Themed-nomination gate. A manager may have declared a theme for
-            # this exact period (kind + window). Non-managers can only nominate
-            # VNs that satisfy it; managers/operators bypass (they can pool-add
-            # off-theme via /manage_pool). Strict guild scoping: a theme in one
-            # server never gates another. Only future nominations are gated;
-            # anything already in the pool is untouched.
-            if not await is_manager(interaction):
-                theme_row = await self.bot.GET_ONE(
-                    DatabaseQueries.GET_THEME_ASSIGNMENT_FOR_PERIOD,
-                    (interaction.guild.id, kind_value, start_month, end_month),
-                )
-                if theme_row:
-                    theme_label, rules_json = theme_row
-                    try:
-                        # Normalize + fill defaults on read: Phase 2's web console
-                        # writes this same column, so don't trust its exact shape.
-                        theme_rules = validate_rules(json.loads(rules_json))
-                    except (TypeError, ValueError):
-                        # Corrupted/incompatible stored rules. Log and skip the gate
-                        # rather than block every nomination on a config error.
-                        _log.error(
-                            "theme rules unparseable for guild=%s %s %s..%s; skipping gate",
-                            interaction.guild.id, kind_value, start_month, end_month,
-                        )
-                        theme_rules = None
-                    # An empty ruleset (just the version stamp) gates nothing.
-                    if theme_rules and theme_rules != {"schema_version": RULES_SCHEMA_VERSION}:
-                        attrs = await gather_theme_attributes(
-                            self.bot, vndb_id, vn_info, theme_rules,
-                        )
-                        if attrs is None:
-                            raise ValidationError(
-                                "theme attr fetch failed",
-                                f"Couldn't check this VN against the "
-                                f"**{theme_label}** theme right now (VNDB may be "
-                                "temporarily unreachable). Try again in a moment.",
-                            )
-                        theme_failures = evaluate_theme(attrs, theme_rules)
-                        if theme_failures:
-                            reasons = "\n".join(f"• {r}" for r in theme_failures)
-                            raise ValidationError(
-                                "theme gate",
-                                f"**{display_title}** doesn't fit the theme for "
-                                f"**{period_label}** (**{theme_label}**):\n{reasons}",
-                            )
+            # this exact period (kind + window). The theme is evaluated for
+            # everyone, including the managers who author it: a rule nobody
+            # can see themselves hit is a rule nobody can test. Managers are
+            # not blocked by the outcome (they can pool-add off-theme via
+            # /manage_pool anyway), they get it back as a warning on the
+            # confirmation. Strict guild scoping: a theme in one server never
+            # gates another. Only new nominations are checked; anything
+            # already in the pool is untouched.
+            theme_warning = await self._check_nomination_theme(
+                interaction, kind_value, start_month, end_month,
+                vndb_id, vn_info, display_title, period_label,
+            )
 
             # Block nominating a VN that is already in the pool for the SAME
             # exact period, whether as a pending nomination OR an already
@@ -3989,6 +4109,18 @@ class VNCycleCog(commands.Cog):
                     f"✅ **{display_title}** nominated for the {kind_value} vote "
                     f"({period_label}) as pool entry **#{pool_id}** "
                     f"— `/pool_entry id:{pool_id}` for full detail."
+                )
+            if theme_warning:
+                # One reason line per failed rule, each naming its tags, so the
+                # warning has no natural bound and shares the 2000-character
+                # message with the confirmation itself.
+                if len(theme_warning) > THEME_NOTE_CHARS:
+                    theme_warning = theme_warning[:THEME_NOTE_CHARS - 1].rstrip() + "…"
+                content = (
+                    f"⚠️ {theme_warning}\n\nAllowed because you're a manager. "
+                    f"Anyone else would have been turned away. Use "
+                    f"`/manage_pool` to drop it, or `/manage_theme` to change "
+                    f"the theme.\n\n{content}"
                 )
             await interaction.followup.send(
                 content=content,

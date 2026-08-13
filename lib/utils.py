@@ -1148,8 +1148,10 @@ class DatabaseQueries:
     WHERE guild_id = ? AND kind = ? AND start_month = ? AND end_month = ?;
     """
 
+    # source_template_id rides along so the dashboard can compare a snapshot
+    # against the template it was taken from and flag drift.
     LIST_THEME_ASSIGNMENTS = """
-    SELECT kind, start_month, end_month, label, rules_json
+    SELECT kind, start_month, end_month, label, rules_json, source_template_id
     FROM theme_assignments WHERE guild_id = ?
     ORDER BY start_month DESC, kind;
     """

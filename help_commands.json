@@ -136,6 +136,15 @@
       "example": "/season_overview season:Spring year:2026"
     },
     {
+      "name": "/theme",
+      "category": "pool",
+      "short_description": "Show the nomination theme for an upcoming month or season.",
+      "usage": "/theme [status:<monthly|seasonal>] [target_month:<YYYY-MM>]",
+      "description": "Show the nomination theme in force for a period, as a card listing every rule it applies plus real VNDB titles that satisfy it. Defaults to the period /nominate targets (next month), so running it bare tells you what to nominate for next. Use `status:seasonal` for the seasonal lane and `target_month` to look further ahead. Says so plainly when a period has no theme. The example titles come from a live VNDB search built from the same rules the gate enforces, so anything shown would be accepted; rules VNDB can't search on (character count) are called out on the card.",
+      "parameters": "• `status`: Optional - Which nomination lane, `monthly` (default) or `seasonal`.\n• `target_month`: Optional - YYYY-MM period. Defaults to the period /nominate targets.",
+      "example": "/theme target_month:2026-09"
+    },
+    {
       "name": "/nominate",
       "category": "voting",
       "short_description": "Nominate a VN for an upcoming monthly or seasonal voting.",
@@ -176,7 +185,7 @@
       "category": "manager",
       "short_description": "Manager: set nomination themes for a month or season.",
       "usage": "/manage_theme",
-      "description": "Manager-only. Opens an ephemeral dashboard for nomination themes. Build reusable theme templates (developer allowlist, required/excluded tags, length, character count, release window, NSFW cover policy) with a search-then-pick flow for tags and developers, then apply one to an upcoming month or season. While a theme is set, /nominate only accepts VNs that fit it and tells the nominator which rule failed; managers bypass the gate. Applying snapshots the template's rules onto the period, so later template edits never change an already-themed month. Clearing a period lifts the restriction.",
+      "description": "Manager-only. Opens an ephemeral dashboard for nomination themes. Build reusable theme templates (developer allowlist, required/excluded tags, length, character count, release window, NSFW cover policy) with a search-then-pick flow for tags and developers, then apply one to an upcoming month or season. While a theme is set, /nominate only accepts VNs that fit it and tells the nominator which rule failed. Managers are checked too, but are let through with a warning on the confirmation rather than blocked. Members can see the active theme any time with /theme. Applying snapshots the template's rules onto the period, so later template edits never change an already-themed month. Clearing a period lifts the restriction.",
       "parameters": "_(none — the dashboard collects every input through the panel and modals.)_",
       "example": "/manage_theme"
     },

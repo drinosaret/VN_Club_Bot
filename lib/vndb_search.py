@@ -93,19 +93,24 @@ class VNDBClient:
             return []
 
     async def search_tags(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Search VNDB tags (the /kana/tag endpoint) for the dashboard picker."""
+        """Search VNDB tags (the /kana/tag endpoint) for the dashboard picker.
+
+        Drops tags VNDB marks unsearchable. Ordinary searches surface grouping
+        nodes like "Theme" and "Story", and the `tag` VN filter matches nothing
+        at all for those, so a theme built on one would reject every VN.
+        """
         query = (query or "").strip()
         if not query:
             return []
         limit = max(1, min(limit, 25))
         payload = {
             "filters": ["search", "=", query],
-            "fields": "id,name,category",
+            "fields": "id,name,category,searchable",
             "results": limit,
         }
         try:
             resp = await self._make_request("tag", payload)
-            return resp.get("results", [])
+            return [t for t in resp.get("results", []) if t.get("searchable")]
         except Exception as exc:  # noqa: BLE001
             logger.error("Error searching VNDB tags for '%s': %s", query, exc)
             return []

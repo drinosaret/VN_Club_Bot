@@ -20,6 +20,11 @@ _log = logging.getLogger(__name__)
 # lib/migrations._invalidate_vndb_cache_for_blur_threshold).
 COVER_BLUR_THRESHOLD = 0.7
 
+# The club reads in Japanese, so a VN originally written in another language
+# is not a candidate however well it fits a theme. VNDB's `olang` is the
+# original language, unlike `lang`, which also counts translations into it.
+CLUB_ORIGINAL_LANGUAGE = "ja"
+
 # Process-local TTL cache for VNDB extras.
 # Banners re-render on /season_overview, /monthly, /seasonal, and on vote
 # closes — without caching, every render fires a fresh VNDB POST per VN.
@@ -33,6 +38,24 @@ _vndb_extras_locks: dict[str, asyncio.Lock] = {}
 
 _theme_attrs_cache: dict[str, tuple[float, dict]] = {}
 _theme_attrs_locks: dict[str, asyncio.Lock] = {}
+
+# (vndb_id, tag_id, max_spoiler, min_level, include_children) -> (at, matched)
+_tag_match_cache: dict[tuple[str, str, int, float, bool], tuple[float, bool]] = {}
+
+# Tag probes are the only path here that fans out per call, and VNDB meters
+# per IP for the whole container. Holding them to a few in flight keeps a
+# themed batch from spending the budget that autocomplete and the banners
+# share. Created lazily: a module-level Semaphore would bind the import-time
+# event loop.
+_TAG_MATCH_IN_FLIGHT = 4
+_tag_match_gate: Optional[asyncio.Semaphore] = None
+
+
+def _tag_match_limiter() -> asyncio.Semaphore:
+    global _tag_match_gate
+    if _tag_match_gate is None:
+        _tag_match_gate = asyncio.Semaphore(_TAG_MATCH_IN_FLIGHT)
+    return _tag_match_gate
 
 CREATE_VNDB_CACHE_TABLE = """
 CREATE TABLE IF NOT EXISTS vndb_cache (
@@ -495,19 +518,194 @@ async def fetch_vndb_extras(
     return result
 
 
+async def vn_matches_tag(
+    vndb_id: str,
+    tag_id: str,
+    max_spoiler: int,
+    min_level: float,
+    include_children: bool = True,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Optional[bool]:
+    """Does this VN carry ``tag_id``, as VNDB itself would answer it?
+
+    Asks VNDB rather than reading the VN's own tag list, because that list
+    holds only directly-applied tags: a VN carrying a child tag does not list
+    the parent it sits under, though a VNDB search for the broader
+    tag returns it. The tag endpoint publishes no parent/child links (tags
+    form a DAG), so the hierarchy can only be resolved server-side.
+
+    ``include_children`` picks the filter: `tag` credits a VN for any
+    descendant of the tag, `dtag` requires the tag itself. The difference is
+    large enough to change a theme's reach several times over.
+
+    Returns None when the answer is unavailable (network failure, non-200,
+    or a filter VNDB rejects such as an unknown tag id) so the caller can
+    fail closed instead of reading "no answer" as "no match".
+    """
+    if not vndb_id.startswith("v"):
+        vndb_id = f"v{vndb_id}"
+    # VNDB rejects out-of-range values outright, taking the whole request
+    # with them; clamp to the documented domains.
+    max_spoiler = max(0, min(2, int(max_spoiler)))
+    min_level = max(0.0, min(3.0, float(min_level)))
+
+    key = (vndb_id, tag_id, max_spoiler, min_level, include_children)
+    now = time.monotonic()
+    cached = _tag_match_cache.get(key)
+    if cached is not None and (now - cached[0]) < _VNDB_EXTRAS_TTL_SECONDS:
+        return cached[1]
+
+    payload = {
+        "filters": ["and", ["id", "=", vndb_id],
+                    [("tag" if include_children else "dtag"), "=",
+                     [tag_id, max_spoiler, min_level]]],
+        "fields": "id",
+        "results": 1,
+    }
+
+    async def _do(s: aiohttp.ClientSession) -> Optional[bool]:
+        async with _tag_match_limiter():
+            async with s.post(API_URL, json=payload) as resp:
+                if resp.status != 200:
+                    _log.warning("tag match %s for %s/%s", resp.status, vndb_id, tag_id)
+                    return None
+                data = await resp.json()
+                return bool(data.get("results"))
+
+    # Two attempts, like the metadata fetch: an unanswered probe fails the
+    # nomination closed, so a dropped connection would read to the nominator
+    # as their VN not carrying a tag it has.
+    matched = None
+    for attempt in (1, 2):
+        try:
+            if session is not None:
+                matched = await _do(session)
+            else:
+                timeout = aiohttp.ClientTimeout(
+                    total=10 if attempt == 1 else 20,
+                    connect=5 if attempt == 1 else 10,
+                )
+                async with aiohttp.ClientSession(timeout=timeout) as own:
+                    matched = await _do(own)
+            break
+        except Exception as e:  # noqa: BLE001
+            if attempt == 1:
+                _log.warning("tag match attempt 1 failed for %s/%s: %s. Retrying.",
+                             vndb_id, tag_id, e)
+                continue
+            _log.warning("tag match failed for %s/%s: %s", vndb_id, tag_id, e)
+            return None
+
+    if matched is None:
+        return None
+    _tag_match_cache[key] = (time.monotonic(), matched)
+    if len(_tag_match_cache) > _VNDB_EXTRAS_CACHE_CAP:
+        oldest = min(_tag_match_cache, key=lambda k: _tag_match_cache[k][0])
+        _tag_match_cache.pop(oldest, None)
+    return matched
+
+
+async def search_vns(
+    filters: list,
+    *,
+    limit: int = 8,
+    sort: str = "rating",
+    exclude_nsfw_covers: bool = False,
+    original_language: Optional[str] = CLUB_ORIGINAL_LANGUAGE,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> tuple[Optional[list[dict]], Optional[int]]:
+    """Run a VNDB filter and return ``(results, total_matches)``.
+
+    Used to show real titles that satisfy a nomination theme. ``total_matches``
+    is the full count behind the page. Returns ``(None, None)`` on any failure,
+    so a caller can drop the examples and still show whatever else it was going
+    to.
+
+    ``original_language`` narrows to VNs written in that language, defaulting
+    to the club's. Pass None only for a search that genuinely spans languages,
+    since a count taken over every language includes titles this club does not
+    read.
+
+    ``exclude_nsfw_covers`` drops results whose cover is rated at or above
+    COVER_BLUR_THRESHOLD. VNDB has no filter for that, so it is applied here
+    over an over-fetched page.
+    """
+    if not filters:
+        return None, None
+    if original_language:
+        filters = ["and", filters, ["olang", "=", original_language]]
+
+    payload = {
+        "filters": filters,
+        "fields": "id, title, alttitle, rating, votecount, released, image.url, image.sexual",
+        # Over-fetch so local NSFW removal can still fill the page. Same one
+        # request either way, and a theme can match a lot of adult titles.
+        "results": min(limit * 5, 100) if exclude_nsfw_covers else limit,
+        "sort": sort,
+        "reverse": True,
+        "count": True,
+    }
+
+    async def _do(s: aiohttp.ClientSession) -> Optional[dict]:
+        async with s.post(API_URL, json=payload) as resp:
+            if resp.status != 200:
+                # The body carries VNDB's reason for rejecting a filter, which
+                # is the only useful signal here. Bounded and single-lined: the
+                # log is read through the console, which renders it as text.
+                detail = " ".join((await resp.text())[:200].split())
+                _log.warning("vn search %s: %s", resp.status, detail)
+                return None
+            return await resp.json()
+
+    data = None
+    for attempt in (1, 2):
+        try:
+            if session is not None:
+                data = await _do(session)
+            else:
+                timeout = aiohttp.ClientTimeout(
+                    total=10 if attempt == 1 else 20,
+                    connect=5 if attempt == 1 else 10,
+                )
+                async with aiohttp.ClientSession(timeout=timeout) as own:
+                    data = await _do(own)
+            break
+        except Exception as e:  # noqa: BLE001
+            if attempt == 1:
+                _log.warning("vn search attempt 1 failed: %s. Retrying.", e)
+                continue
+            _log.warning("vn search failed: %s", e)
+            return None, None
+
+    if not data:
+        return None, None
+    results = data.get("results") or []
+    if exclude_nsfw_covers:
+        results = [
+            vn for vn in results
+            if ((vn.get("image") or {}).get("sexual") or 0) < COVER_BLUR_THRESHOLD
+        ]
+    return results[:limit], data.get("count")
+
+
 async def fetch_theme_attributes(
     vndb_id: str,
     session: Optional[aiohttp.ClientSession] = None,
 ) -> Optional[dict]:
-    """Fetch the theme-gate attributes not held in vndb_cache: full tag list
-    (id/rating/spoiler), developer producer ids, and the full release date.
+    """Fetch the theme-gate attributes not held in vndb_cache: developer
+    producer ids, the full release date, and the cover's sexual rating.
 
     Returns None on any failure (network, non-200, no results) so the caller
     fails the theme gate closed rather than silently passing a VN it could not
     verify. On success returns:
-        {"tags": [{"id","rating","spoiler"}...],
-         "developer_ids": ["p57", ...],
-         "released": "YYYY-MM-DD" | "YYYY-MM" | "YYYY" | None}
+        {"developer_ids": ["p<id>", ...],
+         "released": "YYYY-MM-DD" | "YYYY-MM" | "YYYY" | None,
+         "cover_sexual": float | None}
+
+    ``cover_sexual`` is None when the VN has no cover or the cover carries no
+    sexuality votes, which the NSFW rule must treat as unknown rather than
+    safe. Tags are not here: they need one filtered query per tag, see
+    ``vn_matches_tag``.
 
     Cached process-locally like fetch_vndb_extras (1h TTL); pass ``session``
     to reuse a connection.
@@ -532,7 +730,7 @@ async def fetch_theme_attributes(
 
         payload = {
             "filters": ["id", "=", vndb_id],
-            "fields": "released, tags.id, tags.rating, tags.spoiler, developers.id, developers.name",
+            "fields": "released, image.sexual, developers.id, developers.name",
         }
 
         async def _do(s: aiohttp.ClientSession) -> Optional[dict]:
@@ -560,16 +758,24 @@ async def fetch_theme_attributes(
         return None
     vn = results[0]
 
-    tags = [
-        {"id": t.get("id"), "rating": float(t.get("rating") or 0), "spoiler": int(t.get("spoiler") or 0)}
-        for t in (vn.get("tags") or []) if t.get("id")
-    ]
     developer_ids = [d.get("id") for d in (vn.get("developers") or []) if d.get("id")]
-    result = {"tags": tags, "developer_ids": developer_ids, "released": vn.get("released")}
+    image = vn.get("image") or {}
+    cover_sexual = image.get("sexual")
+    result = {
+        "developer_ids": developer_ids,
+        "released": vn.get("released"),
+        "cover_sexual": float(cover_sexual) if cover_sexual is not None else None,
+    }
 
     _theme_attrs_cache[vndb_id] = (time.monotonic(), result)
     if len(_theme_attrs_cache) > _VNDB_EXTRAS_CACHE_CAP:
         oldest = min(_theme_attrs_cache, key=lambda k: _theme_attrs_cache[k][0])
         _theme_attrs_cache.pop(oldest, None)
         _theme_attrs_locks.pop(oldest, None)
+    # A lookup that never succeeds still left a lock behind, and only the
+    # success path above evicts, so ids that always fail would accumulate.
+    if len(_theme_attrs_locks) > _VNDB_EXTRAS_CACHE_CAP * 2:
+        for stale in [k for k in _theme_attrs_locks
+                      if k not in _theme_attrs_cache and not _theme_attrs_locks[k].locked()]:
+            _theme_attrs_locks.pop(stale, None)
     return result

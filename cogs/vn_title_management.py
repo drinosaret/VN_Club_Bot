@@ -15,6 +15,7 @@ from lib.utils import (
     DatabaseQueries,
     validate_user_permission,
     validate_month_input,
+    validate_month_format,
     handle_command_error,
     get_current_month,
     get_single_monthly_vn,
@@ -32,6 +33,8 @@ from lib.utils import (
     prev_season,
     next_season,
 )
+from lib.theme_service import load_period_theme
+from lib.themes import rules_summary
 from lib.embeds import EmbedBuilder, build_vn_links_view
 from lib.autocomplete import (
     vn_autocomplete, vn_pool_autocomplete,
@@ -1532,6 +1535,41 @@ class VNTitleManagement(commands.Cog):
     ):
         return await self._pool_entry_lookup_autocomplete(interaction, current)
 
+    @staticmethod
+    async def _pool_theme_block(bot: VNClubBot, guild_id: int, kind: str,
+                               start_month: str, end_month: str) -> str:
+        """The period's theme rendered for the pool header, or "" when the
+        period is unthemed. Names the rules, not just the label: "SF
+        September" tells a member nothing about what will be accepted."""
+        theme = await load_period_theme(bot, guild_id, kind, start_month, end_month)
+        if theme is None:
+            return ""
+        label, rules = theme
+        if rules is None:
+            return (f"🎯 **Theme: {label}** (its rules can't be read right now, "
+                    "so nominations for this period are on hold)")
+        lines = [f"🎯 **Theme: {label}**"]
+        lines += [f"> {line}" for line in rules_summary(rules).splitlines()]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _pool_footer(view_label: str, scope_label: str, filter_value: str,
+                     page: int = 1, total: int = 1) -> str:
+        """Which slice of the pool is on screen, and what to do with it.
+
+        Lives in the footer rather than the description: it describes the view
+        instead of the period, and the theme banner needs the space under the
+        title. Footers render no markdown, so this is plain text.
+        """
+        parts = [view_label, scope_label, f"Filter: {filter_value}"]
+        if total > 1:
+            parts.append(f"Page {page}/{total}")
+        # A reader looking at the pool is the likeliest person to want to add
+        # to it, and nothing else on the embed says how.
+        parts.append("/nominate to add a VN")
+        parts.append("/pool_entry id:<#> for detail")
+        return " · ".join(parts)
+
     async def _build_pool_pages(
         self,
         bot: VNClubBot,
@@ -1609,16 +1647,28 @@ class VNTitleManagement(commands.Cog):
 
         scope_label = "All Servers" if all_servers else "This Server"
         view_label = "Seasonal" if view_mode == "seasonal" else "Monthly"
-        meta = f"*View: {view_label} · Scope: {scope_label} · Filter: {filter_value}*"
+
+        # Themed periods restrict what /nominate accepts, so say so here
+        # rather than leaving members to discover it by being turned away.
+        # Themes are per-guild, so the global view has no single one to show.
+        # Not `header`: the section loop below binds that name, and this has
+        # to survive it to reach the embed.
+        page_header = ""
+        if not all_servers:
+            page_header = await self._pool_theme_block(
+                bot, guild_id, view_mode, probe_start_month, probe_end_month,
+            )
 
         if not picks and not noms:
+            empty = f"_No entries match for {empty_label}._"
             embed = discord.Embed(
                 title=f"📚 Pool — {period_label}",
-                description=f"{meta}\n\n_No entries match for {empty_label}._",
+                description=f"{page_header}\n\n{empty}" if page_header else empty,
                 color=discord.Color.blurple(),
             )
             embed.set_author(name="Visual Novel Club")
-            embed.set_footer(text="Tip: /pool_entry id:<#> shows full detail for any entry below.")
+            embed.set_footer(
+                text=self._pool_footer(view_label, scope_label, filter_value))
             return [embed]
 
         # `expected_start` / `expected_end` define the view's period —
@@ -1651,10 +1701,12 @@ class VNTitleManagement(commands.Cog):
             sections.append((f"### {label_emoji} {label_text} ({len(section_rows)})", lines))
 
         # Greedy line-by-line packer. Each page's body string lives in
-        # ``page_bodies``; the meta line is prepended at embed-build time.
+        # ``page_bodies``; the header block is prepended at embed-build time,
+        # so its own length comes out of the per-page budget.
         # When a section spills past the budget, the continuation page
         # repeats the section header with a "(cont.)" suffix so readers
         # arriving via page nav always have context.
+        budget = _POOL_DESC_BUDGET - len(page_header)
         page_bodies: list[str] = []
         buf: list[str] = []
         buf_len = 0
@@ -1675,7 +1727,7 @@ class VNTitleManagement(commands.Cog):
             # Require room for the header AND at least one row so we never
             # orphan a section header at the bottom of a page.
             first_line_cost = (len(lines[0]) + 1) if lines else 0
-            if buf and buf_len + sep_cost + header_cost + first_line_cost > _POOL_DESC_BUDGET:
+            if buf and buf_len + sep_cost + header_cost + first_line_cost > budget:
                 flush()
                 sep = []
                 sep_cost = 0
@@ -1685,7 +1737,7 @@ class VNTitleManagement(commands.Cog):
             buf_len += sep_cost + header_cost
             for line in lines:
                 line_cost = len(line) + 1  # always preceded by header or earlier line
-                if buf_len + line_cost > _POOL_DESC_BUDGET:
+                if buf_len + line_cost > budget:
                     flush()
                     cont = header + " (cont.)" if not header.endswith(" (cont.)") else header
                     buf.append(cont)
@@ -1701,18 +1753,12 @@ class VNTitleManagement(commands.Cog):
         for i, body in enumerate(page_bodies):
             embed = discord.Embed(
                 title=f"📚 Pool — {period_label}",
-                description=f"{meta}\n\n{body}",
+                description=f"{page_header}\n\n{body}" if page_header else body,
                 color=discord.Color.blurple(),
             )
             embed.set_author(name="Visual Novel Club")
-            if total > 1:
-                embed.set_footer(
-                    text=f"Page {i + 1}/{total} · Tip: /pool_entry id:<#> shows full detail.",
-                )
-            else:
-                embed.set_footer(
-                    text="Tip: /pool_entry id:<#> shows full detail for any entry below.",
-                )
+            embed.set_footer(text=self._pool_footer(
+                view_label, scope_label, filter_value, page=i + 1, total=total))
             pages.append(embed)
         return pages
 
@@ -1780,40 +1826,48 @@ class VNTitleManagement(commands.Cog):
 
     @app_commands.command(
         name="monthly",
-        description="Show this server's current monthly VN(s) as a banner card.",
+        description="Show this server's monthly VN(s) as a banner card.",
     )
     @app_commands.describe(
         embed="Switch to the legacy text embed instead of the banner image (off by default).",
         cover="Banner cover: shown (default), blurred (force NSFW blur), or hidden. Ignored with embed:true.",
+        month="YYYY-MM month to show (default: the month in progress).",
     )
+    @app_commands.autocomplete(month=month_picker_autocomplete)
     @app_commands.guild_only()
     async def monthly(
         self,
         interaction: discord.Interaction,
         embed: bool = False,
         cover: Literal["shown", "blurred", "hidden"] = "shown",
+        month: Optional[str] = None,
     ):
         await self._post_pool_kind_banners(
             interaction, kind="monthly", embed=embed, cover_mode=cover,
+            target_month=month,
         )
 
     @app_commands.command(
         name="seasonal",
-        description="Show this server's current seasonal VN(s) as a banner card.",
+        description="Show this server's seasonal VN(s) as a banner card.",
     )
     @app_commands.describe(
         embed="Switch to the legacy text embed instead of the banner image (off by default).",
         cover="Banner cover: shown (default), blurred (force NSFW blur), or hidden. Ignored with embed:true.",
+        month="YYYY-MM inside the season you want (default: the season in progress).",
     )
+    @app_commands.autocomplete(month=month_picker_autocomplete)
     @app_commands.guild_only()
     async def seasonal(
         self,
         interaction: discord.Interaction,
         embed: bool = False,
         cover: Literal["shown", "blurred", "hidden"] = "shown",
+        month: Optional[str] = None,
     ):
         await self._post_pool_kind_banners(
             interaction, kind="seasonal", embed=embed, cover_mode=cover,
+            target_month=month,
         )
 
     async def _post_pool_kind_banners(
@@ -1822,31 +1876,50 @@ class VNTitleManagement(commands.Cog):
         kind: str,
         embed: bool,
         cover_mode: str = "shown",
+        target_month: Optional[str] = None,
     ):
         """Shared body for /monthly and /seasonal. Pre-renders every active
         ``kind`` row into a payload, then posts a single message — paginated
         with PoolBannerPaginator when there's more than one — instead of
         spamming the channel with N separate banner messages.
+
+        ``target_month`` probes a period other than the one in progress. The
+        queries are overlap checks, so any month inside a season finds that
+        season's row.
         """
         await interaction.response.defer()
 
-        current_month = get_current_month()
+        if target_month and not validate_month_format(target_month):
+            await interaction.followup.send(
+                "❌ `month` must be in YYYY-MM format, for example `2026-09`.",
+            )
+            return
+        probe_month = target_month or get_current_month()
+        # "Current" is only honest when the caller didn't name a period.
+        is_current = target_month is None
 
         if kind == "seasonal":
             query = DatabaseQueries.GET_CURRENT_SEASONAL_VNS_FOR_GUILD
-            empty_msg = "No current seasonal VNs found for this server."
             file_kind_tag = "season"
             eyebrow_suffix = "VN OF THE SEASON"
-            embed_title_prefix = "Current Seasonal VN: "
+            period_word = "seasonal"
         else:
             query = DatabaseQueries.GET_CURRENT_MONTHLY_VNS_FOR_GUILD
-            empty_msg = "No current monthly VNs found for this server this month."
             file_kind_tag = "month"
             eyebrow_suffix = "VN OF THE MONTH"
-            embed_title_prefix = "Current Monthly VN: "
+            period_word = "monthly"
+
+        if is_current:
+            empty_msg = f"No current {period_word} VNs found for this server."
+            embed_title_prefix = f"Current {period_word.capitalize()} VN: "
+        else:
+            asked_label = month_label_for(probe_month)
+            empty_msg = (f"No {period_word} VNs found for this server for "
+                         f"{asked_label}.")
+            embed_title_prefix = f"{period_word.capitalize()} VN: "
 
         results = await self.bot.GET(
-            query, (current_month, current_month, interaction.guild.id),
+            query, (probe_month, probe_month, interaction.guild.id),
         )
         if not results:
             await interaction.followup.send(empty_msg)

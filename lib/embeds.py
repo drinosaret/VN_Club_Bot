@@ -19,6 +19,9 @@ from lib.jiten_client import resolve_display_cover
 
 _log = logging.getLogger(__name__)
 
+# Discord fits five buttons per action row, and one row is all a theme needs.
+MAX_THEME_LINK_BUTTONS = 5
+
 
 def build_vn_links_view(vndb_id: str, jiten_deck_id: Optional[int]) -> discord.ui.View:
     """VNDB + jiten.moe link buttons for any single-VN embed/banner."""
@@ -34,6 +37,39 @@ def build_vn_links_view(vndb_id: str, jiten_deck_id: Optional[int]) -> discord.u
             style=discord.ButtonStyle.link,
             url=f"https://jiten.moe/decks/media/{jiten_deck_id}/detail",
         ))
+    return view
+
+
+def build_theme_links_view(rules: dict) -> Optional[discord.ui.View]:
+    """Link buttons out to the VNDB pages a theme is built from.
+
+    Each tag and developer page lists everything carrying it, which is the
+    closest thing to a browsable "all valid titles" list: VNDB's advanced
+    search encodes its filters in an undocumented compact format that cannot
+    be generated reliably, so there is no single URL for a whole ruleset.
+
+    Returns None when the ruleset names nothing linkable.
+    """
+    tags = rules.get("tags") or {}
+    entries = [(t["name"], t["id"]) for t in tags.get("all_of", []) + tags.get("any_of", [])]
+    entries += [(d["name"], d["id"])
+                for d in (rules.get("developers") or {}).get("any_of", [])]
+    if not entries:
+        return None
+
+    view = discord.ui.View(timeout=None)
+    seen = set()
+    for name, vndb_id in entries:
+        if vndb_id in seen:
+            continue
+        seen.add(vndb_id)
+        view.add_item(discord.ui.Button(
+            label=truncate_text(f"Browse {name}", 80),
+            style=discord.ButtonStyle.link,
+            url=f"https://vndb.org/{vndb_id}",
+        ))
+        if len(view.children) == MAX_THEME_LINK_BUTTONS:
+            break
     return view
 
 

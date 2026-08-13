@@ -135,6 +135,19 @@ class VNClubBot(commands.Bot):
             await db.commit()
             return new_id
 
+    async def RUN_RETURNING_ROWCOUNT(self, query: str, params: tuple = ()) -> int:
+        """Execute a write and return how many rows it changed.
+
+        Use for UPDATE/DELETE whose WHERE clause is also the authorization
+        check (id + guild_id): zero rows means the target was gone or belonged
+        to another guild, which the caller must report instead of confirming.
+        """
+        async with aiosqlite.connect(self.path_to_db) as db:
+            cursor = await db.execute(query, params)
+            changed = cursor.rowcount
+            await db.commit()
+            return changed
+
     async def RUN_TRANSACTION(self, statements: list[tuple[str, tuple]]) -> None:
         """Execute multiple writes atomically in a single transaction.
 
