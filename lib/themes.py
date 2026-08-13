@@ -511,15 +511,19 @@ def rules_summary(rules: dict) -> str:
             parts.append("Any of: " + ", ".join(inc_label(t) for t in tags["any_of"]))
         if tags["none_of"]:
             parts.append("Excludes: " + ", ".join(exc_label(t) for t in tags["none_of"]))
-        if not tags["include_spoilers"]:
-            parts.append("Spoiler tags don't count toward required tags")
-        # Worth stating either way: the same tag name covers a set several
-        # times larger with child tags than without, and the reader cannot
-        # tell which they are looking at from the tag alone.
-        parts.append(
-            "Child tags count toward required tags"
-            if tags.get("include_children", True)
-            else "Child tags don't count: required tags must be applied directly")
+        # Both settings scope how a required tag is matched, so they only
+        # describe a ruleset that requires one. An exclusion sets its own
+        # scope and is unaffected by either.
+        if tags["all_of"] or tags["any_of"]:
+            if not tags["include_spoilers"]:
+                parts.append("Spoiler tags don't count toward required tags")
+            # Worth stating either way: the same tag name covers a set several
+            # times larger with child tags than without, and the reader cannot
+            # tell which they are looking at from the tag alone.
+            parts.append(
+                "Child tags count toward required tags"
+                if tags.get("include_children", True)
+                else "Child tags don't count: required tags must be applied directly")
     rel = rules.get("released")
     if rel and (rel.get("after") or rel.get("before")):
         parts.append(f"Released: {release_window_phrase(rel)}")
