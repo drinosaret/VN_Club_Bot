@@ -60,6 +60,7 @@ async def run_migrations(bot) -> None:
         await _backfill_vndb_cache_after_blur_invalidation(bot)
         await _add_user_tag_to_users(bot)
         await _create_theme_tables(bot)
+        await _create_user_transfers_table(bot)
     except Exception:
         _log.exception("Migrations failed; aborting startup so the container restart-loops cleanly")
         raise
@@ -1042,6 +1043,30 @@ async def _create_theme_tables(bot) -> None:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (guild_id, kind, start_month, end_month)
+        );
+        """
+    )
+
+
+async def _create_user_transfers_table(bot) -> None:
+    """Journal of account-to-account record transfers.
+
+    Records which rows moved to the new account (moved_json) and which stayed
+    because they collide with rows it already had (left_json), so a transfer
+    can be undone row for row. Kept in this database so the journal stays
+    consistent with the data it describes when a backup is restored.
+    """
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS user_transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_user_id INTEGER NOT NULL,
+            to_user_id INTEGER NOT NULL,
+            performed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            moved_json TEXT NOT NULL,
+            left_json TEXT NOT NULL,
+            undone_at TIMESTAMP,
+            undo_json TEXT
         );
         """
     )
