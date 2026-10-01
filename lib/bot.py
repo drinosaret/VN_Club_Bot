@@ -194,7 +194,7 @@ class VNClubBot(commands.Bot):
         error: discord.app_commands.AppCommandError,
     ):
         # Import here to avoid circular imports
-        from lib.utils import BotError
+        from lib.utils import BotError, send_error
 
         # Unwrap the original exception if wrapped
         original = getattr(error, 'original', error)
@@ -203,11 +203,11 @@ class VNClubBot(commands.Bot):
         if isinstance(original, BotError):
             message = original.user_message
         elif isinstance(error, discord.app_commands.MissingAnyRole):
-            message = "You do not have the permission to use this command."
+            message = "You don't have permission to use this."
         elif isinstance(error, discord.app_commands.CommandOnCooldown):
-            message = f"This command is currently on cooldown. Try again in {int(error.retry_after)} seconds."
+            message = f"This command is on cooldown. Try again in {int(error.retry_after)} seconds."
         else:
-            message = "An unexpected error occurred. Please try again later."
+            message = "Something went wrong. Try again in a minute."
             # Log unexpected errors for debugging. Include user/guild/command
             # context so a generic Discord report ("I got an error toast") is
             # immediately correlatable in hikaru_bot.log without grepping by
@@ -222,14 +222,9 @@ class VNClubBot(commands.Bot):
                 exc_info=error,
             )
 
-        # Send ephemeral error message
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(f"❌ {message}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"❌ {message}", ephemeral=True)
-        except Exception as e:
-            _log.error(f"Failed to send error message: {e}")
+        if not message.startswith("❌"):
+            message = f"❌ {message}"
+        await send_error(interaction, message)
 
     async def on_error(self, event_method, *args, **kwargs):
         _log.exception("Ignoring exception in %s", event_method)

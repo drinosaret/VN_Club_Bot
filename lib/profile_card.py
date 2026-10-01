@@ -13,7 +13,7 @@ purple accent, rounded panels). Layout:
     |             │ TOTAL POINTS    │ VN COMPLETIONS          │  |
     |             │ 1,234           │ 42                      │  |
     |             │ MONTHLY VNS     │ AVG RATING              │  |
-    |             │ 8               │ 4.2 / 5  (12 ratings)   │  |
+    |             │ 8               │ 7.8 / 10  (12 ratings)  │  |
     |             └─────────────────────────────────────────────┘
     |             ┌──────── 6-month activity ───────────────────┐
     |             │ ▁▂▅▇▃▁  (bar chart with month labels)       │
@@ -51,6 +51,16 @@ def _format_month_short(yyyy_mm: str) -> str:
         return datetime.strptime(yyyy_mm, "%Y-%m").strftime("%b")
     except Exception:
         return yyyy_mm
+
+
+def _format_card_date(yyyy_mm_dd: str) -> str:
+    """'2026-07-03' -> 'Jul 3, 2026'; anything unparseable passes through."""
+    try:
+        from datetime import datetime
+        d = datetime.strptime(yyyy_mm_dd[:10], "%Y-%m-%d")
+        return f"{d:%b} {d.day}, {d.year}"
+    except Exception:
+        return yyyy_mm_dd
 
 
 class ProfileCardGenerator:
@@ -235,6 +245,7 @@ class ProfileCardGenerator:
         badge_summary: Optional[Tuple[int, int, List[str]]] = None,
         voting_stats: Optional[dict] = None,
         ranks: Optional[dict] = None,
+        vndb_username: Optional[str] = None,
     ) -> io.BytesIO:
         # Pre-fetch the avatar (the only async work) and run the heavy
         # synchronous PIL render off the event loop so /profile doesn't stall
@@ -256,7 +267,7 @@ class ProfileCardGenerator:
                 recent_activity=recent_activity, member_since=member_since,
                 last_log=last_log, streak_months=streak_months,
                 badge_summary=badge_summary, voting_stats=voting_stats,
-                ranks=ranks,
+                ranks=ranks, vndb_username=vndb_username,
             )
         except Exception:
             logger.exception(
@@ -290,6 +301,7 @@ class ProfileCardGenerator:
         badge_summary: Optional[Tuple[int, int, List[str]]] = None,
         voting_stats: Optional[dict] = None,
         ranks: Optional[dict] = None,
+        vndb_username: Optional[str] = None,
     ) -> io.BytesIO:
         """
         ``badge_summary`` is ``(unlocked_count, total_count, latest_names)`` —
@@ -391,21 +403,23 @@ class ProfileCardGenerator:
         draw.text((self.TEXT_X, name_baseline), title_drawn,
                   fill=self.INK_PRIMARY, font=font_name, anchor="ls")
 
-        # subtitle: @username · joined YYYY-MM-DD · last log YYYY-MM-DD
-        # Place it below the name's full glyph extent (ascent + descent) plus
-        # a fixed visual gap, so display names with descenders (g/j/p/q/y)
-        # don't graze the subtitle text. Tertiary ink so the name + stats
-        # grid remain the visual anchors.
-        subtitle_parts = [f"@{username}"]
+        # Meta row under the name: @username, then labelled fields in the same
+        # small accent caps the standing panel uses (RANK, VOTING, BADGES), so
+        # each value reads as belonging to its label. Placed below the name's
+        # full glyph extent so descenders (g/j/p/q/y) never graze it.
+        meta_fields: List[Tuple[str, str]] = []
         if member_since:
-            subtitle_parts.append(f"joined {member_since}")
+            meta_fields.append(("JOINED", _format_card_date(member_since)))
         if last_log:
-            subtitle_parts.append(f"last log {last_log}")
-        subtitle = "  ·  ".join(subtitle_parts)
+            meta_fields.append(("LAST LOG", _format_card_date(last_log)))
+        if vndb_username:
+            meta_fields.append(("VNDB", vndb_username))
         subtitle_y = name_baseline + name_descent + 14 * S
-        sub = self._truncate_to_width(draw, subtitle, font_subtitle, max_name_w)
-        draw.text((self.TEXT_X, subtitle_y), sub,
-                  fill=self.INK_TERTIARY, font=font_subtitle)
+        sub_ascent, _sub_descent = font_subtitle.getmetrics()
+        self._draw_meta_row(
+            draw, self.TEXT_X, subtitle_y + sub_ascent, max_name_w,
+            f"@{username}", meta_fields, font_subtitle,
+        )
 
         # ---- stats grid (2 col x 2 row) ----
         # Account for the subtitle's own glyph height before the next gap, so
@@ -427,7 +441,8 @@ class ProfileCardGenerator:
         col2_x = col1_x + col_w + col_gap
 
         if average_rating is not None and rating_count > 0:
-            rating_value = f"{average_rating:.1f} / 5  ({rating_count})"
+            # average_rating is normalized to 1-100; shown on the 10-point scale.
+            rating_value = f"{average_rating / 10:.1f} / 10  ({rating_count})"
         else:
             rating_value = "—"
 
@@ -592,6 +607,43 @@ class ProfileCardGenerator:
             (text_x, box[1] + 70 * S),
             unit, fill=self.INK_SECONDARY, font=font_unit,
         )
+
+    def _draw_meta_row(self, draw, x: int, baseline: int, max_w: int,
+                       handle: str, fields: List[Tuple[str, str]], font_value) -> None:
+        """Draw ``@handle`` followed by LABEL value pairs on one baseline,
+        separated by hairline dividers. Fields that cannot fit are shortened,
+        then dropped from the end, so the row never runs past ``max_w``."""
+        S = self.SCALE
+        font_label = _load_japanese_font(11 * S, bold=True)
+        label_gap = 8 * S
+        field_gap = 24 * S
+        min_value_w = 40 * S
+        right = x + max_w
+        ascent, _ = font_value.getmetrics()
+
+        handle = self._truncate_to_width(draw, handle, font_value, max_w)
+        draw.text((x, baseline), handle, fill=self.INK_TERTIARY,
+                  font=font_value, anchor="ls")
+        cursor = x + draw.textlength(handle, font=font_value)
+
+        for label, value in fields:
+            label_w = draw.textlength(label, font=font_label)
+            avail = right - cursor - field_gap - label_w - label_gap
+            if avail < min_value_w:
+                break
+            value = self._truncate_to_width(draw, value, font_value, int(avail))
+            divider_x = cursor + field_gap // 2
+            draw.line(
+                [(divider_x, baseline - int(ascent * 0.7)), (divider_x, baseline + 2 * S)],
+                fill=self.HAIRLINE, width=max(1, S),
+            )
+            cursor += field_gap
+            draw.text((cursor, baseline), label, fill=self.ACCENT,
+                      font=font_label, anchor="ls")
+            cursor += label_w + label_gap
+            draw.text((cursor, baseline), value, fill=self.INK_SECONDARY,
+                      font=font_value, anchor="ls")
+            cursor += draw.textlength(value, font=font_value)
 
     def _draw_stat_column(self, draw, x: int, y: int, row_h: int,
                           rows: list, font_label, font_value):

@@ -7,6 +7,7 @@ import discord
 import logging
 from pathlib import Path
 from typing import List
+from lib.style import SEP, month_short
 from lib.utils import DatabaseQueries
 from lib.vndb_search import search_visual_novel, create_autocomplete_value, parse_autocomplete_value
 
@@ -81,17 +82,18 @@ async def vn_autocomplete(interaction: discord.Interaction, current: str) -> Lis
         if isinstance(rating, (int, float)) and rating > 0:
             badge_parts.append(f"{rating / 10:.1f}/10")
 
-        # Build label with VN ID suffix to survive Discord token replacement
+        # The VN ID suffix lets resolve_vn_from_input recover the VN when
+        # Discord submits the label instead of the value.
         vn_id_suffix = f" [{vn_id}]"
         if badge_parts:
-            choice_label = f"{display_title} — {' • '.join(badge_parts)}{vn_id_suffix}"
+            choice_label = f"{display_title}{SEP}{SEP.join(badge_parts)}{vn_id_suffix}"
         else:
             choice_label = f"{display_title}{vn_id_suffix}"
 
         # Truncate title if needed, but preserve the VN ID suffix
         if len(choice_label) > 100:
             if badge_parts:
-                badge_str = f" — {' • '.join(badge_parts)}"
+                badge_str = SEP + SEP.join(badge_parts)
                 available_for_title = 100 - len(badge_str) - len(vn_id_suffix) - 1
                 truncated_title = display_title[:available_for_title] + "…"
                 choice_label = f"{truncated_title}{badge_str}{vn_id_suffix}"
@@ -132,10 +134,10 @@ async def user_logs_autocomplete(interaction: discord.Interaction, current: str)
         for log_id, vndb_id, reward_month, reward_reason, points, vn_title in results[:25]:
             # Use VN title if available, otherwise show reward reason for non-VN logs
             display_name = vn_title or reward_reason or "Unknown"
-            label = f"#{log_id} | {display_name} ({reward_month}, {points}点)"
+            label = SEP.join((f"#{log_id}", display_name, month_short(reward_month), f"{points or 0:,}点"))
             # Truncate if needed (Discord limit is 100 chars)
             if len(label) > 100:
-                label = label[:97] + "..."
+                label = label[:99] + "…"
             choices.append(discord.app_commands.Choice(name=label, value=log_id))
 
         return choices
@@ -200,7 +202,7 @@ async def month_picker_autocomplete(
     interaction: discord.Interaction, current: str,
 ) -> List[discord.app_commands.Choice[str]]:
     """Suggest YYYY-MM picks for *date-setter* inputs around the current
-    month — e.g. `/manage_pool start_month` / `end_month`. Symmetric ±12
+    month, e.g. `/manage_pool start_month` / `end_month`. Symmetric ±12
     so corrections to past entries and scheduling future entries both
     work. For *backfill* inputs that should not allow future months,
     use ``month_picker_past_autocomplete``.
@@ -241,7 +243,7 @@ async def month_picker_future_autocomplete(
     at the top of the suggestions so the picker isn't a hard cap.
     """
     needle = (current or "").strip()
-    # _month_window's interleaving doesn't matter when one side is 0 —
+    # _month_window's interleaving doesn't matter when one side is 0:
     # it ends up just "current, +1, +2, …" naturally. 24 forward gives
     # a 25-item window (matches Discord's choice cap).
     suggestions = _month_window(back=0, forward=24)
@@ -263,7 +265,7 @@ async def month_int_autocomplete(
     needle = (current or "").strip().lower()
     choices: list[discord.app_commands.Choice[int]] = []
     for i, name in enumerate(_MONTH_NAMES, start=1):
-        label = f"{i} — {name}"
+        label = f"{i}{SEP}{name}"
         if needle and needle not in label.lower() and needle != str(i):
             continue
         choices.append(discord.app_commands.Choice(name=label, value=i))
@@ -344,7 +346,7 @@ async def bot_guilds_autocomplete(
     Used by admin commands that take a ``guild_id`` parameter for explicit
     cross-guild targeting (``/manage_managers``, ``/manage_pool``). Unlike
     ``server_autocomplete`` which filters to guilds-with-reading-logs, this
-    one lists every guild the bot is a member of — including newly-joined
+    one lists every guild the bot is a member of, including newly-joined
     clubs that haven't had any /finish activity yet, so a host can seed
     their pool right after the invite.
 
@@ -461,21 +463,11 @@ async def help_command_autocomplete(interaction: discord.Interaction, current: s
         short = cmd.get("short_description") or ""
         if needle and needle not in name.lower() and needle not in short.lower():
             continue
-        # Display label: `name — short_description`, truncated to Discord's 100-char limit.
-        label = f"{name} — {short}" if short else name
+        # Display label: `name · short_description`, truncated to Discord's 100-char limit.
+        label = f"{name}{SEP}{short}" if short else name
         if len(label) > 100:
             label = label[:99] + "…"
         choices.append(discord.app_commands.Choice(name=label, value=name.lstrip("/")))
         if len(choices) >= 25:
             break
     return choices
-
-
-# Rating choices for consistent use across commands
-RATING_CHOICES = [
-    discord.app_commands.Choice(name="⭐ 1 - Terrible", value=1),
-    discord.app_commands.Choice(name="⭐⭐ 2 - Bad", value=2),
-    discord.app_commands.Choice(name="⭐⭐⭐ 3 - Average", value=3),
-    discord.app_commands.Choice(name="⭐⭐⭐⭐ 4 - Good", value=4),
-    discord.app_commands.Choice(name="⭐⭐⭐⭐⭐ 5 - Masterpiece", value=5),
-]

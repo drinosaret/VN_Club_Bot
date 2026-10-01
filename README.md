@@ -4,7 +4,9 @@ A Discord bot for visual-novel reading clubs. Members log what they finish, vote
 
 ## Features
 
-**Reading logs.** Record what you finished with rating, comment, points, and timestamp. Re-reads in different months are fine; same-month duplicates get rejected.
+**Reading logs.** Record what you finished with rating, comment, points, and timestamp. Re-reads in different months are fine; same-month duplicates get rejected. Each member rates on their own scale (5, 10 or 100 points, 10 by default); ratings display on the scale they were written on, and averages combine all scales.
+
+**VNDB accounts.** Members can link their VNDB account. Their public list feeds `/ratings` (VNDB votes and notes next to VN Club ratings and comments), a VNDB leaderboard (most finished, most votes, most-read and top-rated VNs), and their profile card.
 
 **Pool and voting.** Admins curate a pool of candidate VNs. Members nominate, then vote, and the winner becomes that month's (or season's) pick. Vote UI is dropdown or buttons, votes can be restricted to a role, and you can schedule the close time so the cycle wraps itself automatically.
 
@@ -65,17 +67,30 @@ Slash commands sync automatically on every startup (in `setup_hook`, which runs 
 
 ## Commands
 
-22 slash commands organized into four groups. `/help` inside Discord renders the same catalog with examples and parameter detail.
+The slash commands below are organized into groups. `/help` inside Discord renders the same catalog with examples and parameter detail.
+
+**Reply visibility.** Replies are shown only to the person who ran the command, so channels are not filled with bot output. Managers can open chosen channels (or the whole server) to public replies with `/manage_visibility`, and can post any single reply in the channel with `public: True`. Anyone can pass `public: False` to keep a reply private in an open channel. Threads follow their parent channel; direct messages are unaffected.
 
 ### Reading
 
 | Command | Description |
 | --- | --- |
 | `/finish` | Mark a VN as finished. Awards more points if the VN is in the active server pool. |
-| `/logs` | View reading history for yourself or another user. |
+| `/logs` | The reading record: chronological logs with points, ratings and a one-line comment preview. |
 | `/log_edit` | Edit the comment or rating on a reading log (yours, or any if admin). |
 | `/log_undo` | Delete one of your reading logs. |
-| `/ratings` | View all user ratings and comments for a specific VN. |
+| `/settings` | Private settings panel; currently the scale you rate on (5, 10 or 100). |
+| `/ratings` | One line per member of this server with their VNDB vote, VN Club rating and a comment or note preview, highest first; for a VN or for one member. Full reviews open privately from a button. |
+
+### VNDB
+
+| Command | Description |
+| --- | --- |
+| `/vndb` | A VN's short card: details, VNDB score, VN Club readers across servers and in this server. Ratings and full info open privately from buttons. |
+| `/vndb_link` | Link your VNDB account, or pick `action: Unlink` to remove it and the cached list. The bot keeps a daily-refreshed copy of entries under public labels. |
+| `/vndb_profile` | Quick link to a member's VNDB profile. |
+| `/vndb_leaderboard` | VN rankings: most-read, highest- and lowest-rated VNs (3+ votes). |
+| `/vndb_user_leaderboard` | Member rankings (most finished, most votes) with each member's VNDB profile; all-time lists every linked member. |
 
 ### Stats
 
@@ -107,12 +122,14 @@ Slash commands sync automatically on every startup (in `setup_hook`, which runs 
 | `/manage_voting` | Dashboard for opening, closing, sweeping, or reopening monthly and seasonal votes. |
 | `/manage_reward_points` | Manually award points to a user. Useful for events, read-alongs, etc. |
 | `/manage_log` | Backfill a reading log on behalf of another user. Same point logic as `/finish`. |
+| `/manage_vndb_link` | Remove a member's VNDB link. |
+| `/manage_visibility` | Private panel: choose the channels where replies are public, or make the whole server public. |
 
 ### Meta
 
 | Command | Description |
 | --- | --- |
-| `/help` | Categorized command list with a per-command detail view. |
+| `/help` | Private category menu, then that category's commands, then one command's detail, all in one message only the caller sees. Manager tools are listed for managers only. |
 
 ## Architecture notes
 
@@ -125,6 +142,10 @@ Slash commands sync automatically on every startup (in `setup_hook`, which runs 
 **Image rendering** lives in `lib/monthly_banner.py`, `lib/profile_card.py`, and `lib/club_stats_card.py`. PIL-based, with 2x oversample plus LANCZOS downsample for anti-aliased edges. Cover fetches and renders run off the event loop via `asyncio.to_thread`.
 
 **VNDB and jiten.moe integration.** Cached per-VN in `vndb_cache`. Banner-time pulls extras (rating, votecount, year, tag set, platforms, developer, tag count) via a fresh `/vn` query. Jiten provides character count, difficulty, unique kanji, and dialogue percentage for the dense banner layout.
+
+**Rating scales.** `reading_logs.rating_scale` records the scale each rating was typed on; rows written before it existed default to 5, which is what they mean. `lib/ratings.py` owns normalization (1-100) and display.
+
+**VNDB list sync.** Linked lists are cached in `vndb_ulist` and refreshed every 24 hours by a background loop, one user at a time, paced well under VNDB's request budget. Only entries VNDB serves without a token (public labels) are visible. VNDB's API and dumps do not include review texts, so `/ratings` uses list notes and votes.
 
 **Migrations** in [`lib/migrations.py`](lib/migrations.py) are idempotent and run before any cog loads. They re-raise on failure so the container restart-loops rather than running on a half-applied schema. Each destructive schema step persists a `*_backup` table inside the DB. Pure data-invalidation steps (e.g. the cover-blur cache wipe) skip the backup, since the data is recoverable from external sources.
 

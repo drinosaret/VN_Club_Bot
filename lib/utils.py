@@ -19,9 +19,7 @@ MAX_EMBED_FIELD = 1024
 MAX_DISCORD_MESSAGE = 2000
 EMBED_DESCRIPTION_BUFFER = 100
 
-# Points and rating constants
-MIN_RATING = 1
-MAX_RATING = 5
+# Points constants (rating scales live in lib/ratings.py)
 DEFAULT_MONTHLY_POINTS = 10
 NON_MONTHLY_MULTIPLIER = 0.6
 
@@ -320,10 +318,127 @@ def format_points_display(current_points: int, new_points: int) -> str:
     return f"**{current_points:,}** ➔ **{new_points:,}**"
 
 
-def format_rating_display(rating: int) -> str:
-    """Format rating display with stars."""
-    stars = "⭐" * rating
-    return f"**{rating}/5** {stars}"
+# "|" is left out so ||spoiler|| tags keep working: members hide plot details
+# with them, and a spoiler cannot carry a link or change other formatting.
+_EMBED_SPECIAL = frozenset("\\`*_~[]<>#")
+
+
+# A server's custom emoji, as it appears in message text. It carries no link
+# or formatting, so it is kept as is and renders as the emoji.
+_CUSTOM_EMOJI = re.compile(r"<a?:[A-Za-z0-9_]{2,32}:[0-9]{15,21}>")
+
+
+def _escape_segment(text: str) -> str:
+    out = []
+    for ch in text:
+        if ord(ch) < 32:
+            out.append(" ")
+        elif ch in _EMBED_SPECIAL:
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+# A custom emoji shows as one small image, so it counts as this many
+# characters towards a length limit instead of the length of its code.
+_EMOJI_WIDTH = 2
+
+
+# Some older reading_logs rows store a VNDB id as the bare number ("184")
+# rather than the canonical "v184". Readers treat both forms as the same VN
+# instead of rewriting the stored rows.
+def canonical_vndb_id(vndb_id: Optional[str]) -> Optional[str]:
+    """'184' -> 'v184'; anything else unchanged."""
+    if vndb_id and vndb_id.isdigit():
+        return f"v{vndb_id}"
+    return vndb_id
+
+
+def vndb_id_forms(vndb_id: str) -> tuple[str, str]:
+    """Both stored forms of a VN id, for `vndb_id IN (?, ?)` lookups:
+    'v184' -> ('v184', '184')."""
+    canonical = canonical_vndb_id(vndb_id) or ""
+    return canonical, canonical[1:] if canonical.startswith("v") else canonical
+
+
+def sql_canonical_vndb_id(column: str) -> str:
+    """SQL expression giving the canonical form of a vndb_id column. Only
+    ever called with a fixed column name from code, never user input."""
+    return f"(CASE WHEN {column} GLOB '[0-9]*' THEN 'v' || {column} ELSE {column} END)"
+
+
+def close_cut(cut: str) -> str:
+    """End a shortened string with an ellipsis, first dropping a spoiler the
+    cut left open: an unclosed || would show the text it was meant to hide."""
+    if cut.count("||") % 2 == 1:
+        cut = cut[:cut.rindex("||")]
+    return cut.rstrip() + "…"
+
+
+def _cut_visible(text: str, limit: int) -> str:
+    """Cut to ``limit`` visible characters, never inside a custom emoji or an
+    open spoiler."""
+    width = 0
+    pos = 0
+    for m in _CUSTOM_EMOJI.finditer(text):
+        gap = m.start() - pos
+        if width + gap > limit:
+            return close_cut(text[:pos + (limit - width)])
+        width += gap
+        if width + _EMOJI_WIDTH > limit:
+            return close_cut(text[:m.start()])
+        width += _EMOJI_WIDTH
+        pos = m.end()
+    rest = len(text) - pos
+    if width + rest > limit:
+        return close_cut(text[:pos + (limit - width)])
+    return text
+
+
+def inert_text(text: Optional[str], limit: Optional[int] = None) -> str:
+    """Flatten text this bot did not write into one literal line for an embed.
+
+    Embed descriptions and field values interpret markdown and [label](url)
+    syntax. Escaping runs in a single pass because discord.utils.escape_markdown
+    only escapes "[" inside a recognised link pattern, and escaping an already
+    escaped character would consume the escape and restore the markup. Custom
+    emoji are left whole so they render.
+
+    ``limit`` counts visible characters of the source text (a custom emoji
+    counts as _EMOJI_WIDTH), so a cut never lands inside an escape or an emoji.
+    """
+    if not text:
+        return ""
+    if limit is not None:
+        text = _cut_visible(text, limit)
+    out = []
+    pos = 0
+    for m in _CUSTOM_EMOJI.finditer(text):
+        out.append(_escape_segment(text[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_escape_segment(text[pos:]))
+    return "".join(out)
+
+
+# Inside a masked link's label Discord ignores backslash escapes, so the
+# characters that would start formatting or end the label are swapped for
+# their full-width forms, which many Japanese titles use anyway.
+_LINK_LABEL_SWAP = str.maketrans({
+    "[": "［", "]": "］", "*": "＊", "_": "＿", "~": "～",
+    "`": "｀", "|": "｜", "\\": "＼", "<": "＜", ">": "＞",
+})
+
+
+def link_label(text: Optional[str], limit: Optional[int] = None) -> str:
+    """Text this bot did not write, made safe as the label of [label](url)."""
+    if not text:
+        return ""
+    if limit is not None and len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    flat = "".join(" " if ord(ch) < 32 else ch for ch in text)
+    return flat.translate(_LINK_LABEL_SWAP)
 
 
 def create_vndb_link(vndb_id: str) -> str:
@@ -365,7 +480,9 @@ async def resolve_vn_from_input(raw_value: str) -> str | None:
 
     Handles:
     - Autocomplete value format: ${vndb|v11:jp}
-    - Autocomplete display format (user clicked back on field): "Title — YYYY-MM-DD • rating/10"
+    - Autocomplete display format (user clicked back on field):
+      "Title · YYYY-MM-DD · rating/10 [vXXXXX]", or the older
+      "Title — YYYY-MM-DD • rating/10 [vXXXXX]"
     - Raw VNDB ID: v11 or 11
 
     Returns:
@@ -396,7 +513,8 @@ async def resolve_vn_from_input(raw_value: str) -> str | None:
         return f"v{embedded.group(1)}"
 
     # Check if this looks like an autocomplete display value that Discord sent
-    # Format: "Title — YYYY-MM-DD • rating/10 [vXXXXX]"
+    # Format: "Title · YYYY-MM-DD · rating/10 [vXXXXX]" (older labels used
+    # " — " and " • " as separators).
 
     # First try to extract VN ID from [vXXXXX] pattern (most reliable)
     vn_id_match = re.search(r'\[v(\d+)\]', raw_value)
@@ -516,24 +634,57 @@ async def handle_command_error(
         error: Exception that occurred
         custom_message: Custom error message to display
     """
-    _log.error(
-        "Error in command %s",
-        interaction.command.name if interaction.command else "unknown",
-        exc_info=error,
-    )
-
+    command_name = interaction.command.name if interaction.command else "unknown"
+    # Replies are often private, so the log is where a member's report gets
+    # matched up: record who and where, never what they typed.
+    user_id = getattr(getattr(interaction, "user", None), "id", "?")
+    guild_id = getattr(interaction, "guild_id", None)
     if isinstance(error, BotError):
+        # An expected refusal (bad input, missing permission): no traceback.
+        _log.info("Command %s refused: user=%s guild=%s: %s", command_name, user_id, guild_id, error)
         message = error.user_message
     else:
-        message = custom_message or "An unexpected error occurred. Please try again later."
+        _log.error("Error in command %s: user=%s guild=%s", command_name, user_id, guild_id, exc_info=error)
+        message = custom_message or "Something went wrong. Try again in a minute."
 
+    if not message.startswith("❌"):
+        message = f"❌ {message}"
+    await send_error(interaction, message)
+
+
+async def send_error(interaction: discord.Interaction, content: str, **kwargs) -> None:
+    """Show an error to the person who ran the command and nobody else.
+
+    After a public defer, Discord shows a "thinking" placeholder and the first
+    follow-up replaces it, keeping the placeholder's visibility whatever
+    ``ephemeral`` says. The placeholder is removed first in that case so the
+    error can be sent privately. Failures are logged, never raised: an error
+    report must not turn into a second error.
+    """
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(f"❌ {message}", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"❌ {message}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(content, ephemeral=True, **kwargs)
+            return
+        await _remove_public_placeholder(interaction)
+        await interaction.followup.send(content, ephemeral=True, **kwargs)
     except Exception:
         _log.exception("Failed to send error message")
+
+
+async def _remove_public_placeholder(interaction: discord.Interaction) -> None:
+    """Delete the original response if it is still a public "thinking"
+    placeholder. A response that already holds content is left alone."""
+    if getattr(interaction.response, "type", None) != discord.InteractionResponseType.deferred_channel_message:
+        return
+    try:
+        original = await interaction.original_response()
+    except discord.HTTPException:
+        return
+    if original.flags.loading and not original.flags.ephemeral:
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            _log.debug("could not remove public placeholder", exc_info=True)
 
 
 # ==================== VALIDATION HELPERS ====================
@@ -621,7 +772,7 @@ async def validate_user_permission(interaction: discord.Interaction, custom_mess
     )
     raise ValidationError(
         f"User {interaction.user.id} lacks manager permission in guild {interaction.guild_id}",
-        custom_message or "You don't have permission to use this command in this server.",
+        custom_message or "Only server managers can use this.",
     )
 
 
@@ -659,33 +810,12 @@ async def validate_month_input(interaction: discord.Interaction, month: str = No
     return month
 
 
-async def validate_rating_input(rating: int) -> int:
-    """
-    Validate rating input.
-    
-    Args:
-        rating: Rating to validate
-        
-    Returns:
-        Validated rating
-        
-    Raises:
-        ValidationError: If rating is invalid
-    """
-    if not rating or rating < MIN_RATING or rating > MAX_RATING:
-        raise ValidationError(
-            f"Invalid rating: {rating}",
-            f"Please provide a valid rating between {MIN_RATING} and {MAX_RATING}."
-        )
-    return rating
-
-
 # ==================== EMBED UTILITIES ====================
 
 def create_base_embed(
     title: str,
     description: str = None,
-    color: discord.Color = discord.Color.blue(),
+    color: discord.Color = None,
     author_name: str = None,
     author_icon: str = None
 ) -> discord.Embed:
@@ -702,6 +832,9 @@ def create_base_embed(
     Returns:
         Configured discord.Embed
     """
+    if color is None:
+        from lib.style import ACCENT
+        color = ACCENT
     embed = discord.Embed(title=title, color=color)
     
     if description:
@@ -713,9 +846,13 @@ def create_base_embed(
     return embed
 
 
-def add_pagination_footer(embed: discord.Embed, current_page: int, max_pages: int, total_items: int) -> None:
-    """Add pagination information to embed footer."""
-    embed.set_footer(text=f"Page {current_page + 1}/{max_pages} • {total_items:,} total items")
+def add_pagination_footer(
+    embed: discord.Embed, current_page: int, max_pages: int, total_items: int,
+    noun: str = "entry", plural_form: str = "entries",
+) -> None:
+    """'Page 2/5 · 42 entries' in the house style (lib/style.py)."""
+    from lib.style import footer, plural
+    embed.set_footer(text=footer(current_page, max_pages, plural(total_items, noun, plural_form)))
 
 
 # ==================== DATABASE UTILITIES ====================
@@ -774,7 +911,8 @@ class DatabaseQueries:
         points INTEGER NOT NULL,
         comment TEXT,
         logged_in_guild INTEGER,
-        completed_at TIMESTAMP
+        completed_at TIMESTAMP,
+        rating_scale INTEGER NOT NULL DEFAULT 5
     );"""
 
     # Indexes for the reading_logs hot paths. /profile, /club_stats,
@@ -804,8 +942,8 @@ class DatabaseQueries:
     )
 
     ADD_READING_LOG = """
-    INSERT INTO reading_logs (user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild, completed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+    INSERT INTO reading_logs (user_id, vndb_id, user_rating, rating_scale, reward_reason, reward_month, points, comment, logged_in_guild, completed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
     """
 
     # Race-safe INSERT for the /finish and /manage_log paths. Pairs with
@@ -816,8 +954,8 @@ class DatabaseQueries:
     # "already logged" message instead of pretending the insert
     # happened.
     ADD_READING_LOG_OR_IGNORE = """
-    INSERT OR IGNORE INTO reading_logs (user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild, completed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+    INSERT OR IGNORE INTO reading_logs (user_id, vndb_id, user_rating, rating_scale, reward_reason, reward_month, points, comment, logged_in_guild, completed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
     """
     
     GET_USER_VN_LOG = """
@@ -836,7 +974,7 @@ class DatabaseQueries:
     """
     
     GET_LOG_BY_ID = """
-    SELECT user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild
+    SELECT user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild, rating_scale
     FROM reading_logs WHERE log_id = ?;
     """
     
@@ -845,7 +983,7 @@ class DatabaseQueries:
     """
     
     GET_USER_LOGS = """
-    SELECT log_id, user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild
+    SELECT log_id, user_id, vndb_id, user_rating, reward_reason, reward_month, points, comment, logged_in_guild, rating_scale
     FROM reading_logs WHERE user_id = ? ORDER BY reward_month DESC, log_id DESC;
     """
     
@@ -890,25 +1028,15 @@ class DatabaseQueries:
     """
 
     UPDATE_LOG_COMMENT_RATING = """
-    UPDATE reading_logs SET comment = ?, user_rating = ? WHERE log_id = ?;
+    UPDATE reading_logs SET comment = ?, user_rating = ?, rating_scale = ? WHERE log_id = ?;
     """
 
     GET_USER_RATINGS = """
     SELECT user_id, vndb_id, user_rating, comment FROM reading_logs WHERE user_id = ? AND vndb_id = ?;
     """
     
-    # Returns one row per rating *event* — a user who re-read the VN in a
-    # different reward_month appears once per read so consumers can show
-    # the rating evolution. reward_month is included so the UI can label
-    # re-reads.
-    GET_ALL_VN_RATINGS = """
-    SELECT user_id, user_rating, comment, reward_month FROM reading_logs
-    WHERE vndb_id = ? AND user_rating IS NOT NULL
-    ORDER BY user_rating DESC, user_id, reward_month DESC;
-    """
-    
     GET_USER_AVERAGE_RATING = """
-    SELECT AVG(CAST(user_rating AS REAL)) as avg_rating, COUNT(user_rating) as rating_count
+    SELECT AVG(user_rating * 100.0 / rating_scale) as avg_rating, COUNT(user_rating) as rating_count
     FROM reading_logs 
     WHERE user_id = ? AND user_rating IS NOT NULL;
     """
@@ -966,18 +1094,16 @@ class DatabaseQueries:
     LIMIT 25
     """
 
-    # Same shape as VN_AUTOCOMPLETE but filtered to a single user. The
-    # join on vc.vndb_id used to have an OR-branch matching
-    # 'v' || rl.vndb_id for legacy rows that stored the id without the
-    # 'v' prefix; the bot has been normalizing IDs to v-prefixed for
-    # long enough that we can drop the slow branch (it killed the
-    # vndb_cache PK index by making the join non-sargable). LIMIT 25
-    # mirrors Discord's choice cap.
-    USER_LOGS_AUTOCOMPLETE = """
+    # Same shape as VN_AUTOCOMPLETE but filtered to a single user. Older
+    # rows may hold the bare numeric id, so the join goes through the
+    # canonical form. The expression sits on the reading_logs side, which
+    # keeps the vndb_cache primary key usable (an OR in the join would not).
+    # LIMIT 25 mirrors Discord's choice cap.
+    USER_LOGS_AUTOCOMPLETE = f"""
     SELECT rl.log_id, rl.vndb_id, rl.reward_month, rl.reward_reason, rl.points,
            COALESCE(vc.title_ja, vc.title_en) as vn_title
     FROM reading_logs rl
-    LEFT JOIN vndb_cache vc ON vc.vndb_id = rl.vndb_id
+    LEFT JOIN vndb_cache vc ON vc.vndb_id = {sql_canonical_vndb_id("rl.vndb_id")}
     WHERE rl.user_id = ?
     ORDER BY rl.log_id DESC
     LIMIT 25;
@@ -1190,12 +1316,13 @@ class DatabaseQueries:
     LIMIT ?;
     """
 
+    # Grouped by (rating, scale); the cog buckets the normalized values.
     CLUB_STATS_RATING_DIST = """
-    SELECT user_rating, COUNT(*)
+    SELECT user_rating, rating_scale, COUNT(*)
     FROM reading_logs
     WHERE (? IS NULL OR logged_in_guild = ?)
       AND user_rating IS NOT NULL
-    GROUP BY user_rating
+    GROUP BY user_rating, rating_scale
     ORDER BY user_rating;
     """
 

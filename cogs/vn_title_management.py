@@ -8,8 +8,10 @@ from typing import Literal, Optional
 from discord.ext import commands
 from lib.bot import VNClubBot
 from lib.vndb_api import from_vndb_id, fetch_vndb_extras, VN_Entry, CREATE_VNDB_CACHE_TABLE
-from lib.pagination import BasePaginationView
+from lib.pagination import BasePaginationView, PAGE_TEXT_BUDGET
 from lib.utils import (
+    link_label,
+    send_error,
     ANIME_SEASONS,
     AUTHORIZED_USER_IDS,
     DatabaseQueries,
@@ -32,7 +34,11 @@ from lib.utils import (
     month_to_season_name,
     prev_season,
     next_season,
+    inert_text,
+    vndb_id_forms,
 )
+from lib import style
+from lib.ratings import format_rating
 from lib.theme_service import load_period_theme
 from lib.themes import rules_summary
 from lib.embeds import EmbedBuilder, build_vn_links_view
@@ -42,6 +48,7 @@ from lib.autocomplete import (
     bot_guilds_autocomplete,
 )
 from lib.jiten_client import JitenClient, resolve_display_cover
+from lib.visibility import PUBLIC_OPTION_HELP, defer_reply
 from lib.monthly_banner import (
     MonthlyBannerGenerator,
     render_banner_for_vn_entry,
@@ -98,10 +105,7 @@ class SeasonNavOverviewView(discord.ui.View):
             self._guild_id, new_season, new_year, interaction.client,
         )
         if payload is None:
-            await interaction.followup.send(
-                "❌ Couldn't render the next season — VNDB lookup failed.",
-                ephemeral=True,
-            )
+            await send_error(interaction, style.error("Couldn't load that season from VNDB. Try again in a minute."))
             return
         new_view = SeasonNavOverviewView(
             cog=self._cog,
@@ -125,7 +129,7 @@ class _PrevSeasonOverviewButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
             style=discord.ButtonStyle.secondary,
-            emoji="⬅", label="Prev season", row=4,
+            label="‹ Previous season", row=4,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -138,7 +142,7 @@ class _NextSeasonOverviewButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
             style=discord.ButtonStyle.secondary,
-            emoji="➡", label="Next season", row=4,
+            label="Next season ›", row=4,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -171,10 +175,10 @@ def _season_end_for_month(month: str) -> str:
 
 
 _SEASON_CHOICES = [
-    app_commands.Choice(name="Winter (Jan–Mar)", value="winter"),
-    app_commands.Choice(name="Spring (Apr–Jun)", value="spring"),
-    app_commands.Choice(name="Summer (Jul–Sep)", value="summer"),
-    app_commands.Choice(name="Fall (Oct–Dec)",   value="fall"),
+    app_commands.Choice(name="Winter (Jan to Mar)", value="winter"),
+    app_commands.Choice(name="Spring (Apr to Jun)", value="spring"),
+    app_commands.Choice(name="Summer (Jul to Sep)", value="summer"),
+    app_commands.Choice(name="Fall (Oct to Dec)",   value="fall"),
 ]
 
 
@@ -196,10 +200,70 @@ _PICK_KIND_EMOJI = {
     "special":  "✨",
 }
 
-# Per-page description budget for /pool. Discord caps embed descriptions
-# at 4096 chars; leave headroom for the meta line and section headers we
-# prepend at embed-build time.
-_POOL_DESC_BUDGET = 3900
+# Stored status and cycle-phase codes, as members should read them.
+_STATUS_WORDS = {
+    "monthly":   "Monthly pick",
+    "seasonal":  "Seasonal pick",
+    "special":   "Special pick",
+    "nominated": "Nomination",
+}
+_PHASE_WORDS = {
+    "nominating": "nominations open",
+    "voting":     "voting open",
+    "closed":     "voting closed",
+}
+_FILTER_WORDS = {
+    "monthly":     "Monthly picks",
+    "special":     "Special picks",
+    "nominations": "Nominations",
+}
+
+
+def _status_words(status: Optional[str]) -> str:
+    status = status or "monthly"
+    return _STATUS_WORDS.get(status, status.capitalize())
+
+
+async def _member_names(bot, user_ids) -> dict[int, str]:
+    """Display names from the client cache, then the local users table.
+
+    Ids found in neither are left out so the caller can fall back to a
+    mention. Nothing here goes to the network.
+    """
+    names: dict[int, str] = {}
+    missing: list[int] = []
+    get_user = getattr(bot, "get_user", None)
+    for uid in {u for u in user_ids if u}:
+        user = get_user(uid) if get_user else None
+        if user is not None:
+            names[uid] = user.display_name
+        else:
+            missing.append(uid)
+    if missing:
+        marks = ",".join("?" * len(missing))
+        try:
+            rows = await bot.GET(
+                f"SELECT discord_user_id, user_name FROM users "
+                f"WHERE discord_user_id IN ({marks})",
+                tuple(missing),
+            )
+        except Exception:  # noqa: BLE001
+            # The users table belongs to another cog and may not exist yet.
+            rows = []
+        for uid, name in rows or []:
+            if name:
+                names[uid] = name
+    return names
+
+
+def _member_label(names: dict[int, str], user_id: int) -> str:
+    name = names.get(user_id)
+    return inert_text(name, 40) if name else f"<@{user_id}>"
+
+# Per-page description budget for /pool: the shared page size plus room for
+# the meta line and section headers prepended at embed-build time, which come
+# out of this budget. Well under Discord's 4096-character cap.
+_POOL_DESC_BUDGET = PAGE_TEXT_BUDGET + 200
 # Defensive cap so one pathologically long row can't render past 4096 by itself.
 _POOL_ROW_HARD_CAP = 1000
 
@@ -368,10 +432,14 @@ class PoolNavigationView(discord.ui.View):
     def _sync_button_labels(self) -> None:
         """Adapt button labels to the active view mode."""
         if self.view_mode == "seasonal":
-            self.today.label = "Current season"
+            self.previous_month.label = "‹ Previous season"
+            self.today.label = "This season"
+            self.next_month.label = "Next season ›"
             self.toggle_view.label = "📅 Monthly view"
         else:
-            self.today.label = "Current month"
+            self.previous_month.label = "‹ Previous month"
+            self.today.label = "This month"
+            self.next_month.label = "Next month ›"
             self.toggle_view.label = "🌸 Seasonal view"
 
     def _sync_page_button_states(self) -> None:
@@ -426,7 +494,7 @@ class PoolNavigationView(discord.ui.View):
             embed=self._pages[self.page], view=self,
         )
 
-    @discord.ui.button(label="← Previous", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="‹ Previous month", style=discord.ButtonStyle.secondary, row=0)
     async def previous_month(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -443,7 +511,7 @@ class PoolNavigationView(discord.ui.View):
         self.page = 0
         await self._refresh(interaction)
 
-    @discord.ui.button(label="Current month", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="This month", style=discord.ButtonStyle.secondary, row=0)
     async def today(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -459,7 +527,7 @@ class PoolNavigationView(discord.ui.View):
         self.page = 0
         await self._refresh(interaction)
 
-    @discord.ui.button(label="Next →", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Next month ›", style=discord.ButtonStyle.secondary, row=0)
     async def next_month(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -476,7 +544,7 @@ class PoolNavigationView(discord.ui.View):
         self.page = 0
         await self._refresh(interaction)
 
-    @discord.ui.button(label="🌸 Seasonal view", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="🌸 Seasonal view", style=discord.ButtonStyle.secondary, row=0)
     async def toggle_view(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -491,14 +559,14 @@ class PoolNavigationView(discord.ui.View):
         self.page = 0
         await self._refresh(interaction)
 
-    @discord.ui.button(label="⏪", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="«", style=discord.ButtonStyle.secondary, row=1)
     async def first_page(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
         self.page = 0
         await self._refresh_page_only(interaction)
 
-    @discord.ui.button(label="◀️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="‹", style=discord.ButtonStyle.secondary, row=1)
     async def prev_page(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -506,7 +574,7 @@ class PoolNavigationView(discord.ui.View):
             self.page -= 1
         await self._refresh_page_only(interaction)
 
-    @discord.ui.button(label="▶️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="›", style=discord.ButtonStyle.secondary, row=1)
     async def next_page(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -514,7 +582,7 @@ class PoolNavigationView(discord.ui.View):
             self.page += 1
         await self._refresh_page_only(interaction)
 
-    @discord.ui.button(label="⏩", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="»", style=discord.ButtonStyle.secondary, row=1)
     async def last_page(
         self, interaction: discord.Interaction, _button: discord.ui.Button,
     ):
@@ -592,9 +660,13 @@ class PoolBannerPaginator(discord.ui.View):
                 child.disabled = self.index >= len(self.entries) - 1
 
     def _caption(self) -> str:
+        """Names the VN in banner mode (the text embed already carries the
+        title), plus the page when there is more than one entry."""
         entry = self._current()
-        page = f"{self.index + 1}/{len(self.entries)}"
-        return f"Pool entry **#{entry['pool_id']}** · *{page}*"
+        page = style.footer(self.index, len(self.entries))
+        if self.embed_mode:
+            return page
+        return style.SEP.join(p for p in (f"**{inert_text(entry['title'])}**", page) if p)
 
     async def _render(self, interaction: discord.Interaction) -> None:
         """Edit the message in place to reflect ``self.index``."""
@@ -623,7 +695,7 @@ class PoolBannerPaginator(discord.ui.View):
     # ---- nav buttons ----
 
     @discord.ui.button(
-        label="◀ Prev", style=discord.ButtonStyle.secondary,
+        label="‹ Previous", style=discord.ButtonStyle.secondary,
         custom_id=NAV_PREV_ID, row=0,
     )
     async def prev_btn(
@@ -634,7 +706,7 @@ class PoolBannerPaginator(discord.ui.View):
         await self._render(interaction)
 
     @discord.ui.button(
-        label="Next ▶", style=discord.ButtonStyle.secondary,
+        label="Next ›", style=discord.ButtonStyle.secondary,
         custom_id=NAV_NEXT_ID, row=0,
     )
     async def next_btn(
@@ -652,7 +724,7 @@ async def get_vn_month(interaction: discord.Interaction, month: str | None) -> s
     try:
         return await validate_month_input(interaction, month)
     except ValidationError as e:
-        await interaction.followup.send(e.user_message)
+        await interaction.followup.send(style.error(e.user_message))
         return None
 
 
@@ -680,7 +752,7 @@ def _parse_pool_id(raw: str | int | None) -> int:
     except ValueError:
         raise ValidationError(
             f"bad pool id {raw!r}",
-            f"Pool ID must be a number — got `{raw}`. Try `8` or `#8`.",
+            f"Pool ID must be a number, not `{raw}`. Try `8` or `#8`.",
         )
     if n <= 0:
         raise ValidationError(f"bad pool id {n}", "Pool ID must be a positive integer.")
@@ -734,12 +806,12 @@ async def get_vndb_info(
         _log.exception("Error fetching VNDB info for ID %s", vndb_id)
         raise ValidationError(
             f"Error fetching VNDB info: {e}",
-            "An error occurred while fetching VNDB information. Report this."
+            "Couldn't reach VNDB. Try again in a minute, or check the bot logs for details."
         )
     if not vndb_response:
         raise ValidationError(
             f"VNDB ID {vndb_id} not found",
-            "Failed to fetch VN information from VNDB. Please check the ID and try again."
+            "VNDB has no VN with that ID. Check the ID and try again."
         )
     return vndb_response
 
@@ -812,9 +884,10 @@ class VNTitleManagement(commands.Cog):
         for row in rows:
             pool_id, vndb_id, _gid, start_m, end_m, _pts, _ca, title_ja, title_en, status = row
             title = title_ja or title_en or vndb_id
-            period = start_m if start_m == end_m else f"{start_m}–{end_m}"
-            kind_tag = f" [{status or 'monthly'}]"
-            label = f"#{pool_id} · {title}{kind_tag} ({period})"
+            label = style.SEP.join((
+                f"#{pool_id}", title, _status_words(status),
+                style.month_range(start_m, end_m),
+            ))
             if len(label) > 100:
                 label = label[:99] + "…"
             if query and query not in label.lower() and query not in str(pool_id):
@@ -848,8 +921,10 @@ class VNTitleManagement(commands.Cog):
         for row in rows:
             rid, vndb_id, _gid, start_m, end_m, _pts, _ca, title_ja, title_en, status = row
             title = title_ja or title_en or vndb_id
-            period = start_m if start_m == end_m else f"{start_m}–{end_m}"
-            label = f"#{rid} · [{status or 'monthly'}] {title} ({period})"
+            label = style.SEP.join((
+                f"#{rid}", title, _status_words(status),
+                style.month_range(start_m, end_m),
+            ))
             if len(label) > 100:
                 label = label[:99] + "…"
             if query and query not in label.lower() and query not in str(rid):
@@ -866,12 +941,12 @@ class VNTitleManagement(commands.Cog):
     @app_commands.choices(action=POOL_ACTIONS, status=POOL_STATUS_CHOICES)
     @app_commands.describe(
         action="Pool action to perform.",
-        title="VN title or existing pool entry — autocomplete switches by action.",
+        title="VN to add, or the pool entry to edit or remove. Autocomplete follows the action.",
         start_month="(add/edit) Active window start. YYYY-MM.",
         end_month="(add/edit) Active window end. YYYY-MM.",
         points="(add/edit) Points awarded during the active window. Default 10 on add.",
-        status="(add/edit) Status: monthly, seasonal, special, or nominated (demote a pick back to a nomination).",
-        guild_id="(add/edit) Target guild — integer or `NULL` for global. Bot operators only for cross-guild values.",
+        status="(add/edit) Monthly, seasonal or special pick, or nominated to demote a pick.",
+        guild_id="(add/edit) Target server ID, or NULL to share the entry with every server. Bot operators only.",
     )
     @app_commands.guild_only()
     async def manage_pool(
@@ -895,7 +970,7 @@ class VNTitleManagement(commands.Cog):
                 if not title:
                     raise ValidationError(
                         "title required",
-                        "`title` is required for add — pick a VN from the autocomplete.",
+                        "Pick a VN in `title` to add.",
                     )
                 await self._pool_add(
                     interaction, title, start_month, end_month,
@@ -907,7 +982,7 @@ class VNTitleManagement(commands.Cog):
                 if not title:
                     raise ValidationError(
                         "title required",
-                        "`title` is required for edit — pick the pool entry from the autocomplete.",
+                        "Pick the pool entry to edit in `title`.",
                     )
                 await self._pool_edit(
                     interaction, title,
@@ -918,7 +993,7 @@ class VNTitleManagement(commands.Cog):
                 if not title:
                     raise ValidationError(
                         "title required",
-                        "`title` is required for remove — pick the pool entry from the autocomplete.",
+                        "Pick the pool entry to remove in `title`.",
                     )
                 await self._pool_remove(interaction, title)
         except BotError as e:
@@ -967,7 +1042,8 @@ class VNTitleManagement(commands.Cog):
         vndb_id = await resolve_vn_from_input(title)
         if not vndb_id:
             raise ValidationError(
-                "Could not determine VN from input. Please try selecting from the autocomplete dropdown."
+                f"unresolved VN input {title!r}",
+                "Couldn't tell which VN that is. Pick one from the autocomplete list.",
             )
 
         _log.info(
@@ -1022,8 +1098,8 @@ class VNTitleManagement(commands.Cog):
                 if interaction.user.id not in AUTHORIZED_USER_IDS:
                     raise ValidationError(
                         f"guild_id=NULL add by non-operator {interaction.user.id}",
-                        "Only bot operators can create global (NULL-guild) "
-                        "pool entries.",
+                        "Only bot operators can create pool entries shared "
+                        "by every server.",
                     )
                 target_guild_id = None
             else:
@@ -1032,15 +1108,16 @@ class VNTitleManagement(commands.Cog):
                 except ValueError:
                     raise ValidationError(
                         f"bad guild_id {g!r}",
-                        "`guild_id` must be an integer or the literal `NULL`.",
+                        "`guild_id` must be a server ID, or `NULL` to share "
+                        "the entry with every server.",
                     )
                 if g_int != interaction.guild.id and interaction.user.id not in AUTHORIZED_USER_IDS:
                     raise ValidationError(
                         f"cross-guild add by non-operator {interaction.user.id} "
                         f"(target={g_int}, requester_guild={interaction.guild.id})",
                         "Only bot operators can add pool entries to other "
-                        "servers. Run `/manage_pool` from inside the target "
-                        "server instead, or omit `guild_id`.",
+                        "servers. Run `/manage_pool` in that server instead, "
+                        "or leave out `guild_id`.",
                     )
                 target_guild_id = g_int
 
@@ -1057,14 +1134,16 @@ class VNTitleManagement(commands.Cog):
             rows_desc = []
             for row in existing_overlaps:
                 row_id, _vid, _gid, sm, em, st = row
-                period = sm if sm == em else f"{sm}–{em}"
-                rows_desc.append(f"#{row_id} ({st}, {period})")
+                rows_desc.append(
+                    f"#{row_id} ({_status_words(st).lower()}, {style.month_range(sm, em)})"
+                )
+            vn_name = vn_info.title_ja or vn_info.title_en or vn_info.vndb_id
             raise ValidationError(
                 f"overlap on add for {vn_info.vndb_id} in guild {target_guild_id}",
-                f"`{vn_info.vndb_id}` already has an overlapping pool entry: "
+                f"{vn_name} already has a pool entry in that period: "
                 + ", ".join(rows_desc) + ".\n"
-                "Use `/manage_pool action:edit` to modify the existing entry, "
-                "or `action:remove` first if you want to start fresh.",
+                "Edit that entry with `/manage_pool action:edit`, "
+                "or remove it first to start over.",
             )
 
         new_pool_id = await self.bot.RUN_RETURNING_ID(
@@ -1087,15 +1166,16 @@ class VNTitleManagement(commands.Cog):
 
         embed = await EmbedBuilder.create_vn_info_embed(
             vn_info, start_month, end_month, points,
-            title_prefix=f"VN Added ({status}): ", color=discord.Color.green(),
+            color=style.ACCENT,
             pool_id=new_pool_id, jiten_data=jiten_data,
         )
 
         view = build_vn_links_view(vn_info.vndb_id, jiten_deck_id)
         await interaction.followup.send(
-            content=(
-                f"-# Added as pool entry **#{new_pool_id}** — "
-                f"`/pool_entry id:{new_pool_id}` for full detail."
+            content=style.ok(
+                f"Added to the pool as **#{new_pool_id}** "
+                f"({_status_words(status).lower()}, {style.month_range(start_month, end_month)}). "
+                f"`/pool_entry id:{new_pool_id}` shows the full entry."
             ),
             embed=embed,
             view=view,
@@ -1107,16 +1187,20 @@ class VNTitleManagement(commands.Cog):
         # else, including non-numeric input.
         pool_id = _parse_pool_id(title)
 
+        # The full row carries the cached titles, so the confirmation can name
+        # the removed VN without a second query.
         row = await self.bot.GET_ONE(
-            DatabaseQueries.GET_VN_TITLE_BY_ID, (pool_id,)
+            DatabaseQueries.GET_VN_TITLE_FULL, (pool_id,)
         )
         if not row:
             raise ValidationError(
                 f"No pool entry #{pool_id}",
                 f"No pool entry with ID #{pool_id}.",
             )
-        # row: (id, vndb_id, guild_id, start_month, end_month, is_monthly_points, status)
-        _id, vndb_id, _gid, start_m, end_m, _pts, status = row
+        # Row shape matches GET_VN_TITLES_FOR_MONTH (18 columns).
+        (_id, vndb_id, _gid, start_m, end_m, _pts, _ca, title_ja, title_en,
+         status, _cycle_id, _nominator, title_cache,
+         _phase, _kind, _target_m, _target_end_m, _winner) = row
         # Block cross-guild removes: a per-server admin in guild A
         # shouldn't be able to wipe guild B's pool entry by knowing the
         # id. AUTHORIZED_USERS (bot operators) bypass this check.
@@ -1141,17 +1225,16 @@ class VNTitleManagement(commands.Cog):
         if _rowcount == 0:
             raise ValidationError(
                 f"pool entry #{pool_id} moved between read and delete",
-                f"Pool entry **#{pool_id}** changed under us (its server "
-                f"affiliation was modified by another manager or the web "
-                f"console while we were reading it). Re-run the command.",
+                f"Pool entry **#{pool_id}** was moved to another server "
+                f"while this command ran. Run it again.",
             )
         self._invalidate_season_overview_cache()
 
-        period = start_m if start_m == end_m else f"{start_m}–{end_m}"
-        kind_tag = f" [{status or 'monthly'}]"
-        await interaction.followup.send(
-            f"Pool entry **#{pool_id}**{kind_tag} (`{vndb_id}` · {period}) removed."
-        )
+        removed_title = inert_text(title_ja or title_en or title_cache or vndb_id)
+        await interaction.followup.send(style.ok(
+            f"Removed pool entry **#{pool_id}**{style.SEP}**{removed_title}** "
+            f"({_status_words(status).lower()}, {style.month_range(start_m, end_m)})."
+        ))
 
     async def _pool_edit(
         self,
@@ -1201,7 +1284,7 @@ class VNTitleManagement(commands.Cog):
         if status is not None and status not in ("monthly", "seasonal", "special", "nominated"):
             raise ValidationError(
                 f"bad status {status!r}",
-                "`status` must be one of monthly, seasonal, special, or nominated.",
+                "`status` must be monthly, seasonal, special or nominated.",
             )
 
         # Build dynamic UPDATE — only set columns the admin actually passed.
@@ -1238,11 +1321,9 @@ class VNTitleManagement(commands.Cog):
             if interaction.user.id not in AUTHORIZED_USER_IDS:
                 raise ValidationError(
                     f"guild_id edit by non-operator {interaction.user.id}",
-                    "Only bot operators can change a pool entry's server. "
-                    "Per-server managers can edit start_month / end_month "
-                    "/ points / status, but moving an entry between "
-                    "servers (or clearing it to global) requires "
-                    "bot-operator access.",
+                    "Only bot operators can move a pool entry to another "
+                    "server or share it with every server. Managers can "
+                    "change the months, points and status.",
                 )
             g = guild_id.strip()
             if g.upper() == "NULL" or g == "":
@@ -1254,7 +1335,8 @@ class VNTitleManagement(commands.Cog):
                 except ValueError:
                     raise ValidationError(
                         f"bad guild_id {g!r}",
-                        "`guild_id` must be an integer or the literal `NULL`.",
+                        "`guild_id` must be a server ID, or `NULL` to share "
+                        "the entry with every server.",
                     )
                 sets.append("guild_id = ?")
                 params.append(g_int)
@@ -1275,8 +1357,8 @@ class VNTitleManagement(commands.Cog):
         if not sets:
             raise ValidationError(
                 "no fields to update",
-                "Pass at least one field to change "
-                "(start_month, end_month, points, status, or guild_id).",
+                "Nothing to change. Set at least one of `start_month`, "
+                "`end_month`, `points`, `status` or `guild_id`.",
             )
 
         # The UPDATE filters on (id, observed guild_id) so a concurrent
@@ -1302,9 +1384,8 @@ class VNTitleManagement(commands.Cog):
         if _rowcount == 0:
             raise ValidationError(
                 f"pool entry #{pool_id} moved between read and edit",
-                f"Pool entry **#{pool_id}** changed under us (its server "
-                f"affiliation was modified by another manager or the web "
-                f"console while we were reading it). Re-run the command.",
+                f"Pool entry **#{pool_id}** was moved to another server "
+                f"while this command ran. Run it again.",
             )
         self._invalidate_season_overview_cache()
 
@@ -1323,19 +1404,21 @@ class VNTitleManagement(commands.Cog):
         )
         if not updated:
             await interaction.followup.send(
-                f"Pool entry **#{pool_id}** updated.", ephemeral=True
+                style.ok(f"Updated pool entry **#{pool_id}**."), ephemeral=True
             )
             return
-        _id, vndb_id, gid, sm, em, pts, st = updated
-        period = sm if sm == em else f"{sm}–{em}"
-        gid_str = "NULL (global)" if gid is None else str(gid)
-        msg = (
-            f"✅ Pool entry **#{pool_id}** updated:\n"
-            f"  • `{vndb_id}` · {period} · **{pts}**点 · `{st or 'monthly'}` · guild={gid_str}"
-        )
+        _id, _vndb_id, gid, sm, em, pts, st = updated
+        if gid is None:
+            scope = "every server"
+        else:
+            guild = self.bot.get_guild(gid)
+            scope = inert_text(guild.name) if guild else f"server {gid}"
+        msg = style.ok(f"Updated pool entry **#{pool_id}**.") + "\n" + style.SEP.join((
+            _status_words(st), style.month_range(sm, em), f"**{pts:,}**点", scope,
+        ))
         if auto_widened_to is not None:
             msg += (
-                f"\n  • Auto-widened `end_month` to **{auto_widened_to}** "
+                f"\nThe end month moved to {style.month_short(auto_widened_to)} "
                 "to cover the full season."
             )
         await interaction.followup.send(msg)
@@ -1350,6 +1433,7 @@ class VNTitleManagement(commands.Cog):
         year="Target year. Defaults to current year.",
         filter="Restrict to a single kind. Defaults to all.",
         all_servers="Include entries from every server the bot is in (default: this server only).",
+        public=PUBLIC_OPTION_HELP,
     )
     @app_commands.choices(filter=POOL_FILTER_CHOICES)
     @app_commands.autocomplete(month=month_int_autocomplete, year=year_autocomplete)
@@ -1361,15 +1445,16 @@ class VNTitleManagement(commands.Cog):
         year: Optional[int] = None,
         filter: Optional[app_commands.Choice[str]] = None,
         all_servers: bool = False,
+        public: Optional[bool] = None,
     ):
-        await interaction.response.defer()
+        await defer_reply(interaction, public)
 
         from datetime import datetime
         now = datetime.now()
         m = month if month is not None else now.month
         y = year if year is not None else now.year
         if not (1 <= m <= 12):
-            await interaction.followup.send("❌ `month` must be between 1 and 12.", ephemeral=True)
+            await send_error(interaction, style.error("`month` must be between 1 and 12."))
             return
 
         filter_value = filter.value if filter else "all"
@@ -1402,28 +1487,28 @@ class VNTitleManagement(commands.Cog):
         description="Show full details for a pool entry by ID.",
     )
     @app_commands.describe(
-        id="The pool entry ID. Accepts `8` or `#8`. Use autocomplete to pick from this server's entries.",
+        id="Pool entry number, like 8 or #8. Autocomplete lists this server's entries.",
+        public=PUBLIC_OPTION_HELP,
     )
     @app_commands.guild_only()
     async def pool_entry(
         self,
         interaction: discord.Interaction,
         id: str,
+        public: Optional[bool] = None,
     ):
-        await interaction.response.defer()
+        await defer_reply(interaction, public)
         try:
             pool_id = _parse_pool_id(id)
         except ValidationError as e:
-            await interaction.followup.send(f"❌ {e.user_message}", ephemeral=True)
+            await send_error(interaction, style.error(e.user_message))
             return
         row = await self.bot.GET_ONE(
             DatabaseQueries.GET_VN_TITLE_FULL,
             (pool_id,),
         )
         if not row:
-            await interaction.followup.send(
-                f"❌ No pool entry `#{pool_id}`.", ephemeral=True,
-            )
+            await send_error(interaction, style.error(f"There's no pool entry #{pool_id}."))
             return
 
         # Row shape matches GET_VN_TITLES_FOR_MONTH (18 columns).
@@ -1444,39 +1529,55 @@ class VNTitleManagement(commands.Cog):
         except Exception as e:  # noqa: BLE001
             _log.warning("jiten lookup failed for /pool_entry %s: %s", vndb_id, e)
 
-        tag = _pool_row_tag(row)[1]
         display_title = (
             (vn_info.title_ja if vn_info else None)
             or (vn_info.title_en if vn_info else None)
             or title_ja or title_en or title_cache or vndb_id
         )
-        period = start_m if start_m == end_m else f"{start_m}–{end_m}"
+        status_text = _status_words(status)
+        if status == "nominated" and phase == "voting":
+            status_text += f"{style.SEP}in voting"
 
         embed = discord.Embed(
-            title=f"#{rid} · {display_title}",
+            title=style.title(None, f"#{rid}", display_title),
             description=(
                 await vn_info.get_normalized_description(max_length=600)
                 if vn_info else "No description available."
             ),
-            color=discord.Color.blurple(),
+            color=style.ACCENT,
             url=f"https://vndb.org/{vndb_id}",
         )
-        embed.set_author(name="Visual Novel Club")
-        embed.add_field(name="Status", value=f"`[{tag}]`", inline=True)
-        embed.add_field(name="Period", value=period, inline=True)
-        embed.add_field(name="Points", value=f"{pts}点", inline=True)
+        embed.add_field(name="Status", value=status_text, inline=True)
+        embed.add_field(name="Period", value=style.month_range(start_m, end_m), inline=True)
+        embed.add_field(name="Points", value=f"{pts:,}点", inline=True)
         if cycle_id is not None:
+            vote_kind = (kind or "monthly").capitalize()
             embed.add_field(
                 name="Voting",
-                value=f"Cycle `#{cycle_id}` · Phase `{phase}` · Kind `{kind or 'monthly'}`",
+                value=f"{vote_kind} vote{style.SEP}{_PHASE_WORDS.get(phase, 'voting closed')}",
                 inline=False,
             )
+
+        # Fetched newest first; see the completions field below.
+        try:
+            log_rows = await self.bot.GET(
+                "SELECT user_id, user_rating, comment, rating_scale FROM reading_logs "
+                "WHERE vndb_id IN (?, ?) AND logged_in_guild = ? "
+                "ORDER BY log_id DESC LIMIT 5",
+                (*vndb_id_forms(vndb_id), interaction.guild.id),
+            )
+        except Exception:
+            log_rows = []
+        # A mention of a member the client hasn't cached renders as a raw id,
+        # so a known name is preferred.
+        names = await _member_names(
+            self.bot, [nominator_user_id] + [r[0] for r in log_rows],
+        )
+
         if nominator_user_id:
-            # Always-mention so rendering doesn't depend on the bot's
-            # user cache; allowed_mentions=none() prevents pings.
             embed.add_field(
                 name="Nominated by",
-                value=f"<@{nominator_user_id}>",
+                value=_member_label(names, nominator_user_id),
                 inline=True,
             )
         cover_url, cover_is_nsfw = (
@@ -1486,15 +1587,6 @@ class VNTitleManagement(commands.Cog):
             embed.set_thumbnail(url=cover_url)
 
         # Top completers (last 5) for this VN in this guild.
-        try:
-            log_rows = await self.bot.GET(
-                "SELECT user_id, user_rating, comment FROM reading_logs "
-                "WHERE vndb_id = ? AND logged_in_guild = ? "
-                "ORDER BY log_id DESC LIMIT 5",
-                (vndb_id, interaction.guild.id),
-            )
-        except Exception:
-            log_rows = []
         if log_rows:
             # Greedy pack within the 1024-char field cap. Rows arrive newest
             # first; dropped overflow is always the oldest of the fetched
@@ -1503,13 +1595,10 @@ class VNTitleManagement(commands.Cog):
             lines: list[str] = []
             cur_len = 0
             rendered = 0
-            for uid, rating, comment in log_rows:
-                u = self.bot.get_user(uid)
-                name = f"@{u.name}" if u else f"<@{uid}>"
-                snippet = (comment or "").strip().replace("\n", " ")
-                if len(snippet) > 80:
-                    snippet = snippet[:79] + "…"
-                line = f"{name} · {rating}/5{(' · ' + snippet) if snippet else ''}"
+            for uid, rating, comment, rating_scale in log_rows:
+                name = _member_label(names, uid)
+                snippet = inert_text((comment or "").strip(), 80)
+                line = f"{name} · {format_rating(rating, rating_scale)}{(' · ' + snippet) if snippet else ''}"
                 added = len(line) + (1 if lines else 0)
                 if cur_len + added > FIELD_CAP - 40:  # reserve for tail notice
                     break
@@ -1518,10 +1607,10 @@ class VNTitleManagement(commands.Cog):
                 rendered += 1
             if rendered < len(log_rows):
                 lines.append(
-                    f"_…and {len(log_rows) - rendered} older entries hidden._"
+                    f"…and {style.plural(len(log_rows) - rendered, 'older entry', 'older entries')} not shown"
                 )
             embed.add_field(
-                name=f"Recent completions ({len(log_rows)})",
+                name="Recent completions",
                 value="\n".join(lines),
                 inline=False,
             )
@@ -1553,22 +1642,24 @@ class VNTitleManagement(commands.Cog):
         return "\n".join(lines)
 
     @staticmethod
-    def _pool_footer(view_label: str, scope_label: str, filter_value: str,
-                     page: int = 1, total: int = 1) -> str:
-        """Which slice of the pool is on screen, and what to do with it.
+    def _pool_title(period_label: str, filter_value: str, all_servers: bool) -> str:
+        """The period, plus the filter and scope when they narrow or widen the
+        default view, so the footer can stay short."""
+        return style.title(
+            "📋", "Pool", period_label,
+            _FILTER_WORDS.get(filter_value, ""),
+            "All servers" if all_servers else "",
+        )
 
-        Lives in the footer rather than the description: it describes the view
-        instead of the period, and the theme banner needs the space under the
-        title. Footers render no markdown, so this is plain text.
-        """
-        parts = [view_label, scope_label, f"Filter: {filter_value}"]
-        if total > 1:
-            parts.append(f"Page {page}/{total}")
+    @staticmethod
+    def _pool_footer(count: int, page: int = 0, total: int = 1) -> str:
+        """Page, entry count and one hint. Footers render no markdown."""
         # A reader looking at the pool is the likeliest person to want to add
         # to it, and nothing else on the embed says how.
-        parts.append("/nominate to add a VN")
-        parts.append("/pool_entry id:<#> for detail")
-        return " · ".join(parts)
+        return style.footer(
+            page, total, style.plural(count, "entry", "entries"),
+            "/nominate to add a VN",
+        )
 
     async def _build_pool_pages(
         self,
@@ -1645,8 +1736,8 @@ class VNTitleManagement(commands.Cog):
         picks = [r for r in rows if r[9] != "nominated"]
         noms = [r for r in rows if r[9] == "nominated"]
 
-        scope_label = "All Servers" if all_servers else "This Server"
-        view_label = "Seasonal" if view_mode == "seasonal" else "Monthly"
+        embed_title = self._pool_title(period_label, filter_value, all_servers)
+        entry_count = len(picks) + len(noms)
 
         # Themed periods restrict what /nominate accepts, so say so here
         # rather than leaving members to discover it by being turned away.
@@ -1660,15 +1751,13 @@ class VNTitleManagement(commands.Cog):
             )
 
         if not picks and not noms:
-            empty = f"_No entries match for {empty_label}._"
+            empty = style.info(f"Nothing in the pool for {empty_label}.")
             embed = discord.Embed(
-                title=f"📚 Pool — {period_label}",
+                title=embed_title,
                 description=f"{page_header}\n\n{empty}" if page_header else empty,
-                color=discord.Color.blurple(),
+                color=style.ACCENT,
             )
-            embed.set_author(name="Visual Novel Club")
-            embed.set_footer(
-                text=self._pool_footer(view_label, scope_label, filter_value))
+            embed.set_footer(text=self._pool_footer(0))
             return [embed]
 
         # `expected_start` / `expected_end` define the view's period —
@@ -1686,25 +1775,27 @@ class VNTitleManagement(commands.Cog):
         # common cycle members watch week-to-week.
         monthly_noms = [r for r in noms if r[3] == r[4]]
         seasonal_noms = [r for r in noms if r[3] != r[4]]
+        names = await _member_names(bot, [r[11] for r in noms])
         sections: list[tuple[str, list[str]]] = []
-        for label_emoji, label_text, section_rows in (
-            ("📌", "Picks", picks),
-            ("🗳️", "Monthly Nominations", monthly_noms),
-            ("🗳️", "Seasonal Nominations", seasonal_noms),
+        for label_text, section_rows in (
+            ("Picks", picks),
+            ("Monthly nominations", monthly_noms),
+            ("Seasonal nominations", seasonal_noms),
         ):
             if not section_rows:
                 continue
             lines = self._format_pool_lines(
                 bot, section_rows, all_servers,
                 expected_start=expected_start, expected_end=expected_end,
+                names=names, view_mode=view_mode,
             )
-            sections.append((f"### {label_emoji} {label_text} ({len(section_rows)})", lines))
+            sections.append((f"### {label_text}{style.SEP}{len(section_rows)}", lines))
 
         # Greedy line-by-line packer. Each page's body string lives in
         # ``page_bodies``; the header block is prepended at embed-build time,
         # so its own length comes out of the per-page budget.
         # When a section spills past the budget, the continuation page
-        # repeats the section header with a "(cont.)" suffix so readers
+        # repeats the section header with a "continued" suffix so readers
         # arriving via page nav always have context.
         budget = _POOL_DESC_BUDGET - len(page_header)
         page_bodies: list[str] = []
@@ -1739,7 +1830,8 @@ class VNTitleManagement(commands.Cog):
                 line_cost = len(line) + 1  # always preceded by header or earlier line
                 if buf_len + line_cost > budget:
                     flush()
-                    cont = header + " (cont.)" if not header.endswith(" (cont.)") else header
+                    cont_suffix = f"{style.SEP}continued"
+                    cont = header if header.endswith(cont_suffix) else header + cont_suffix
                     buf.append(cont)
                     buf_len = len(cont)
                     line_cost = len(line) + 1
@@ -1752,13 +1844,13 @@ class VNTitleManagement(commands.Cog):
         total = len(page_bodies)
         for i, body in enumerate(page_bodies):
             embed = discord.Embed(
-                title=f"📚 Pool — {period_label}",
-                description=f"{page_header}\n\n{body}" if page_header else body,
-                color=discord.Color.blurple(),
+                title=embed_title,
+                # Section headers are markdown headings, which bring their
+                # own top margin; a blank line on top of it doubles the gap.
+                description=f"{page_header}\n{body}" if page_header else body,
+                color=style.ACCENT,
             )
-            embed.set_author(name="Visual Novel Club")
-            embed.set_footer(text=self._pool_footer(
-                view_label, scope_label, filter_value, page=i + 1, total=total))
+            embed.set_footer(text=self._pool_footer(entry_count, page=i, total=total))
             pages.append(embed)
         return pages
 
@@ -1767,6 +1859,8 @@ class VNTitleManagement(commands.Cog):
         *,
         expected_start: Optional[str] = None,
         expected_end: Optional[str] = None,
+        names: Optional[dict[int, str]] = None,
+        view_mode: str = "monthly",
     ) -> list[str]:
         """One formatted line per vn_titles row.
 
@@ -1784,29 +1878,36 @@ class VNTitleManagement(commands.Cog):
              status, cycle_id, nominator_user_id, title_cache,
              phase, kind, _target_m, _target_end_m, _winner_flag) = row
             emoji, tag = _pool_row_tag(row)
-            display_title = title_ja or title_en or title_cache or vndb_id
+            display_title = link_label(title_ja or title_en or title_cache or vndb_id)
             link = f"https://vndb.org/{vndb_id}"
-            period = start_m if start_m == end_m else f"{start_m}–{end_m}"
             server_tag = self._server_tag(bot, gid) if all_servers else ""
             # Hide the period segment when it matches the view's range.
             period_segment = (
                 "" if (start_m == expected_start and end_m == expected_end)
-                else f" · {period}"
+                else f"{style.SEP}{style.month_range(start_m, end_m)}"
             )
             if status == "nominated":
                 nominator = (
-                    f"<@{nominator_user_id}>" if nominator_user_id else "unknown"
+                    f"by {_member_label(names or {}, nominator_user_id)}"
+                    if nominator_user_id else "nominator unknown"
                 )
-                # Monthly vs seasonal is implicit in the section header
-                # the row is rendered under, so we don't repeat it here.
+                # Monthly vs seasonal is implicit in the section header, so
+                # only a live vote is called out.
+                voting = f"{style.SEP}in voting" if tag == "voting" else ""
                 line = (
-                    f"{emoji} `[{tag}]` **#{rid}** [{display_title}]({link}) "
-                    f"`{vndb_id}`{period_segment} · {nominator}{server_tag}"
+                    f"{emoji} **#{rid}** [{display_title}]({link})"
+                    f"{period_segment}{voting} · {nominator}{server_tag}"
                 )
             else:
+                # The view's own kind is implied by the period; anything else
+                # (a special pick, say) is named.
+                kind_segment = (
+                    "" if status == view_mode
+                    else f"{style.SEP}{_status_words(status).lower()}"
+                )
                 line = (
-                    f"{emoji} `[{tag}]` **#{rid}** [{display_title}]({link}) "
-                    f"`{vndb_id}`{period_segment} · **{pts}**点{server_tag}"
+                    f"{emoji} **#{rid}** [{display_title}]({link})"
+                    f"{period_segment}{kind_segment} · **{pts:,}**点{server_tag}"
                 )
             # Truncate the title if a single row would exceed the per-row cap.
             if len(line) > _POOL_ROW_HARD_CAP:
@@ -1818,20 +1919,22 @@ class VNTitleManagement(commands.Cog):
 
     @staticmethod
     def _server_tag(bot: VNClubBot, guild_id: Optional[int]) -> str:
-        """Trailing ` [Server]` annotation used in `all_servers:true` views."""
+        """Trailing source-server annotation used in `all_servers:true` views."""
         if guild_id is None:
-            return " *[Global]*"
+            return f"{style.SEP}*every server*"
         guild = bot.get_guild(guild_id)
-        return f" *[{guild.name if guild else f'Server {guild_id}'}]*"
+        name = inert_text(guild.name) if guild else f"server {guild_id}"
+        return f"{style.SEP}*{name}*"
 
     @app_commands.command(
         name="monthly",
         description="Show this server's monthly VN(s) as a banner card.",
     )
     @app_commands.describe(
-        embed="Switch to the legacy text embed instead of the banner image (off by default).",
-        cover="Banner cover: shown (default), blurred (force NSFW blur), or hidden. Ignored with embed:true.",
+        embed="Send a text embed instead of the banner image.",
+        cover="Banner cover: shown (default), blurred, or hidden. Ignored with embed:true.",
         month="YYYY-MM month to show (default: the month in progress).",
+        public=PUBLIC_OPTION_HELP,
     )
     @app_commands.autocomplete(month=month_picker_autocomplete)
     @app_commands.guild_only()
@@ -1841,10 +1944,11 @@ class VNTitleManagement(commands.Cog):
         embed: bool = False,
         cover: Literal["shown", "blurred", "hidden"] = "shown",
         month: Optional[str] = None,
+        public: Optional[bool] = None,
     ):
         await self._post_pool_kind_banners(
             interaction, kind="monthly", embed=embed, cover_mode=cover,
-            target_month=month,
+            target_month=month, public=public,
         )
 
     @app_commands.command(
@@ -1852,9 +1956,10 @@ class VNTitleManagement(commands.Cog):
         description="Show this server's seasonal VN(s) as a banner card.",
     )
     @app_commands.describe(
-        embed="Switch to the legacy text embed instead of the banner image (off by default).",
-        cover="Banner cover: shown (default), blurred (force NSFW blur), or hidden. Ignored with embed:true.",
+        embed="Send a text embed instead of the banner image.",
+        cover="Banner cover: shown (default), blurred, or hidden. Ignored with embed:true.",
         month="YYYY-MM inside the season you want (default: the season in progress).",
+        public=PUBLIC_OPTION_HELP,
     )
     @app_commands.autocomplete(month=month_picker_autocomplete)
     @app_commands.guild_only()
@@ -1864,10 +1969,11 @@ class VNTitleManagement(commands.Cog):
         embed: bool = False,
         cover: Literal["shown", "blurred", "hidden"] = "shown",
         month: Optional[str] = None,
+        public: Optional[bool] = None,
     ):
         await self._post_pool_kind_banners(
             interaction, kind="seasonal", embed=embed, cover_mode=cover,
-            target_month=month,
+            target_month=month, public=public,
         )
 
     async def _post_pool_kind_banners(
@@ -1877,6 +1983,7 @@ class VNTitleManagement(commands.Cog):
         embed: bool,
         cover_mode: str = "shown",
         target_month: Optional[str] = None,
+        public: Optional[bool] = None,
     ):
         """Shared body for /monthly and /seasonal. Pre-renders every active
         ``kind`` row into a payload, then posts a single message — paginated
@@ -1887,12 +1994,10 @@ class VNTitleManagement(commands.Cog):
         queries are overlap checks, so any month inside a season finds that
         season's row.
         """
-        await interaction.response.defer()
+        await defer_reply(interaction, public)
 
         if target_month and not validate_month_format(target_month):
-            await interaction.followup.send(
-                "❌ `month` must be in YYYY-MM format, for example `2026-09`.",
-            )
+            await send_error(interaction, style.error("`month` must be in YYYY-MM format, for example `2026-09`."))
             return
         probe_month = target_month or get_current_month()
         # "Current" is only honest when the caller didn't name a period.
@@ -1909,14 +2014,15 @@ class VNTitleManagement(commands.Cog):
             eyebrow_suffix = "VN OF THE MONTH"
             period_word = "monthly"
 
+        kind_label = f"{period_word.capitalize()} VN"
         if is_current:
-            empty_msg = f"No current {period_word} VNs found for this server."
-            embed_title_prefix = f"Current {period_word.capitalize()} VN: "
+            empty_msg = style.info(f"This server has no current {period_word} VN.")
+            embed_title_prefix = kind_label + style.SEP
         else:
             asked_label = month_label_for(probe_month)
-            empty_msg = (f"No {period_word} VNs found for this server for "
-                         f"{asked_label}.")
-            embed_title_prefix = f"{period_word.capitalize()} VN: "
+            empty_msg = style.info(
+                f"This server has no {period_word} VN for {asked_label}.")
+            embed_title_prefix = style.SEP.join((kind_label, asked_label)) + style.SEP
 
         results = await self.bot.GET(
             query, (probe_month, probe_month, interaction.guild.id),
@@ -1951,13 +2057,14 @@ class VNTitleManagement(commands.Cog):
                 payload: dict = {
                     "pool_id": _id,
                     "vndb_id": vndb_id,
+                    "title": vn_info.title_ja or vn_info.title_en or vndb_id,
                     "jiten_deck_id": jiten_deck_id,
                 }
                 if embed:
                     payload["legacy_embed"] = await EmbedBuilder.create_vn_info_embed(
                         vn_info, start_month, end_month, is_monthly_points,
                         title_prefix=embed_title_prefix,
-                        color=discord.Color.blue(),
+                        color=style.ACCENT,
                         pool_id=_id, jiten_data=jiten_data,
                     )
                 else:
@@ -1981,9 +2088,9 @@ class VNTitleManagement(commands.Cog):
                 entries.append(payload)
 
         if not entries:
-            await interaction.followup.send(
-                f"Couldn't render any {kind} VNs (VNDB lookups failed)."
-            )
+            await interaction.followup.send(style.error(
+                f"Couldn't load the {kind} VN from VNDB. Try again in a minute."
+            ))
             return
 
         # Single-entry path: keep the original simple message shape so a
@@ -2000,7 +2107,7 @@ class VNTitleManagement(commands.Cog):
                 buf.seek(0)
                 file = discord.File(buf, filename=first["filename"])
                 await interaction.followup.send(
-                    content=f"Pool entry **#{first['pool_id']}**",
+                    content=f"**{inert_text(first['title'])}**",
                     file=file, view=link_view,
                 )
             return
@@ -2032,6 +2139,7 @@ class VNTitleManagement(commands.Cog):
     @app_commands.describe(
         season="Optional: season (defaults to the current season).",
         year="Optional: year for the season (defaults to the current year).",
+        public=PUBLIC_OPTION_HELP,
     )
     @app_commands.choices(season=_SEASON_CHOICES)
     @app_commands.autocomplete(year=year_autocomplete)
@@ -2041,6 +2149,7 @@ class VNTitleManagement(commands.Cog):
         interaction: discord.Interaction,
         season: Optional[app_commands.Choice[str]] = None,
         year: Optional[int] = None,
+        public: Optional[bool] = None,
     ):
         """Composite image: seasonal banner up top + per-month monthly picks
         on a strip underneath. Multiple monthlies in the same month stack.
@@ -2049,13 +2158,10 @@ class VNTitleManagement(commands.Cog):
         seasonal pick exists for the period it goes on top; otherwise the
         command falls back to a text response (the bottom strip alone isn't
         worth posting as an image)."""
-        await interaction.response.defer()
+        await defer_reply(interaction, public)
 
         if year is not None and season is None:
-            await interaction.followup.send(
-                "❌ Pick a `season` too — `year` alone isn't a filter.",
-                ephemeral=True,
-            )
+            await send_error(interaction, style.error("Pick a `season` to go with `year`."))
             return
 
         if season is None:
@@ -2068,9 +2174,7 @@ class VNTitleManagement(commands.Cog):
             interaction.guild.id, season_value, season_year, interaction.client,
         )
         if payload is None:
-            await interaction.followup.send(
-                "❌ Couldn't fetch the seasonal VN's VNDB info."
-            )
+            await send_error(interaction, style.error("Couldn't load the seasonal VN from VNDB. Try again in a minute."))
             return
 
         view = SeasonNavOverviewView(
@@ -2124,6 +2228,7 @@ class VNTitleManagement(commands.Cog):
         s_vndb_id: Optional[str] = None
         seasonal_jiten = None
         seasonal_buf = None
+        seasonal_title: Optional[str] = None
         async with JitenClient() as jiten, MonthlyBannerGenerator() as banner_gen:
             if seasonal_rows:
                 s_id, s_vndb_id, _s_guild, s_start, s_end, s_points, _s_status, _s_ca = seasonal_rows[0]
@@ -2131,6 +2236,7 @@ class VNTitleManagement(commands.Cog):
                 seasonal_vn = await from_vndb_id(bot_for_vndb, s_vndb_id)
                 if not seasonal_vn:
                     return None
+                seasonal_title = seasonal_vn.title_ja or seasonal_vn.title_en or s_vndb_id
 
                 try:
                     seasonal_jiten = await jiten.get_by_vndb_id(s_vndb_id)
@@ -2184,12 +2290,12 @@ class VNTitleManagement(commands.Cog):
             )
 
         if seasonal_rows and s_vndb_id is not None:
-            content = f"Seasonal pool entry **#{s_id}**"
+            content = f"**{inert_text(seasonal_title)}**{style.SEP}{season_label}"
             seasonal_jiten_deck = seasonal_jiten.deck_id if seasonal_jiten else None
         else:
-            content = (
-                f"No seasonal VN set for **{season_label}** — "
-                "showing the monthly picks anyway."
+            content = style.info(
+                f"No seasonal VN is set for {season_label}. "
+                "Showing the monthly picks."
             )
             seasonal_jiten_deck = None
         # Return the rendered bytes (not a discord.File) so the cache layer

@@ -33,6 +33,7 @@ from lib.pillow_helpers import (
     INK_PRIMARY, INK_SECONDARY, INK_TERTIARY, PANEL_BG,
     load_japanese_font, paste_aa_rounded, truncate_to_width,
 )
+from lib.ratings import BUCKET_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ def render_club_stats(
     unique_vns: int,
     active_members: int,
     top_contributors: list[tuple[str, int, int]],   # (display_name, points, completions)
-    rating_distribution: list[tuple[int, int]],     # [(rating, count), ...] sorted asc
+    rating_distribution: list[tuple[int, int]],     # [(bucket 1-5, count), ...] see lib.ratings.bucket5
     monthly_trend: list[tuple[str, int]],           # [(yyyy-mm, count), ...] oldest→newest
 ) -> io.BytesIO:
     """Render the club-stats dashboard.
@@ -134,7 +135,7 @@ def render_club_stats(
         "RATING DISTRIBUTION", fill=ACCENT, font=font_panel_eyebrow,
     )
 
-    # 1..5 rows. Bars stretch right based on max count.
+    # Five bucket rows. Bars stretch right based on max count.
     rating_map = dict(rating_distribution)
     max_count = max(rating_map.values()) if rating_map else 0
     if max_count == 0:
@@ -152,10 +153,10 @@ def render_club_stats(
     for i, rating in enumerate([5, 4, 3, 2, 1]):  # high→low for visual descent
         count = rating_map.get(rating, 0)
         ry = row_top + i * row_h
-        # Star label
+        # Bucket label on the 10-point display scale
         draw.text(
             (dist_box[0] + 16 * S, ry + (row_h - 22 * S) // 2),
-            f"{rating}★", fill=INK_PRIMARY, font=font_rating_label,
+            BUCKET_LABELS[rating], fill=INK_PRIMARY, font=font_rating_label,
         )
         # Bar
         bar_w = int(bar_area_w * (count / max_count)) if count else 0

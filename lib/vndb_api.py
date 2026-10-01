@@ -131,9 +131,9 @@ class VN_Entry:
         """Fetch VN details from the database."""
         result = await bot.GET_ONE(GET_VNDB_ENTRY_QUERY, (vndb_id,))
         if result:
-            _log.info(f"Fetched VNDB entry from DB for {vndb_id}")
+            _log.debug("Fetched VNDB entry from DB for %s", vndb_id)
             return result
-        _log.info(f"VNDB entry not found in DB for {vndb_id}.")
+        _log.debug("VNDB entry not found in DB for %s", vndb_id)
         return None
 
     @classmethod

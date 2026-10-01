@@ -13,11 +13,14 @@ import discord
 import discord.app_commands as app_commands
 from discord.ext import commands
 
+from lib import style
 from lib.badges import BADGE_BY_ID, BADGE_DEFS, compute_user_badges
 from lib.badges_grid import render_badges_grid
 from lib.bot import VNClubBot
 from lib.club_stats_card import render_club_stats
-from lib.utils import DatabaseQueries
+from lib.ratings import bucket5, normalize
+from lib.utils import DatabaseQueries, send_error
+from lib.visibility import PUBLIC_OPTION_HELP, defer_reply
 
 _log = logging.getLogger(__name__)
 
@@ -32,7 +35,7 @@ def _build_full_12_month_trend(rows) -> list[tuple[str, int]]:
     """Take whatever the trend query returned (sparse, DESC) and rebuild a
     contiguous oldest→newest 12-month series ending at the current month.
     Missing months become zero entries so the chart's x-axis is always 12
-    bars wide — the dashboard's eyebrow promises "LAST 12 MONTHS"."""
+    bars wide, matching the dashboard's "LAST 12 MONTHS" eyebrow."""
     from datetime import datetime, timezone
     counts = {str(r[0]): int(r[1]) for r in rows if r and r[0]}
     # ``reward_month`` is derived from ``get_current_month()`` (UTC). Using
@@ -69,33 +72,33 @@ class VNClubStats(commands.Cog):
     # ------------------------------------------------------------------
     @app_commands.command(
         name="badges",
-        description="Show a user's earned achievements as an image grid.",
+        description="Show a user's earned badges as an image grid.",
     )
     @app_commands.describe(
         user="Optional: whose badges to show (defaults to yourself).",
+        public=PUBLIC_OPTION_HELP,
     )
     async def badges(
         self,
         interaction: discord.Interaction,
         user: Optional[discord.User] = None,
+        public: Optional[bool] = None,
     ):
         """Render the badges grid for ``user`` (or the caller).
 
-        Badges are computed live from existing logs/cycles — no backfill or
+        Badges are computed live from existing logs/cycles, so no backfill or
         unlock-event table is needed. Scope is intentionally global per
-        user: a user's achievements span every server they've logged in,
+        user: a user's badges span every server they've logged in,
         which is the same way `/profile` already works.
         """
-        await interaction.response.defer()
+        await defer_reply(interaction, public)
 
         target = user or interaction.user
         try:
             unlocked = await compute_user_badges(self.bot, target.id, scope_guild_id=None)
         except Exception as e:  # noqa: BLE001
             _log.exception("compute_user_badges failed for %s: %s", target.id, e)
-            await interaction.followup.send(
-                "❌ Couldn't load badges right now. Try again in a moment."
-            )
+            await send_error(interaction, "❌ Couldn't load badges right now. Try again in a minute.")
             return
 
         display_name = getattr(target, "display_name", None) or target.name
@@ -103,26 +106,24 @@ class VNClubStats(commands.Cog):
             buf = await asyncio.to_thread(render_badges_grid, unlocked, display_name)
         except Exception as e:  # noqa: BLE001
             _log.exception("render_badges_grid failed: %s", e)
-            await interaction.followup.send(
-                "❌ Couldn't render the badges image."
-            )
+            await send_error(interaction, "❌ Couldn't render the badges image.")
             return
 
         # Attach a short text summary alongside the image so unlocked badge
         # names are searchable in chat (the grid uses tier-label discs, not
-        # emoji glyphs — the emoji belongs to Discord text, not the canvas).
+        # emoji glyphs; the emoji belongs to Discord text, not the canvas).
         unlocked_names = [
             f"{BADGE_BY_ID[b].emoji} {BADGE_BY_ID[b].name}"
             for b in unlocked
             if b in BADGE_BY_ID
         ]
         summary_lines = [
-            f"**{display_name}** — {len(unlocked)}/{len(BADGE_DEFS)} achievements earned.",
+            f"**{display_name}**{style.SEP}{len(unlocked)}/{len(BADGE_DEFS)} badges earned",
         ]
         if unlocked_names:
-            summary_lines.append("Unlocked: " + ", ".join(unlocked_names))
+            summary_lines.append("Earned: " + ", ".join(unlocked_names))
         else:
-            summary_lines.append("No badges yet — use `/finish` to log a VN!")
+            summary_lines.append("No badges yet. Log a finished VN with `/finish` to start.")
 
         file = discord.File(buf, filename=f"badges-{target.id}.png")
         await interaction.followup.send(content="\n".join(summary_lines), file=file)
@@ -136,7 +137,8 @@ class VNClubStats(commands.Cog):
         description="Server-wide stats dashboard (or global across all servers).",
     )
     @app_commands.describe(
-        scope="`server` (default) — this server only · `global` — every server combined.",
+        scope="Which servers to count. Defaults to this server.",
+        public=PUBLIC_OPTION_HELP,
     )
     @app_commands.choices(scope=CLUB_STATS_SCOPE_CHOICES)
     @app_commands.guild_only()
@@ -144,10 +146,11 @@ class VNClubStats(commands.Cog):
         self,
         interaction: discord.Interaction,
         scope: Optional[app_commands.Choice[str]] = None,
+        public: Optional[bool] = None,
     ):
         """Dashboard image. Server scope shows the current guild only;
         global aggregates every server hikaru is in."""
-        await interaction.response.defer()
+        await defer_reply(interaction, public)
 
         scope_value = (scope.value if scope else "server").lower()
         if scope_value == "global":
@@ -155,7 +158,7 @@ class VNClubStats(commands.Cog):
             guild_filter: Optional[int] = None
         else:
             scope_label = (
-                interaction.guild.name if interaction.guild else "—"
+                interaction.guild.name if interaction.guild else "This server"
             )
             guild_filter = interaction.guild.id if interaction.guild else None
 
@@ -179,11 +182,11 @@ class VNClubStats(commands.Cog):
             )
         except Exception as e:  # noqa: BLE001
             _log.exception("club_stats query failure: %s", e)
-            await interaction.followup.send("❌ Couldn't load club stats right now.")
+            await send_error(interaction, "❌ Couldn't load club stats right now.")
             return
 
         if not totals_row:
-            await interaction.followup.send("No data yet — try logging some VNs first!")
+            await interaction.followup.send(style.info("No reading logs yet. Stats appear once VNs are logged with `/finish`."))
             return
 
         total_completions, unique_vns, active_members, total_points = totals_row
@@ -203,12 +206,18 @@ class VNClubStats(commands.Cog):
                 pass
             top_contributors.append((display, int(pts), int(completions)))
 
-        rating_distribution = [
-            (int(r[0]), int(r[1])) for r in (rating_rows or [])
-        ]
+        # Ratings on different scales share five buckets over the normalized
+        # value; bucket k holds legacy k-star ratings exactly.
+        bucket_counts: dict[int, int] = {}
+        for value, scale, count in rating_rows or []:
+            if not value or not scale:
+                continue
+            b = bucket5(normalize(int(value), int(scale)))
+            bucket_counts[b] = bucket_counts.get(b, 0) + int(count)
+        rating_distribution = sorted(bucket_counts.items())
         # Pad the trend to a full 12-month window ending at the current month
         # so the eyebrow's "LAST 12 MONTHS" matches what's drawn. Months with
-        # no logs render as a zero-height bar — the strip stays a stable
+        # no logs render as a zero-height bar, so the strip stays a stable
         # length regardless of how sparse the underlying data is.
         monthly_trend = _build_full_12_month_trend(trend_rows or [])
 
@@ -226,7 +235,7 @@ class VNClubStats(commands.Cog):
             )
         except Exception as e:  # noqa: BLE001
             _log.exception("render_club_stats failed: %s", e)
-            await interaction.followup.send("❌ Couldn't render the dashboard image.")
+            await send_error(interaction, "❌ Couldn't render the dashboard image.")
             return
 
         file = discord.File(

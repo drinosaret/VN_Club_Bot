@@ -3,6 +3,7 @@ import discord
 import asyncio
 import logging
 from discord.ext import commands, tasks
+from lib import style
 from lib.bot import VNClubBot
 
 _log = logging.getLogger(__name__)
@@ -18,12 +19,12 @@ class DatabasePoster(commands.Cog):
         try:
             self.target_channel_id = int(raw) if raw else 0
         except ValueError:
-            _log.warning("DB_BACKUP_CHANNEL=%r is not a valid integer — backups disabled", raw)
+            _log.warning("DB_BACKUP_CHANNEL=%r is not a valid integer; backups disabled", raw)
             self.target_channel_id = 0
         if self.target_channel_id:
             self.post_database.start()
         else:
-            _log.info("DB_BACKUP_CHANNEL unset/0 — database backup loop disabled")
+            _log.info("DB_BACKUP_CHANNEL unset/0; database backup loop disabled")
 
     def cog_unload(self):
         if self.target_channel_id:
@@ -49,11 +50,12 @@ class DatabasePoster(commands.Cog):
                 self.bot.path_to_db, filename="database_backup.sqlite3"
             )
 
-            # Send the file with a timestamp
+            # A Discord timestamp renders in each reader's own time zone.
+            taken = int(discord.utils.utcnow().timestamp())
             embed = discord.Embed(
-                title=f"{backup_type} Database Backup",
-                description=f"Database backup for {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                color=discord.Color.green() if backup_type == "Startup" else discord.Color.blue(),
+                title=style.title("💾", "Database backup", backup_type),
+                description=f"Taken <t:{taken}:f>",
+                color=style.ACCENT,
             )
 
             await channel.send(embed=embed, file=db_file)

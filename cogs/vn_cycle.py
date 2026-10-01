@@ -45,6 +45,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from lib import style
 from lib.bot import VNClubBot
 from lib.embeds import EmbedBuilder, build_vn_links_view
 from lib.jiten_client import JitenClient
@@ -53,6 +54,9 @@ from lib.monthly_banner import (
     month_label_for as _month_label_shared,
 )
 from lib.utils import (
+    inert_text,
+    link_label,
+    send_error,
     ANIME_SEASONS,
     DEFAULT_MONTHLY_POINTS,
     DatabaseQueries,
@@ -161,6 +165,34 @@ async def cycle_period_label_with_season(bot, cycle_row) -> str:
     return await format_season_label_from_yyyy_mm(bot, target_month)
 
 
+# Phase codes stored on vn_cycles, as a manager should read them.
+_PHASE_WORDS = {
+    "voting": "voting open",
+    "closed": "closed",
+    "nominating": "nominations open",
+    "closed_nominating": "nominations closed",
+}
+
+
+def _phase_words(phase) -> str:
+    return _PHASE_WORDS.get(phase, "in an unknown state")
+
+
+def _kind_label(kind) -> str:
+    return "Seasonal" if kind == "seasonal" else "Monthly"
+
+
+def _mode_text(choice_mode, winner_count) -> str:
+    """How many picks a voter gets, e.g. 'One vote per member'."""
+    if choice_mode == "multi":
+        return f"Up to {style.plural(winner_count or 1, 'vote')} per member"
+    return "One vote per member"
+
+
+# Shown in place of a name the bot can no longer resolve.
+_UNKNOWN_MEMBER = "unknown member"
+
+
 # Ballot entries checked against the period theme when voting opens. Each one
 # costs a metadata fetch plus a round trip per themed tag, and VNDB meters per
 # IP across the whole container, so the ceiling here is what keeps an audit
@@ -231,7 +263,6 @@ class VoteSelect(discord.ui.Select):
             discord.SelectOption(
                 label=_truncate_label(n[NOM_TITLE], 100),
                 value=str(n[NOM_ID]),
-                description=n[NOM_VNDB_ID],
             )
             for n in nominees[:25]
         ]
@@ -291,12 +322,12 @@ class _ParticipantsNomineeSelect(discord.ui.Select):
         options = [
             discord.SelectOption(
                 label=_truncate_label(
-                    f"{_VOTE_LETTERS[i] if i < len(_VOTE_LETTERS) else '?'} - "
-                    f"{n[NOM_TITLE]}",
+                    f"{_VOTE_LETTERS[i] if i < len(_VOTE_LETTERS) else '?'}"
+                    f"{style.SEP}{n[NOM_TITLE]}",
                     100,
                 ),
                 value=str(n[NOM_ID]),
-                description=f"{votes_by_nom.get(n[NOM_ID], 0)} voter(s)",
+                description=style.plural(votes_by_nom.get(n[NOM_ID], 0), "voter"),
                 default=(i == 0),
             )
             for i, n in enumerate(nominees[:25])
@@ -321,7 +352,7 @@ class _ParticipantsPrevButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
             style=discord.ButtonStyle.secondary,
-            label="◀ Prev",
+            label="‹ Previous",
             row=1,
         )
 
@@ -334,7 +365,7 @@ class _ParticipantsNextButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
             style=discord.ButtonStyle.secondary,
-            label="Next ▶",
+            label="Next ›",
             row=1,
         )
 
@@ -418,7 +449,7 @@ class ParticipantsView(discord.ui.View):
 
         letter = self._selected_letter()
         title_display = _truncate_label(nominee[NOM_TITLE], 200)
-        header = f"**{len(voters)} voter(s)** · Vote ID `{self.cycle_id}`"
+        header = f"Choice **{letter}**{style.SEP}{style.plural(len(voters), 'voter')}"
 
         if not voters:
             body = "_No voters yet._"
@@ -446,30 +477,28 @@ class ParticipantsView(discord.ui.View):
                 tag_map = {r[0]: (r[1] or r[2]) for r in rows if r[1] or r[2]}
             lines = []
             for user_id, created_at in page_slice:
+                # A mention renders as @unknown-user in clients that have not
+                # loaded the member, so the handle is always shown as text,
+                # with the mention kept alongside when the user is cached.
                 user = self.bot.get_user(user_id)
                 if user is not None:
-                    tag = user.name
+                    name = f"@{inert_text(user.name, 40)} (<@{user_id}>)"
+                elif tag_map.get(user_id):
+                    name = f"@{inert_text(tag_map[user_id], 40)}"
                 else:
-                    tag = tag_map.get(user_id) or "unknown-user"
+                    name = _UNKNOWN_MEMBER
                 ts = _format_closes_at_relative(created_at)
-                line = f"• @{tag} (<@{user_id}>)"
-                if ts:
-                    line += f" · {ts}"
-                lines.append(line)
+                lines.append(f"• {name}{style.SEP}{ts}" if ts else f"• {name}")
             body = "\n".join(lines)
 
         embed = discord.Embed(
-            title=f"👥 Participants · {letter} {title_display}",
+            title=style.title("👥", "Participants", title_display),
             description=f"{header}\n\n{body}",
-            color=discord.Color.blurple(),
+            color=style.ACCENT,
         )
-        if max_page > 0:
-            embed.set_footer(
-                text=f"Page {self.voter_page + 1}/{max_page + 1} · "
-                     "use the dropdown below to switch nominee",
-            )
-        else:
-            embed.set_footer(text="Use the dropdown above to switch nominee")
+        embed.set_footer(text=style.footer(
+            self.voter_page, max_page + 1, "Pick a nominee from the menu below",
+        ))
         return embed
 
     async def _on_nominee_change(self, interaction, new_nom_id: int):
@@ -561,7 +590,7 @@ def _truncate_label(text: str, limit: int) -> str:
 
 def _votes_phrase(n: int) -> str:
     """Singular/plural-aware vote count, e.g. '1 vote' / '5 votes'."""
-    return "1 vote" if n == 1 else f"{n} votes"
+    return style.plural(n, "vote")
 
 
 async def _persist_resolved_users(bot, user_ids) -> None:
@@ -642,15 +671,16 @@ def _build_close_voting_summary(
         no one actually voted. Same outcome (nothing promoted) but
         worth distinguishing in the message.
     """
+    kind_label = _kind_label(cycle_kind)
     if not winners:
         if tally:
-            return (
-                f"✅ {cycle_kind.capitalize()} voting closed for "
-                f"**{period_label}** (no votes cast, nothing to promote)."
+            return style.ok(
+                f"{kind_label} voting closed for **{period_label}**: "
+                "no votes cast, nothing to promote."
             )
-        return (
-            f"✅ {cycle_kind.capitalize()} voting closed for **{period_label}** "
-            "(no nominees, nothing to promote)."
+        return style.ok(
+            f"{kind_label} voting closed for **{period_label}**: "
+            "no nominees, nothing to promote."
         )
 
     # A winner's seat was contested if the next tally row has the same
@@ -669,22 +699,20 @@ def _build_close_voting_summary(
         if w[1] in promoted_pool_ids:
             pid = promoted_pool_ids[w[1]]
             if tied:
-                return (
-                    f"⚖️ {cycle_kind.capitalize()} voting closed for "
-                    f"**{period_label}**. Tied at {votes_str}; "
-                    f"**{w[2]}** wins as the earliest nomination "
-                    f"(pool **#{pid}**)."
+                return style.ok(
+                    f"{kind_label} voting closed for **{period_label}**. "
+                    f"Tied at {votes_str}; **{w[2]}** wins as the earliest "
+                    f"nomination (pool entry **#{pid}**)."
                 )
-            return (
-                f"✅ **{w[2]}** wins the {cycle_kind} vote for "
-                f"**{period_label}** ({votes_str}, pool **#{pid}**)."
+            return style.ok(
+                f"**{w[2]}** wins the {cycle_kind} vote for "
+                f"**{period_label}** ({votes_str}, pool entry **#{pid}**)."
             )
-        return (
-            f"⚠️ **{w[2]}** ({votes_str}) won the {cycle_kind} vote for "
+        return style.info(
+            f"**{w[2]}** ({votes_str}) won the {cycle_kind} vote for "
             f"**{period_label}**, but its pool entry was removed before "
-            f"voting closed — its status couldn't be set to {cycle_kind}. "
-            "Re-add it via `/manage_pool action:Add` if you still want it "
-            f"as the {cycle_kind} pick."
+            f"voting closed, so it couldn't be made the {cycle_kind} pick. "
+            "Re-add it with `/manage_pool action:Add` if it should still count."
         )
     parts = []
     for w in winners:
@@ -692,15 +720,15 @@ def _build_close_voting_summary(
         tie_note = ", earliest of a tie" if w[0] in tied_winners else ""
         if w[1] in promoted_pool_ids:
             parts.append(
-                f"**{w[2]}** ({votes_str}, pool "
+                f"**{w[2]}** ({votes_str}, pool entry "
                 f"**#{promoted_pool_ids[w[1]]}**{tie_note})"
             )
         else:
             parts.append(
-                f"**{w[2]}** ({votes_str}, pool entry removed mid-vote)"
+                f"**{w[2]}** ({votes_str}, pool entry removed during the vote)"
             )
-    return (
-        f"✅ Winners of the {cycle_kind} vote for **{period_label}**: "
+    return style.ok(
+        f"Winners of the {cycle_kind} vote for **{period_label}**: "
         + ", ".join(parts)
     )
 
@@ -773,7 +801,7 @@ class ClosedVoteView(discord.ui.View):
 async def _send_handler_error(interaction: discord.Interaction) -> None:
     """Ephemeral 'something went wrong, logged' fallback that tolerates
     either response state (already-deferred vs. fresh)."""
-    msg = "❌ Something went wrong. This has been logged."
+    msg = style.error("Something went wrong. Try again in a minute.")
     try:
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
@@ -842,7 +870,7 @@ async def _handle_vote(interaction: discord.Interaction, cycle_id: int, nominati
     cycle = await _cycle_by_id(bot, cycle_id)
     if not cycle or cycle[CYCLE_PHASE] != "voting":
         await interaction.response.send_message(
-            "❌ That voting is not open right now.", ephemeral=True
+            style.error("This vote isn't open right now."), ephemeral=True
         )
         return
 
@@ -855,13 +883,13 @@ async def _handle_vote(interaction: discord.Interaction, cycle_id: int, nominati
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         if member is None:
             await interaction.response.send_message(
-                "❌ This voting can only be cast from inside the guild.",
+                style.error("Votes can only be cast from inside the server."),
                 ephemeral=True,
             )
             return
         if not any(r.id == allowed_role_id for r in member.roles):
             await interaction.response.send_message(
-                f"❌ You need the <@&{allowed_role_id}> role to vote in this voting.",
+                style.error(f"You need the <@&{allowed_role_id}> role to vote."),
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -870,7 +898,8 @@ async def _handle_vote(interaction: discord.Interaction, cycle_id: int, nominati
     nomination = await bot.GET_ONE(DatabaseQueries.GET_NOMINATION_BY_ID, (nomination_id,))
     if not nomination:
         await interaction.response.send_message(
-            "❌ Couldn't find that nominee — it may have been removed.", ephemeral=True
+            style.error("Couldn't find that nominee. It may have been removed."),
+            ephemeral=True,
         )
         return
     # Reject votes whose nomination_id belongs to a different cycle. In normal
@@ -883,7 +912,7 @@ async def _handle_vote(interaction: discord.Interaction, cycle_id: int, nominati
             nomination_id, nomination[NOM_CYCLE_ID], cycle_id,
         )
         await interaction.response.send_message(
-            "❌ That nominee isn't part of this voting.", ephemeral=True
+            style.error("That nominee isn't part of this vote."), ephemeral=True
         )
         return
     nominee_title = nomination[NOM_TITLE]
@@ -915,12 +944,14 @@ async def _handle_vote(interaction: discord.Interaction, cycle_id: int, nominati
             already_picked = any(row[1] == nomination_id for row in existing)
             if already_picked:
                 await interaction.response.send_message(
-                    f"You've already voted for **{nominee_title}**.", ephemeral=True
+                    style.info(f"You've already voted for **{nominee_title}**."),
+                    ephemeral=True,
                 )
                 return
             if not await _phase_still_voting():
                 await interaction.response.send_message(
-                    "❌ Voting just closed — your vote wasn't recorded.", ephemeral=True
+                    style.error("Voting just closed, so your vote wasn't recorded."),
+                    ephemeral=True,
                 )
                 return
             # Single transaction so a failed INSERT doesn't leave the user
@@ -936,9 +967,9 @@ async def _handle_vote(interaction: discord.Interaction, cycle_id: int, nominati
                 action, cycle_id, user_id, nomination_id,
             )
             msg = (
-                f"✅ Replaced your earlier vote with **{nominee_title}**."
+                style.ok(f"Replaced your earlier vote with **{nominee_title}**.")
                 if existing
-                else f"✅ Voted for **{nominee_title}**."
+                else style.ok(f"Voted for **{nominee_title}**.")
             )
             await interaction.response.send_message(msg, ephemeral=True)
             await _refresh_vote_message(bot, cycle_id)
@@ -956,21 +987,25 @@ async def _handle_vote(interaction: discord.Interaction, cycle_id: int, nominati
                 cycle_id, user_id, nomination_id,
             )
             await interaction.response.send_message(
-                f"➖ Removed your vote for **{nominee_title}**.", ephemeral=True
+                style.ok(f"Removed your vote for **{nominee_title}**."),
+                ephemeral=True,
             )
             await _refresh_vote_message(bot, cycle_id)
             return
 
         if len(existing) >= winner_count:
             await interaction.response.send_message(
-                f"❌ You can pick at most {winner_count} nominees in this voting.",
+                style.error(
+                    f"You can pick at most {style.plural(winner_count, 'nominee')}."
+                ),
                 ephemeral=True,
             )
             return
 
         if not await _phase_still_voting():
             await interaction.response.send_message(
-                "❌ Voting just closed — your vote wasn't recorded.", ephemeral=True
+                style.error("Voting just closed, so your vote wasn't recorded."),
+                ephemeral=True,
             )
             return
         await bot.RUN(DatabaseQueries.INSERT_VOTE, (cycle_id, user_id, guild_id, nomination_id))
@@ -980,7 +1015,9 @@ async def _handle_vote(interaction: discord.Interaction, cycle_id: int, nominati
             cycle_id, user_id, nomination_id, len(existing) + 1, winner_count,
         )
         await interaction.response.send_message(
-            f"✅ Voted for **{nominee_title}** ({len(existing) + 1}/{winner_count}).",
+            style.ok(
+                f"Voted for **{nominee_title}** ({len(existing) + 1}/{winner_count})."
+            ),
             ephemeral=True,
         )
         await _refresh_vote_message(bot, cycle_id)
@@ -1026,7 +1063,9 @@ def _seconds_until(closes_at) -> Optional[float]:
     return (dt - now).total_seconds()
 
 
-async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
+async def _render_vote_prompt(
+    bot, cycle_row, nominees, tally, *, personal: bool = False,
+) -> discord.Embed:
     """Build the live vote embed with two sections: Choices (alphabetical
     A-Z list of nominees with their nominator) and Standings (ranked by
     votes DESC, ties share rank, zero-vote entries collapsed into a
@@ -1042,10 +1081,13 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
 
     Async because seasonal cycles get a "· Season N" suffix on their
     period label that needs a reading_logs lookup.
+
+    ``personal`` marks the private copy sent by /vote, whose footer should
+    not point back at /vote.
     """
     period_label = await cycle_period_label_with_season(bot, cycle_row)
     kind = cycle_row[CYCLE_KIND] or "monthly"
-    title_lead = "VN of the Season Vote" if kind == "seasonal" else "VN of the Month Vote"
+    title_lead = f"{_kind_label(kind)} vote"
     choice_mode = cycle_row[CYCLE_CHOICE_MODE] or "single"
     winner_count = cycle_row[CYCLE_WINNER_COUNT] or 1
     closes_at = cycle_row[CYCLE_CLOSES_AT]
@@ -1056,16 +1098,17 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
     total_votes = sum(votes_by_nom.values())
     total_nominees = min(len(nominees), 25)
 
-    meta_lines = [
-        f"Mode: `{choice_mode}` · Winners: `{winner_count}` · "
-        f"Vote ID: `{cycle_row[CYCLE_ID]}`",
+    meta_bits = [
+        _mode_text(choice_mode, winner_count),
+        style.plural(winner_count, "winner"),
     ]
     rel = _format_closes_at_relative(closes_at)
     if rel:
-        meta_lines.append(f"⏱ Closes {rel}")
+        meta_bits.append(f"closes {rel}")
+    meta_lines = [style.SEP.join(meta_bits)]
     allowed_role_id = cycle_row[CYCLE_ALLOWED_ROLE_ID]
     if allowed_role_id:
-        meta_lines.append(f"🔒 Allowed role: <@&{allowed_role_id}>")
+        meta_lines.append(f"Only <@&{allowed_role_id}> can vote.")
 
     # Persist every visible nominator's name so the cache stays warm for
     # future renders even if a nominator later leaves the guild.
@@ -1087,20 +1130,20 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
         nom_tag_map = {r[0]: (r[1] or r[2]) for r in rows if r[1] or r[2]}
 
     # ---- Choices section: alphabetical, title link + nominator ----
-    choices_lines = ["📋 **Choices**"]
+    choices_lines = ["**Choices**"]
     for idx, n in enumerate(nominees[:total_nominees]):
         letter = _VOTE_LETTERS[idx]
         title = _truncate_label(n[NOM_TITLE], 60)
-        # Escape `[` `]` in titles so the markdown link parser doesn't
-        # choke on unusual VN names.
-        safe_title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+        safe_title = link_label(title)
         title_link = f"[{safe_title}](https://vndb.org/{n[NOM_VNDB_ID]})"
         nom_user = bot.get_user(n[NOM_USER_ID])
         if nom_user is not None:
-            nom_tag = nom_user.name
+            nominator = f"@{inert_text(nom_user.name, 40)}"
+        elif nom_tag_map.get(n[NOM_USER_ID]):
+            nominator = f"@{inert_text(nom_tag_map[n[NOM_USER_ID]], 40)}"
         else:
-            nom_tag = nom_tag_map.get(n[NOM_USER_ID]) or "unknown-user"
-        choices_lines.append(f"`{letter}` · {title_link} · @{nom_tag}")
+            nominator = _UNKNOWN_MEMBER
+        choices_lines.append(f"`{letter}`{style.SEP}{title_link}{style.SEP}{nominator}")
 
     # ---- Standings section: ranked DESC, ties share rank ----
     # Secondary sort by nomination id ASC mirrors TALLY_VOTES' tie-break,
@@ -1109,7 +1152,7 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
         enumerate(nominees[:total_nominees]),
         key=lambda iv: (-votes_by_nom.get(iv[1][NOM_ID], 0), iv[1][NOM_ID]),
     )
-    standings_header = f"📊 **Standings** · {_votes_phrase(total_votes)}"
+    standings_header = f"**Standings**{style.SEP}{_votes_phrase(total_votes)}"
     standings_body: list[str] = []
     zero_vote_letters: list[str] = []
     prev_votes: Optional[int] = None
@@ -1129,16 +1172,15 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
         pct = (votes / total_votes * 100.0) if total_votes else 0.0
         title_short = _truncate_label(n[NOM_TITLE], 40)
         standings_body.append(
-            f"`{rank:>2}.` `{letter}` · {title_short} · **{pct:.1f}%** ({votes})"
+            f"`{rank:>2}.` `{letter}`{style.SEP}{title_short}{style.SEP}"
+            f"**{pct:.1f}%** ({votes:,})"
         )
     if not standings_body and not zero_vote_letters:
         zero_tail: Optional[str] = "_No votes yet._"
     elif zero_vote_letters:
-        zero_tail = f"_No votes: {', '.join(zero_vote_letters)}_"
+        zero_tail = f"_No votes yet: {', '.join(zero_vote_letters)}_"
     else:
         zero_tail = None
-
-    footer_text = "Tap a button below or use `/vote` for a personal voting menu."
 
     # Per-section sizing: Choices is never truncated (knowing who nominated
     # each title is the whole point of that section). Standings shrinks
@@ -1152,9 +1194,7 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
             standings.append(tail)
         if note is not None:
             standings.append(note)
-        return "\n".join(
-            meta_lines + [""] + choices_lines + [""] + standings + ["", footer_text]
-        )
+        return "\n".join(meta_lines + [""] + choices_lines + [""] + standings)
 
     fit_body = list(standings_body)
     fit_tail = zero_tail
@@ -1167,7 +1207,7 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
             dropped = len(standings_body) - len(fit_body)
             overflow_note = f"_…{dropped} more in standings._"
         else:
-            # Choices + meta + footer alone exceed the budget. Only
+            # Choices + meta alone exceed the budget. Only
             # reachable at the 25-nom cap with pathologically long
             # titles and nominator names. Fall through to the byte-cut.
             break
@@ -1180,10 +1220,13 @@ async def _render_vote_prompt(bot, cycle_row, nominees, tally) -> discord.Embed:
         )
         description = description[:_VOTE_DESC_BUDGET].rstrip() + "\n_…truncated._"
     embed = discord.Embed(
-        title=f"🗳️ {title_lead} - {period_label}",
+        title=style.title("🗳️", title_lead, period_label),
         description=description,
-        color=discord.Color.blurple(),
+        color=style.ACCENT,
     )
+    embed.set_footer(text=style.footer(
+        0, 1, "Vote below" if personal else "Vote below, or use /vote for a private menu",
+    ))
     return embed
 
 
@@ -1245,9 +1288,7 @@ async def _handle_participants(interaction: discord.Interaction, cycle_id: int):
     bot: VNClubBot = interaction.client  # type: ignore
     cycle = await _cycle_by_id(bot, cycle_id)
     if not cycle:
-        await interaction.followup.send(
-            "❌ This voting no longer exists.", ephemeral=True,
-        )
+        await send_error(interaction, style.error("This vote no longer exists."))
         return
     # All-status fetch so a closed vote's panel still includes the promoted
     # winner (its row is no longer status='nominated'). Identical to
@@ -1255,8 +1296,7 @@ async def _handle_participants(interaction: discord.Interaction, cycle_id: int):
     nominees = await bot.GET(DatabaseQueries.GET_CYCLE_NOMINEES_ALL, (cycle_id,))
     if not nominees:
         await interaction.followup.send(
-            f"👥 **Participants — Vote ID `{cycle_id}`**\n\n"
-            "_No nominees in this voting._",
+            style.info("This vote has no nominees."),
             ephemeral=True,
         )
         return
@@ -1281,7 +1321,7 @@ async def _handle_manage_votes(interaction: discord.Interaction, cycle_id: int):
     cycle = await _cycle_by_id(bot, cycle_id)
     if not cycle or cycle[CYCLE_PHASE] != "voting":
         await interaction.response.send_message(
-            "❌ This voting is no longer open.", ephemeral=True
+            style.error("This vote is no longer open."), ephemeral=True
         )
         return
     user_id = interaction.user.id
@@ -1290,7 +1330,7 @@ async def _handle_manage_votes(interaction: discord.Interaction, cycle_id: int):
     )
     if not existing:
         await interaction.response.send_message(
-            "You haven't voted in this cycle yet.", ephemeral=True
+            style.info("You haven't voted yet."), ephemeral=True
         )
         return
 
@@ -1314,12 +1354,12 @@ async def _handle_manage_votes(interaction: discord.Interaction, cycle_id: int):
             nominee_label=_truncate_label(label, 70),
         ))
 
-    lines = ["**Your current votes for this cycle:**"]
+    lines = ["🗳️ **Your votes**"]
     for vote_row in existing:
         nomination_id = vote_row[1]
         lines.append(f"- {label_by_nom.get(nomination_id, f'#{nomination_id}')}")
     lines.append("")
-    lines.append("Click a button below to remove a vote.")
+    lines.append("Use a button below to remove one.")
     await interaction.response.send_message(
         "\n".join(lines), view=view, ephemeral=True,
     )
@@ -1338,7 +1378,8 @@ async def _handle_remove_vote(interaction: discord.Interaction,
     cycle = await _cycle_by_id(bot, cycle_id)
     if not cycle or cycle[CYCLE_PHASE] != "voting":
         await interaction.response.send_message(
-            "❌ Voting is no longer open — can't remove votes.", ephemeral=True
+            style.error("Voting has closed, so votes can't be removed."),
+            ephemeral=True,
         )
         return
     # Defensive: ensure the vote actually belongs to the clicker. A clever
@@ -1349,7 +1390,7 @@ async def _handle_remove_vote(interaction: discord.Interaction,
     )
     if not any(row[0] == vote_id for row in existing):
         await interaction.response.send_message(
-            "❌ That vote doesn't belong to you.", ephemeral=True
+            style.error("That vote doesn't belong to you."), ephemeral=True
         )
         return
     await bot.RUN(DatabaseQueries.DELETE_VOTE_BY_ID, (vote_id,))
@@ -1358,7 +1399,7 @@ async def _handle_remove_vote(interaction: discord.Interaction,
         cycle_id, user_id, vote_id,
     )
     await interaction.response.send_message(
-        "🗑 Vote removed.", ephemeral=True,
+        style.ok("Vote removed."), ephemeral=True,
     )
     await _refresh_vote_message(bot, cycle_id)
 
@@ -1456,55 +1497,59 @@ async def _fetch_panel_state(bot, guild_id: int) -> dict:
 
 async def _build_panel_text(bot, state: dict) -> str:
     """Render the main panel's status block from a state dict."""
+    sep = style.SEP
     lines = ["🛠️ **Voting dashboard**", ""]
-    for kind, kind_label in (("monthly", "Monthly"), ("seasonal", "Seasonal")):
+    for kind in ("monthly", "seasonal"):
+        kind_label = _kind_label(kind)
         cycle = state[kind]
         if cycle is None:
-            lines.append(f"• **{kind_label}** — no active cycle.")
+            lines.append(f"• **{kind_label}**{sep}no vote running")
             continue
         if cycle[CYCLE_PHASE] != "voting":
             lines.append(
-                f"• **{kind_label}** — phase `{cycle[CYCLE_PHASE]}` "
-                f"(cycle `{cycle[CYCLE_ID]}`)."
+                f"• **{kind_label}**{sep}{_phase_words(cycle[CYCLE_PHASE])}"
             )
             continue
         period_label = await cycle_period_label_with_season(bot, cycle)
         nominees = await bot.GET(
             DatabaseQueries.GET_CYCLE_NOMINEES, (cycle[CYCLE_ID],),
         )
-        n_count = len(nominees)
+        bits = [
+            f"voting open for **{period_label}**",
+            style.plural(len(nominees), "nominee"),
+        ]
         if cycle[CYCLE_MESSAGE_ID] is None:
-            lines.append(
-                f"• **{kind_label}** — voting open for **{period_label}** · "
-                f"{n_count} nominee(s) · vote message **not posted yet**"
-            )
+            bits.append("vote message **not posted yet**")
         else:
+            bits.append("vote message posted")
             close_str = _format_closes_at_relative(cycle[CYCLE_CLOSES_AT])
-            close_part = f" · closes {close_str}" if close_str else ""
-            lines.append(
-                f"• **{kind_label}** — voting open for **{period_label}** · "
-                f"{n_count} nominee(s) · message posted{close_part}"
-            )
+            if close_str:
+                bits.append(f"closes {close_str}")
+        # The ID is what Reopen voting asks for once this vote has closed.
+        bits.append(f"vote ID {cycle[CYCLE_ID]}")
+        lines.append(f"• **{kind_label}**{sep}" + sep.join(bits))
 
     role_id = state["default_voting_role_id"]
-    role_part = f"<@&{role_id}>" if role_id else "_not set_"
+    role_part = f"<@&{role_id}>" if role_id else "not set"
     ui_part = state["default_vote_ui"] or "dropdown"
     lines.append("")
-    lines.append(f"**Defaults** — voting role: {role_part} · vote UI: `{ui_part}`")
+    lines.append(
+        f"**Defaults**{sep}voting role: {role_part}{sep}vote menu: {ui_part}"
+    )
     return "\n".join(lines)
 
 
 async def _build_settings_text(state: dict) -> str:
     role_id = state["default_voting_role_id"]
-    role_part = f"<@&{role_id}>" if role_id else "_not set_"
+    role_part = f"<@&{role_id}>" if role_id else "not set"
     ui_part = state["default_vote_ui"] or "dropdown"
     return (
-        "⚙️ **Voting settings**\n\n"
-        f"**Default voting role**: {role_part}\n"
-        "_Open voting falls back to this role when set._\n\n"
-        f"**Default vote UI**: `{ui_part}`\n"
-        "_Used as the default when Open voting fires from the dashboard._\n\n"
-        "Use the controls below or click **Back** to return to the dashboard."
+        "🛠️ **Voting settings**\n\n"
+        f"**Default voting role:** {role_part}\n"
+        "_When set, only this role can nominate and vote in new votes._\n\n"
+        f"**Default vote menu:** {ui_part}\n"
+        "_New votes use this menu style._\n\n"
+        "Change them below, or press **Back** to return to the dashboard."
     )
 
 
@@ -1601,13 +1646,10 @@ class _PostMessageButton(discord.ui.Button):
         try:
             await self.panel.cog._post_vote_message(interaction, kind=self.kind)
         except ValidationError as e:
-            await interaction.followup.send(f"❌ {e.user_message}", ephemeral=True)
+            await send_error(interaction, style.error(e.user_message))
         except Exception:  # noqa: BLE001
             _log.exception("panel post_vote_message failed")
-            await interaction.followup.send(
-                "❌ Could not post vote message. Check the bot logs for details.",
-                ephemeral=True,
-            )
+            await send_error(interaction, style.error("Couldn't post the vote message. Check the bot logs for details."))
         await self.panel.refresh(interaction)
 
 
@@ -1626,13 +1668,10 @@ class _CloseVotingButton(discord.ui.Button):
         try:
             await self.panel.cog._close_voting(interaction, kind=self.kind)
         except ValidationError as e:
-            await interaction.followup.send(f"❌ {e.user_message}", ephemeral=True)
+            await send_error(interaction, style.error(e.user_message))
         except Exception:  # noqa: BLE001
             _log.exception("panel close_voting failed")
-            await interaction.followup.send(
-                "❌ Close failed. Check the bot logs for details.",
-                ephemeral=True,
-            )
+            await send_error(interaction, style.error("Couldn't close voting. Check the bot logs for details."))
         await self.panel.refresh(interaction)
 
 
@@ -1651,13 +1690,10 @@ class _CancelVotingButton(discord.ui.Button):
         try:
             await self.panel.cog._cancel(interaction, kind=self.kind)
         except ValidationError as e:
-            await interaction.followup.send(f"❌ {e.user_message}", ephemeral=True)
+            await send_error(interaction, style.error(e.user_message))
         except Exception:  # noqa: BLE001
             _log.exception("panel cancel failed")
-            await interaction.followup.send(
-                "❌ Cancel failed. Check the bot logs for details.",
-                ephemeral=True,
-            )
+            await send_error(interaction, style.error("Couldn't cancel voting. Check the bot logs for details."))
         await self.panel.refresh(interaction)
 
 
@@ -1778,7 +1814,7 @@ class OpenVotingModal(discord.ui.Modal):
             if not validate_month_format(target):
                 raise ValidationError(
                     "bad month",
-                    "Target month must be `YYYY-MM` (e.g. `2026-06`).",
+                    "Target month must be `YYYY-MM`.",
                 )
 
             mode_raw = (self.choice_mode_input.value or "").strip().lower()
@@ -1819,9 +1855,8 @@ class OpenVotingModal(discord.ui.Modal):
                     raise ValidationError(
                         "bad duration",
                         "Duration must be a positive number with an "
-                        "optional unit suffix — `30s`, `10m`, `2h`, `1d`, "
-                        "`1w` (or a bare integer for hours). Use `0` for "
-                        "no timer.",
+                        "optional unit: `30s`, `10m`, `2h`, `1d` or `1w` "
+                        "(a bare number means hours). Use `0` for no timer.",
                     )
                 if duration_secs > 30 * 86400:
                     raise ValidationError(
@@ -1852,7 +1887,7 @@ class OpenVotingModal(discord.ui.Modal):
                 target_month_arg = target
         except ValidationError as e:
             await interaction.response.send_message(
-                f"❌ {e.user_message}", ephemeral=True,
+                style.error(e.user_message), ephemeral=True,
             )
             return
 
@@ -1875,15 +1910,10 @@ class OpenVotingModal(discord.ui.Modal):
                 allowed_role_id=None,  # ditto
             )
         except ValidationError as e:
-            await interaction.followup.send(
-                f"❌ {e.user_message}", ephemeral=True,
-            )
+            await send_error(interaction, style.error(e.user_message))
         except Exception:  # noqa: BLE001
             _log.exception("OpenVotingModal submit failed")
-            await interaction.followup.send(
-                "❌ Could not open voting. Check the bot logs for details.",
-                ephemeral=True,
-            )
+            await send_error(interaction, style.error("Couldn't open voting. Check the bot logs for details."))
         # Always refresh the panel — _open_voting may have created a
         # cycle-then-rolled-back (no nominees) or partially mutated state.
         await self.panel.refresh(interaction)
@@ -1916,19 +1946,19 @@ class ReopenVotingModal(discord.ui.Modal):
             max_length=10,
         )
         self.choice_mode_input = discord.ui.TextInput(
-            label="Choice mode — blank = keep",
+            label="Choice mode (blank keeps current)",
             placeholder="single or multi",
             required=False,
             max_length=10,
         )
         self.winner_count_input = discord.ui.TextInput(
-            label="Winner count — blank = keep",
+            label="Winner count (blank keeps current)",
             placeholder="1-10",
             required=False,
             max_length=2,
         )
         self.duration_input = discord.ui.TextInput(
-            label="Auto-close — blank = keep, 0 = none",
+            label="Auto-close (blank keeps, 0 = no timer)",
             placeholder="30s · 10m · 2h · 1d · 1w · 0",
             required=False,
             max_length=8,
@@ -1948,12 +1978,12 @@ class ReopenVotingModal(discord.ui.Modal):
             target_cycle_id = int(raw_id)
         except ValueError:
             await interaction.response.send_message(
-                "❌ Vote ID must be a number.", ephemeral=True,
+                style.error("Vote ID must be a number."), ephemeral=True,
             )
             return
         if target_cycle_id <= 0:
             await interaction.response.send_message(
-                "❌ Vote ID must be positive.", ephemeral=True,
+                style.error("Vote ID must be positive."), ephemeral=True,
             )
             return
 
@@ -2000,9 +2030,9 @@ class ReopenVotingModal(discord.ui.Modal):
                         raise ValidationError(
                             "bad duration",
                             "Duration must be a positive number with an "
-                            "optional unit suffix — `30s`, `10m`, `2h`, "
-                            "`1d`, `1w` (or `0` for no timer; blank to "
-                            "keep current).",
+                            "optional unit: `30s`, `10m`, `2h`, `1d` or "
+                            "`1w`. Use `0` for no timer, or leave it blank "
+                            "to keep the current one.",
                         )
                     if secs > 30 * 86400:
                         raise ValidationError(
@@ -2012,7 +2042,7 @@ class ReopenVotingModal(discord.ui.Modal):
                     duration_override = dur_raw
         except ValidationError as e:
             await interaction.response.send_message(
-                f"❌ {e.user_message}", ephemeral=True,
+                style.error(e.user_message), ephemeral=True,
             )
             return
 
@@ -2025,15 +2055,10 @@ class ReopenVotingModal(discord.ui.Modal):
                 duration=duration_override,
             )
         except ValidationError as e:
-            await interaction.followup.send(
-                f"❌ {e.user_message}", ephemeral=True,
-            )
+            await send_error(interaction, style.error(e.user_message))
         except Exception:  # noqa: BLE001
             _log.exception("ReopenVotingModal submit failed")
-            await interaction.followup.send(
-                "❌ Could not reopen voting. Check the bot logs for details.",
-                ephemeral=True,
-            )
+            await send_error(interaction, style.error("Couldn't reopen voting. Check the bot logs for details."))
         await self.panel.refresh(interaction)
 
 
@@ -2114,7 +2139,7 @@ class _DefaultVoteUiSelect(discord.ui.Select):
             discord.SelectOption(
                 label="Dropdown (default)",
                 value="dropdown",
-                description="Single Select with up to 25 options.",
+                description="One dropdown menu, up to 25 nominees.",
                 default=(current == "dropdown"),
             ),
             discord.SelectOption(
@@ -2125,7 +2150,7 @@ class _DefaultVoteUiSelect(discord.ui.Select):
             ),
         ]
         super().__init__(
-            placeholder="Default vote UI…",
+            placeholder="Default vote menu…",
             min_values=1,
             max_values=1,
             options=options,
@@ -2275,21 +2300,18 @@ def _build_moderation_text(kind: str, cycle_row, votes: list, page: int = 0) -> 
     cycle_id = cycle_row[CYCLE_ID]
     total = len(votes)
     lines = [
-        f"🛠 **Vote moderation — {kind} vote ID `{cycle_id}`**",
+        f"🛠️ **Vote moderation**{style.SEP}{_kind_label(kind)} vote "
+        f"(ID {cycle_id})",
         "",
-        f"Total votes: **{total}**",
+        f"Total votes: **{total:,}**",
     ]
     if total == 0:
         lines.append("_No votes cast yet._")
     elif total > 25:
-        start = page * 25 + 1
-        end = min((page + 1) * 25, total)
-        lines.append(
-            f"_Showing votes {start}–{end} of {total}. "
-            f"Use **◀ Newer** / **Older ▶** to navigate._"
-        )
+        pages = (total - 1) // 25 + 1
+        lines.append(f"_{style.footer(page, pages, 'newest first')}_")
     lines.append("")
-    lines.append("Pick a vote and click **Remove selected vote** to delete it.")
+    lines.append("Pick a vote, then press **Remove selected vote**.")
     return "\n".join(lines)
 
 
@@ -2357,8 +2379,7 @@ class _NewerPageButton(discord.ui.Button):
     def __init__(self, mod_view: VoteModerationPanelView):
         super().__init__(
             style=discord.ButtonStyle.secondary,
-            label="Newer",
-            emoji="◀",
+            label="‹ Newer",
             row=2,
             disabled=mod_view.page <= 0,
         )
@@ -2383,8 +2404,7 @@ class _OlderPageButton(discord.ui.Button):
         max_page = max(0, (len(mod_view.votes) - 1) // 25)
         super().__init__(
             style=discord.ButtonStyle.secondary,
-            label="Older",
-            emoji="▶",
+            label="Older ›",
             row=2,
             disabled=mod_view.page >= max_page,
         )
@@ -2416,7 +2436,7 @@ class _RemoveVoteAdminButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         if self.mod_view.selected_vote_id is None:
             await interaction.response.send_message(
-                "❌ Pick a vote from the dropdown first.", ephemeral=True,
+                style.error("Pick a vote from the menu first."), ephemeral=True,
             )
             return
         await interaction.response.defer()
@@ -2439,7 +2459,7 @@ class _RemoveVoteAdminButton(discord.ui.Button):
         if target:
             _, user_id, _, title, _ = target
             await interaction.followup.send(
-                f"🗑 Removed <@{user_id}>'s vote for **{title}**.",
+                style.ok(f"Removed <@{user_id}>'s vote for **{title}**."),
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -2467,7 +2487,7 @@ class _ManageVotesAdminButton(discord.ui.Button):
         super().__init__(
             style=discord.ButtonStyle.secondary,
             label=f"Manage{kind_suffix} votes",
-            emoji="🛠",
+            emoji="🛠️",
         )
         self.panel = panel
         self.kind = kind
@@ -2476,7 +2496,7 @@ class _ManageVotesAdminButton(discord.ui.Button):
         cycle = self.panel.state[self.kind]
         if cycle is None or cycle[CYCLE_PHASE] != "voting":
             await interaction.response.send_message(
-                "❌ This cycle is no longer in the voting phase.",
+                style.error("This vote is no longer open."),
                 ephemeral=True,
             )
             return
@@ -2830,10 +2850,9 @@ class VNCycleCog(commands.Cog):
         if existing:
             raise ValidationError(
                 "active cycle already exists",
-                f"A {kind} vote is already in progress in this server "
-                f"(target: `{existing[CYCLE_TARGET_MONTH]}`). "
-                "Close or cancel it before starting a new one. (Monthly and "
-                "seasonal votes are tracked separately and may run in parallel.)",
+                f"A {kind} vote for **{_cycle_period_label(existing)}** is "
+                "already running. Close or cancel it before starting a new "
+                "one. Monthly and seasonal votes can run at the same time.",
             )
 
         # Resolve target_month + target_end_month from the kind-specific inputs.
@@ -2841,7 +2860,7 @@ class VNCycleCog(commands.Cog):
             if not season:
                 raise ValidationError(
                     "season required",
-                    "Open a seasonal vote with `season:<Winter|Spring|Summer|Fall>`.",
+                    "Enter any month inside the season to vote on.",
                 )
             effective_year = year if year is not None else discord.utils.utcnow().year
             months = season_to_months(season, effective_year)
@@ -2855,19 +2874,21 @@ class VNCycleCog(commands.Cog):
             if not validate_month_format(target):
                 raise ValidationError(
                     f"bad month {target!r}",
-                    "target_month must be in YYYY-MM format.",
+                    "Target month must be `YYYY-MM`.",
                 )
             target_end = target
             period_label = _month_label(target)
 
         if not choice_mode:
             raise ValidationError(
-                "missing choice_mode", "`choice_mode` is required for open_voting."
+                "missing choice_mode", "Choice mode must be `single` or `multi`."
             )
         if winner_count is None:
             winner_count = 1
         if winner_count < 1 or winner_count > 10:
-            raise ValidationError("bad winner_count", "winner_count must be 1-10.")
+            raise ValidationError(
+                "bad winner_count", "Winner count must be between 1 and 10.",
+            )
 
         # Compute closes_at from the duration choice. None means "no timer".
         closes_at_iso: Optional[str] = None
@@ -2893,15 +2914,15 @@ class VNCycleCog(commands.Cog):
         if pending_count == 0:
             raise ValidationError(
                 "no nominees",
-                f"No nominations found for **{period_label}**. Have users run "
-                f"`/nominate status:{kind} title:<title>` first, then open voting again.",
+                f"No nominations for **{period_label}** yet. Members add them "
+                "with `/nominate`; open voting again once there are some.",
             )
         if pending_count > 25:
             raise ValidationError(
                 "too many nominees",
-                f"More than 25 nominations exist for **{period_label}** "
-                "— voting UI doesn't support that. Reduce nominations "
-                "(via `/manage_pool action:Remove`) before opening voting.",
+                f"**{period_label}** has more than 25 nominations, more than "
+                "the vote menu can hold. Remove some with "
+                "`/manage_pool action:Remove` before opening voting.",
             )
 
         # vote_ui resolution: explicit arg wins; otherwise pull the
@@ -2920,13 +2941,14 @@ class VNCycleCog(commands.Cog):
         if vote_ui_value not in ("dropdown", "buttons"):
             raise ValidationError(
                 "bad vote_ui",
-                f"Unknown vote_ui `{vote_ui_value}`. Expected `dropdown` or `buttons`.",
+                f"Unknown vote menu `{vote_ui_value}`. Use dropdown or buttons.",
             )
         if vote_ui_value == "buttons" and pending_count > _VOTE_UI_BUTTONS_MAX:
             raise ValidationError(
                 "too many nominees for buttons",
-                f"Buttons-mode supports at most {_VOTE_UI_BUTTONS_MAX} nominees "
-                f"(have {pending_count}). Use `vote_ui:Dropdown` instead.",
+                f"The buttons menu holds at most {_VOTE_UI_BUTTONS_MAX} nominees "
+                f"and this vote has {pending_count}. Switch the default vote "
+                "menu to dropdown under **Settings…** first.",
             )
 
         # Allowed-role resolution: explicit `allowed_role` arg wins; if
@@ -2974,23 +2996,25 @@ class VNCycleCog(commands.Cog):
         if closes_at_iso:
             self._schedule_close(cycle_id, closes_at_iso)
 
-        timer_note = (
-            f", auto-closes in `{duration}`" if closes_at_iso else ""
-        )
-        role_note = (
-            f", restricted to <@&{allowed_role_id}>" if allowed_role_id else ""
-        )
-        kind_label = "Seasonal" if kind == "seasonal" else "Monthly"
+        details = [
+            style.plural(pending_count, "nominee"),
+            _mode_text(choice_mode, winner_count).lower(),
+            style.plural(winner_count, "winner"),
+        ]
+        if closes_at_iso:
+            details.append(f"closes {_format_closes_at_relative(closes_at_iso)}")
+        if allowed_role_id:
+            details.append(f"only <@&{allowed_role_id}> can vote")
         theme_note = await self._off_theme_ballot_note(
             guild_id, cycle_id, kind, target, target_end)
         await interaction.followup.send(
-            f"🗳️ {kind_label} vote `{cycle_id}` is now open for **{period_label}** "
-            f"with **{pending_count}** nominee(s) "
-            f"(mode `{choice_mode}`, {winner_count} winner(s){timer_note}{role_note}). "
-            "Click **Post vote message** on the dashboard from the channel "
-            "where you want the voting menu to appear. "
-            "Users can also run `/vote` for a personal voting menu "
-            f"without waiting for the public message.{theme_note}",
+            style.ok(
+                f"{_kind_label(kind)} vote (ID {cycle_id}) is open for "
+                f"**{period_label}**: {', '.join(details)}."
+            )
+            + "\nPress **Post vote message** in the channel where the vote "
+            "should appear. Members can already vote with `/vote`."
+            + theme_note,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -3019,13 +3043,13 @@ class VNCycleCog(commands.Cog):
         cycle = await _active_cycle(self.bot, interaction.guild.id, kind)
         if not cycle:
             raise ValidationError(
-                "no active cycle", f"No active {kind} voting found.",
+                "no active cycle", f"No {kind} vote is running.",
             )
         if cycle[CYCLE_PHASE] != "voting":
             raise ValidationError(
                 "wrong phase",
-                f"Voting is in phase `{cycle[CYCLE_PHASE]}`; "
-                "click **Open voting** on the dashboard first.",
+                f"The {kind} vote isn't taking votes "
+                f"({_phase_words(cycle[CYCLE_PHASE])}). Open voting first.",
             )
 
         # If admin passed allowed_role, persist the change *before*
@@ -3047,7 +3071,7 @@ class VNCycleCog(commands.Cog):
         )
         if not nominees:
             raise ValidationError(
-                "no nominees", "Voting has no nominees — nothing to render.",
+                "no nominees", "This vote has no nominees, so there's nothing to post.",
             )
 
         tally = await self.bot.GET(DatabaseQueries.TALLY_VOTES, (cycle[CYCLE_ID],))
@@ -3088,9 +3112,8 @@ class VNCycleCog(commands.Cog):
                     # vote messages had no embed, so this was a no-op
                     # before the embed migration.)
                     await old_msg.edit(
-                        content=(
-                            f"🔁 Voting menu moved — see "
-                            f"{new_message.jump_url}"
+                        content=style.info(
+                            f"This vote has moved: {new_message.jump_url}"
                         ),
                         embed=None,
                         view=None,
@@ -3139,11 +3162,12 @@ class VNCycleCog(commands.Cog):
         guild_for_lookup = guild if guild is not None else interaction.guild
         cycle = await _active_cycle(self.bot, guild_for_lookup.id, kind)
         if not cycle:
-            raise ValidationError("no active cycle", f"No active {kind} voting to close.")
+            raise ValidationError("no active cycle", f"No {kind} vote is running.")
         if cycle[CYCLE_PHASE] != "voting":
             raise ValidationError(
                 "wrong phase",
-                f"Voting is in phase `{cycle[CYCLE_PHASE]}`; expected `voting`.",
+                f"The {kind} vote isn't taking votes "
+                f"({_phase_words(cycle[CYCLE_PHASE])}).",
             )
         if expected_cycle_id is not None and cycle[CYCLE_ID] != expected_cycle_id:
             # The active cycle changed between the scheduler's queue time
@@ -3214,7 +3238,7 @@ class VNCycleCog(commands.Cog):
                     DatabaseQueries.CLOSE_CYCLE, (cycle[CYCLE_ID],),
                 )
                 return
-            raise ValidationError("no nominees", "No nominees to tally.")
+            raise ValidationError("no nominees", "This vote has no nominees to count.")
         # Tie-aware winner resolution: contested seats (where votes ==
         # next-place) are forfeit, and 0-vote "winners" never claim a
         # seat. The cycle still closes; admin can promote manually via
@@ -3313,27 +3337,22 @@ class VNCycleCog(commands.Cog):
                 try:
                     vote_msg = await channel.fetch_message(cycle[CYCLE_MESSAGE_ID])
                     total_votes = sum(t[6] for t in tally)
-                    closed_lines = [
-                        f"🔒 **Voting closed — {period_label}**",
-                    ]
                     if winners:
                         winners_label = ", ".join(f"**{w[2]}**" for w in winners)
-                        closed_lines.append(
+                        outcome = (
                             f"{'Winners' if len(winners) > 1 else 'Winner'}: "
                             f"{winners_label}"
                         )
                     else:
-                        closed_lines.append(
-                            "No votes cast. No winner."
-                        )
-                    closed_lines.append(
-                        f"Mode: `{cycle[CYCLE_CHOICE_MODE] or 'single'}` · "
-                        f"Vote ID: `{cycle[CYCLE_ID]}`"
-                    )
-                    closed_lines.append("")
-                    closed_lines.append(
-                        f"📊 **Standings** · {_votes_phrase(total_votes)}"
-                    )
+                        outcome = "No votes cast, so there is no winner."
+                    closed_lines = [
+                        f"**Voting closed.** {outcome}",
+                        _mode_text(
+                            cycle[CYCLE_CHOICE_MODE] or "single", winner_count,
+                        ),
+                        "",
+                        f"**Standings**{style.SEP}{_votes_phrase(total_votes)}",
+                    ]
                     # Letters stay in nomination order so they match what
                     # voters saw on the live message; the standings then
                     # re-sort by votes. `tally` already arrives votes DESC,
@@ -3387,39 +3406,33 @@ class VNCycleCog(commands.Cog):
                             prev_votes = votes
                         pct = (votes / total_votes * 100.0) if total_votes else 0.0
                         truncated = _truncate_label(str(title), 60)
-                        safe_title = (
-                            truncated.replace("\\", "\\\\")
-                            .replace("[", "\\[")
-                            .replace("]", "\\]")
-                        )
+                        safe_title = link_label(truncated)
                         title_link = (
-                            f"[{safe_title}](<https://vndb.org/{vndb_id}>)"
+                            f"[{safe_title}](https://vndb.org/{vndb_id})"
                         )
                         nom_user = self.bot.get_user(user_id) if user_id else None
                         if nom_user is not None:
-                            nom_tag = nom_user.name
-                        elif user_id:
-                            nom_tag = nom_tag_map.get(user_id) or "unknown-user"
+                            nominator = f"@{inert_text(nom_user.name, 40)}"
+                        elif user_id and nom_tag_map.get(user_id):
+                            nominator = f"@{inert_text(nom_tag_map[user_id], 40)}"
                         else:
-                            nom_tag = "unknown-user"
-                        nominator = f"@{nom_tag}"
+                            nominator = _UNKNOWN_MEMBER
                         winner_marker = " 🏆" if nom_id in winner_ids else ""
+                        sep = style.SEP
                         standings_rows.append(
-                            f"`{rank:>2}.` `{letter}` · {title_link} · "
-                            f"{nominator} · `{pct:5.1f}%` ({votes})"
+                            f"`{rank:>2}.` `{letter}`{sep}{title_link}{sep}"
+                            f"{nominator}{sep}**{pct:.1f}%** ({votes:,})"
                             f"{winner_marker}"
                         )
                     zero_tail = (
                         f"_No votes: {', '.join(zero_vote_letters)}_"
                         if zero_vote_letters else None
                     )
-                    # Fit Discord's 2000-char message-content cap (the live
-                    # prompt uses an embed, which has more room; this closed
-                    # message is plain content). Drop the lowest-information
-                    # lines first: the zero-vote tail, then ranked rows from the
-                    # bottom, leaving a "N more" note. Without this a >2000-char
-                    # render makes vote_msg.edit raise, stranding the message on
-                    # the live (now dead) voting view.
+                    # Fit the embed description budget shared with the live
+                    # prompt. Drop the lowest-information lines first: the
+                    # zero-vote tail, then ranked rows from the bottom, leaving
+                    # a "N more" note. An oversized render makes vote_msg.edit
+                    # raise, stranding the message on the dead voting view.
                     def _fit(
                         body: list[str], tail: Optional[str], note: Optional[str]
                     ) -> str:
@@ -3433,7 +3446,7 @@ class VNCycleCog(commands.Cog):
                     fit_body = list(standings_rows)
                     fit_tail = zero_tail
                     overflow_note: Optional[str] = None
-                    while len(_fit(fit_body, fit_tail, overflow_note)) > 1990:
+                    while len(_fit(fit_body, fit_tail, overflow_note)) > _VOTE_DESC_BUDGET:
                         if fit_tail is not None:
                             fit_tail = None
                         elif fit_body:
@@ -3444,17 +3457,31 @@ class VNCycleCog(commands.Cog):
                             )
                         else:
                             break
-                    content = _fit(fit_body, fit_tail, overflow_note)
-                    if len(content) > 2000:
-                        content = content[:1990].rstrip() + "\n_truncated._"
+                    description = _fit(fit_body, fit_tail, overflow_note)
+                    if len(description) > _VOTE_DESC_BUDGET:
+                        description = (
+                            description[:_VOTE_DESC_BUDGET].rstrip()
+                            + "\n_…truncated._"
+                        )
+                    closed_embed = discord.Embed(
+                        title=style.title(
+                            "🗳️", f"{_kind_label(cycle_kind)} vote", period_label,
+                        ),
+                        description=description,
+                        color=style.ACCENT,
+                    )
+                    # The ID is what Reopen voting asks for.
+                    closed_embed.set_footer(
+                        text=style.footer(0, 1, f"Vote ID {cycle[CYCLE_ID]}"),
+                    )
                     # Keep a participants-only view so people can still see who
                     # voted for what after close; the vote inputs are gone. The
                     # participants custom_id is already registered in-session by
                     # the live VoteView, so we do NOT add_view here (that would
                     # collide); boot re-registration handles it across restarts.
                     await vote_msg.edit(
-                        content=content,
-                        embed=None,
+                        content=None,
+                        embed=closed_embed,
                         view=ClosedVoteView(cycle[CYCLE_ID]),
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
@@ -3510,18 +3537,18 @@ class VNCycleCog(commands.Cog):
         if target is None:
             raise ValidationError(
                 "no such cycle",
-                f"No vote with id `{cycle_id}` exists.",
+                f"No vote with ID {cycle_id} exists.",
             )
         if target[CYCLE_GUILD_ID] != interaction.guild.id:
             raise ValidationError(
                 "wrong guild",
-                f"Vote `{cycle_id}` doesn't belong to this server.",
+                f"Vote {cycle_id} doesn't belong to this server.",
             )
         if target[CYCLE_PHASE] != "closed":
             raise ValidationError(
                 "not closed",
-                f"Vote `{cycle_id}` is in phase `{target[CYCLE_PHASE]}`, "
-                "not `closed` — only closed votes can be reopened.",
+                f"Vote {cycle_id} is {_phase_words(target[CYCLE_PHASE])}. "
+                "Only closed votes can be reopened.",
             )
         kind = target[CYCLE_KIND] or "monthly"
         # Same-kind active-cycle conflict: one active per (guild, kind)
@@ -3530,9 +3557,9 @@ class VNCycleCog(commands.Cog):
         if active:
             raise ValidationError(
                 "active cycle exists",
-                f"A {kind} vote (id `{active[CYCLE_ID]}`) is already "
-                "running in this server. Close or cancel it before "
-                "reopening another one of the same kind.",
+                f"A {kind} vote (ID {active[CYCLE_ID]}) is already "
+                "running. Close or cancel it before reopening another "
+                f"{kind} vote.",
             )
 
         # Atomic: reopen + drop redundant re-noms + demote winners +
@@ -3593,11 +3620,13 @@ class VNCycleCog(commands.Cog):
         if choice_mode is not None:
             sets.append("vote_choice_mode = ?")
             params.append(choice_mode)
-            applied_changes.append(f"mode `{choice_mode}`")
+            applied_changes.append(
+                _mode_text(choice_mode, winner_count or target[CYCLE_WINNER_COUNT]).lower()
+            )
         if winner_count is not None:
             sets.append("vote_winner_count = ?")
             params.append(int(winner_count))
-            applied_changes.append(f"{int(winner_count)} winner(s)")
+            applied_changes.append(style.plural(int(winner_count), "winner"))
         if duration is not None:
             if duration in ("0", "none", "0s"):
                 sets.append("closes_at = NULL")
@@ -3611,8 +3640,11 @@ class VNCycleCog(commands.Cog):
                         + timedelta(seconds=duration_secs)
                     )
                     sets.append("closes_at = ?")
-                    params.append(close_dt.strftime("%Y-%m-%d %H:%M:%S"))
-                    applied_changes.append(f"auto-closes in `{duration}`")
+                    closes_at = close_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    params.append(closes_at)
+                    applied_changes.append(
+                        f"closes {_format_closes_at_relative(closes_at)}"
+                    )
         if sets:
             params.append(cycle_id)
             await self.bot.RUN(
@@ -3640,19 +3672,21 @@ class VNCycleCog(commands.Cog):
             ))
 
         period_label = await cycle_period_label_with_season(self.bot, target)
-        kind_label = "Seasonal" if kind == "seasonal" else "Monthly"
         overrides_note = (
-            f" Settings updated: {', '.join(applied_changes)}."
+            f" Now: {', '.join(applied_changes)}."
             if applied_changes else ""
         )
         theme_note = await self._off_theme_ballot_note(
             guild_id, cycle_id, kind, target_month, target_end_month)
         await interaction.followup.send(
-            f"♻️ {kind_label} vote `{cycle_id}` reopened for "
-            f"**{period_label}**. Any previous winner is back as a "
-            f"nominee.{overrides_note} Click **Repost vote message** "
-            "on the dashboard from the channel where you want the "
-            f"live tally menu.{theme_note}",
+            style.ok(
+                f"{_kind_label(kind)} vote (ID {cycle_id}) reopened for "
+                f"**{period_label}**. Any previous winner is back as a "
+                f"nominee.{overrides_note}"
+            )
+            + "\nPress **Post vote message** in the channel where the vote "
+            "should appear."
+            + theme_note,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -3660,7 +3694,7 @@ class VNCycleCog(commands.Cog):
     async def _cancel(self, interaction, *, kind, **_):
         cycle = await _active_cycle(self.bot, interaction.guild.id, kind)
         if not cycle:
-            raise ValidationError("no active cycle", f"No active {kind} voting to cancel.")
+            raise ValidationError("no active cycle", f"No {kind} vote is running.")
         # Drop any scheduled close so the timer doesn't fire after the
         # cycle has been moved to phase='closed'.
         self._cancel_scheduled_close(cycle[CYCLE_ID])
@@ -3676,9 +3710,10 @@ class VNCycleCog(commands.Cog):
         # the next Open voting for that month.
         await self.bot.RUN(DatabaseQueries.CLOSE_CYCLE, (cycle[CYCLE_ID],))
         await interaction.followup.send(
-            f"🛑 {kind.capitalize()} vote `{cycle[CYCLE_ID]}` cancelled. "
-            "Nominations are preserved — click **Open voting** on the "
-            "dashboard to vote on them again.",
+            style.ok(
+                f"{_kind_label(kind)} vote cancelled. Its nominations are "
+                "kept; open voting again to vote on them."
+            ),
             ephemeral=True,
         )
 
@@ -3714,8 +3749,10 @@ class VNCycleCog(commands.Cog):
         theme_label, theme_rules = theme
         if theme_rules is None:
             return (
-                f"\n\n⚠️ The **{theme_label}** theme for this period is "
-                "misconfigured, so the ballot couldn't be checked against it."
+                "\n\n" + style.info(
+                    f"The **{theme_label}** theme for this period is "
+                    "misconfigured, so the ballot couldn't be checked against it."
+                )
             )
 
         nominees = await self.bot.GET(DatabaseQueries.GET_CYCLE_NOMINEES, (cycle_id,))
@@ -3758,14 +3795,14 @@ class VNCycleCog(commands.Cog):
         parts = []
         if offenders:
             parts.append(
-                f"⚠️ On the ballot but off-theme for **{theme_label}**: "
+                style.info(f"On the ballot but off-theme for **{theme_label}**: ")
                 + self._join_capped(offenders)
                 + ". These were nominated before the theme applied, or added by a "
                 "manager. Use `/manage_pool` to drop any that shouldn't run.")
         if unchecked:
             parts.append(
-                "ℹ️ Couldn't be checked against the theme (VNDB didn't answer for "
-                f"them): {self._join_capped(unchecked)}.")
+                style.info("Couldn't be checked against the theme (VNDB didn't answer for ")
+                + f"them): {self._join_capped(unchecked)}.")
         if not parts:
             return ""
         if len(nominees) > len(checked):
@@ -3864,10 +3901,11 @@ class VNCycleCog(commands.Cog):
                 for r in getattr(member, "roles", [])
             )
             if not has_role:
-                await interaction.followup.send(
-                    f"❌ You need the <@&{default_role_id}> role to "
-                    "nominate VNs in this server.",
-                    ephemeral=True,
+                await send_error(
+                    interaction,
+                    style.error(
+                        f"You need the <@&{default_role_id}> role to nominate VNs."
+                    ),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
@@ -3902,7 +3940,7 @@ class VNCycleCog(commands.Cog):
                     if not validate_month_format(target_month):
                         raise ValidationError(
                             f"bad month {target_month!r}",
-                            "target_month must be in YYYY-MM format.",
+                            "Target month must be `YYYY-MM`.",
                         )
                     year_int = int(target_month[:4])
                     month_int = int(target_month[5:7])
@@ -3911,7 +3949,7 @@ class VNCycleCog(commands.Cog):
                     except ValueError:
                         raise ValidationError(
                             "bad month",
-                            "target_month must be a real calendar month for seasonal noms.",
+                            "Target month must be a real calendar month.",
                         )
                 else:
                     cur_season, cur_year = current_anime_season()
@@ -3924,7 +3962,7 @@ class VNCycleCog(commands.Cog):
                 if not validate_month_format(target):
                     raise ValidationError(
                         f"bad month {target!r}",
-                        "target_month must be in YYYY-MM format.",
+                        "Target month must be `YYYY-MM`.",
                     )
                 start_month = target
                 end_month = target
@@ -3951,11 +3989,9 @@ class VNCycleCog(commands.Cog):
             if active_overlap:
                 raise ValidationError(
                     "vote in progress",
-                    f"A {kind_value} vote is currently running for "
-                    f"**{period_label}** — wait for it to close before "
-                    "nominating new VNs for that period. (New nominations "
-                    "wouldn't be in the active vote anyway since the "
-                    "candidate pool is set when voting opens.)",
+                    f"The {kind_value} vote for **{period_label}** is already "
+                    "running, and its ballot was set when voting opened. Wait "
+                    "for it to close before nominating for that period.",
                 )
 
             # Look up any existing nomination for this user + EXACT
@@ -3974,16 +4010,16 @@ class VNCycleCog(commands.Cog):
             if not vndb_id:
                 raise ValidationError(
                     "couldn't resolve VN",
-                    "Could not determine the VN from your input. Use the autocomplete dropdown.",
+                    "Couldn't tell which VN you meant. Pick one from the autocomplete list.",
                 )
 
             vn_info = await from_vndb_id(self.bot, vndb_id)
             if not vn_info:
                 raise ValidationError(
                     "vndb fetch failed",
-                    "Couldn't fetch that VN from VNDB. VNDB is most likely "
-                    "temporarily unreachable — try again in a moment. If "
-                    "the error persists, double-check the ID.",
+                    "Couldn't fetch that VN from VNDB, which is probably "
+                    "unreachable for the moment. Try again in a minute. If "
+                    "it keeps failing, check the VN you picked.",
                 )
 
             display_title = vn_info.title_ja or vn_info.title_en or vndb_id
@@ -4041,9 +4077,11 @@ class VNCycleCog(commands.Cog):
                     # Same VN as before — friendly no-op so re-running the
                     # exact same command isn't an error.
                     await interaction.followup.send(
-                        f"ℹ️ You've already nominated **{display_title}** for "
-                        f"**{period_label}** (pool entry **#{pool_id}**). "
-                        "Re-run with a different VN to swap your pick.",
+                        style.info(
+                            f"You've already nominated **{display_title}** for "
+                            f"**{period_label}** (pool entry **#{pool_id}**). "
+                            "Nominate a different VN to swap your pick."
+                        ),
                     )
                     return
                 # Re-point the existing row at the new VN. cycle_id stays
@@ -4074,9 +4112,11 @@ class VNCycleCog(commands.Cog):
                     # which is by far the likeliest since Discord serializes a
                     # given user's interactions.
                     await interaction.followup.send(
-                        f"ℹ️ You've already nominated a VN for "
-                        f"**{period_label}**. Re-run with a different VN "
-                        "to swap your pick."
+                        style.info(
+                            f"You've already nominated a VN for "
+                            f"**{period_label}**. Nominate a different VN "
+                            "to swap your pick."
+                        )
                     )
                     return
                 await cache_user(self.bot, interaction.user)
@@ -4099,16 +4139,14 @@ class VNCycleCog(commands.Cog):
                 vndb_id, jiten_data.deck_id if jiten_data else None,
             )
             if update_mode:
-                content = (
-                    f"🔄 Updated your nomination for the {kind_value} vote "
-                    f"({period_label}) to **{display_title}** "
-                    f"— pool entry **#{pool_id}**."
+                content = style.ok(
+                    f"Your nomination for **{period_label}** is now "
+                    f"**{display_title}** (pool entry **#{pool_id}**)."
                 )
             else:
-                content = (
-                    f"✅ **{display_title}** nominated for the {kind_value} vote "
-                    f"({period_label}) as pool entry **#{pool_id}** "
-                    f"— `/pool_entry id:{pool_id}` for full detail."
+                content = style.ok(
+                    f"Nominated **{display_title}** for **{period_label}** "
+                    f"(pool entry **#{pool_id}**)."
                 )
             if theme_warning:
                 # One reason line per failed rule, each naming its tags, so the
@@ -4117,10 +4155,10 @@ class VNCycleCog(commands.Cog):
                 if len(theme_warning) > THEME_NOTE_CHARS:
                     theme_warning = theme_warning[:THEME_NOTE_CHARS - 1].rstrip() + "…"
                 content = (
-                    f"⚠️ {theme_warning}\n\nAllowed because you're a manager. "
-                    f"Anyone else would have been turned away. Use "
-                    f"`/manage_pool` to drop it, or `/manage_theme` to change "
-                    f"the theme.\n\n{content}"
+                    style.info(theme_warning)
+                    + "\n\nAllowed because you're a manager; other members "
+                    "would be turned away. Drop it with `/manage_pool` or "
+                    f"change the theme with `/manage_theme`.\n\n{content}"
                 )
             await interaction.followup.send(
                 content=content,
@@ -4131,13 +4169,15 @@ class VNCycleCog(commands.Cog):
             await handle_command_error(interaction, e)
         except Exception as e:
             _log.exception("/nominate failed")
-            await handle_command_error(interaction, e, "An error occurred recording your nomination.")
+            await handle_command_error(
+                interaction, e, "Something went wrong. Try again in a minute.",
+            )
 
     # ---------------- /vote ----------------
 
     @app_commands.command(
         name="vote",
-        description="Open a personal voting menu for the active vote(s) in this server.",
+        description="Open a private voting menu for this server's open votes.",
     )
     @app_commands.guild_only()
     async def vote(self, interaction: discord.Interaction):
@@ -4159,8 +4199,8 @@ class VNCycleCog(commands.Cog):
                 if cycle and cycle[CYCLE_PHASE] == "voting":
                     actives.append(cycle)
             if not actives:
-                await interaction.followup.send(
-                    "❌ No active voting in this server.", ephemeral=True,
+                await send_error(
+                    interaction, style.info("No vote is open in this server right now."),
                 )
                 return
             for cycle in actives:
@@ -4173,7 +4213,7 @@ class VNCycleCog(commands.Cog):
                     DatabaseQueries.TALLY_VOTES, (cycle[CYCLE_ID],),
                 )
                 embed = await _render_vote_prompt(
-                    self.bot, cycle, nominees, tally,
+                    self.bot, cycle, nominees, tally, personal=True,
                 )
                 view = VoteView(
                     cycle_id=cycle[CYCLE_ID],
@@ -4186,9 +4226,8 @@ class VNCycleCog(commands.Cog):
                 )
         except Exception:  # noqa: BLE001
             _log.exception("/vote failed")
-            await interaction.followup.send(
-                "❌ Could not open the voting menu. Check the bot logs for details.",
-                ephemeral=True,
+            await send_error(
+                interaction, style.error("Something went wrong. Try again in a minute."),
             )
 
 

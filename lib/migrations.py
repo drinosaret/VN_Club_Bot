@@ -61,6 +61,10 @@ async def run_migrations(bot) -> None:
         await _add_user_tag_to_users(bot)
         await _create_theme_tables(bot)
         await _create_user_transfers_table(bot)
+        await _add_rating_scale_to_reading_logs(bot)
+        await _create_user_settings_table(bot)
+        await _create_vndb_link_tables(bot)
+        await _create_reply_visibility_tables(bot)
     except Exception:
         _log.exception("Migrations failed; aborting startup so the container restart-loops cleanly")
         raise
@@ -1072,6 +1076,89 @@ async def _create_user_transfers_table(bot) -> None:
     )
 
 
+async def _add_rating_scale_to_reading_logs(bot) -> None:
+    """Add `rating_scale INTEGER NOT NULL DEFAULT 5` to reading_logs.
+
+    Every rating stored before this column existed is out of 5, so the
+    constant default labels existing rows correctly without rewriting them,
+    and any writer that does not set the column keeps producing rows that
+    mean what they meant before. Fresh installs get the column from the
+    cog's CREATE TABLE.
+    """
+    cols = await _column_names(bot, "reading_logs")
+    if not cols or "rating_scale" in cols:
+        return
+    _log.info("Adding rating_scale column to reading_logs")
+    await bot.RUN(
+        "ALTER TABLE reading_logs ADD COLUMN rating_scale INTEGER NOT NULL DEFAULT 5"
+    )
+
+
+async def _create_user_settings_table(bot) -> None:
+    """Per-user preferences. A missing row, or a NULL rating_scale, means the
+    default scale (lib.ratings.DEFAULT_SCALE)."""
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            rating_scale INTEGER,
+            scale_notice_seen INTEGER NOT NULL DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+
+async def _create_vndb_link_tables(bot) -> None:
+    """Linked VNDB accounts and a cache of their public list entries.
+
+    vndb_uid is UNIQUE so one VNDB account belongs to at most one Discord
+    user. vndb_ulist holds only entries VNDB serves without a token, i.e.
+    entries under public labels, and is replaced wholesale on each sync.
+    vndb_vn_titles keeps one title per VN rather than one per list row.
+    """
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS vndb_links (
+            user_id INTEGER PRIMARY KEY,
+            vndb_uid TEXT NOT NULL UNIQUE,
+            vndb_username TEXT NOT NULL,
+            linked_in_guild INTEGER,
+            linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            synced_at TIMESTAMP,
+            sync_error TEXT
+        );
+        """
+    )
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS vndb_ulist (
+            user_id INTEGER NOT NULL,
+            vndb_id TEXT NOT NULL,
+            vote INTEGER,
+            voted TEXT,
+            finished TEXT,
+            is_finished INTEGER NOT NULL DEFAULT 0,
+            notes TEXT,
+            lastmod INTEGER,
+            PRIMARY KEY (user_id, vndb_id)
+        );
+        """
+    )
+    await bot.RUN(
+        "CREATE INDEX IF NOT EXISTS idx_vndb_ulist_vndb_id ON vndb_ulist (vndb_id)"
+    )
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS vndb_vn_titles (
+            vndb_id TEXT PRIMARY KEY,
+            title TEXT,
+            alttitle TEXT
+        );
+        """
+    )
+
+
 async def _add_vn_titles_nomination_dedup_index(bot) -> None:
     """Partial UNIQUE INDEX so the /nominate INSERT OR IGNORE pattern
     is race-safe.
@@ -1252,3 +1339,27 @@ async def _column_names(bot, table: str) -> list[str]:
         raise ValueError(f"unsafe table name for PRAGMA: {table!r}")
     rows = await bot.GET(f"PRAGMA table_info({table})")
     return [row[1] for row in rows]
+
+
+async def _create_reply_visibility_tables(bot) -> None:
+    """Where command replies may be public. A server without a settings row
+    keeps replies private except in the channels listed for it."""
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS guild_reply_settings (
+            guild_id INTEGER PRIMARY KEY,
+            public_everywhere INTEGER NOT NULL DEFAULT 0,
+            updated_by INTEGER,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS guild_public_channels (
+            guild_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, channel_id)
+        );
+        """
+    )

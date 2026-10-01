@@ -1,11 +1,11 @@
-"""`/manage_managers` — grant/revoke per-guild VN manager permission.
+"""`/manage_managers`: grant/revoke per-guild VN manager permission.
 
 Restricted to ``AUTHORIZED_USERS`` (bot operators). No bootstrap
 exception, no Discord-permission fallback: the host is the only
 principal that can edit the manager list. The
 ``@app_commands.default_permissions(administrator=True)`` decorator
 hides the command from non-admin members in Discord's UI, but that's
-cosmetic — the real gate is the ``AUTHORIZED_USER_IDS`` check inside
+cosmetic; the real gate is the ``AUTHORIZED_USER_IDS`` check inside
 the callback.
 
 The command operates on the current guild by default; the optional
@@ -16,19 +16,23 @@ context).
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from lib import style
 from lib.autocomplete import bot_guilds_autocomplete
 from lib.bot import VNClubBot
 from lib.utils import (
     AUTHORIZED_USER_IDS,
     DatabaseQueries,
     ValidationError,
+    create_base_embed,
     handle_command_error,
+    inert_text,
 )
 
 _log = logging.getLogger(__name__)
@@ -60,10 +64,26 @@ def _parse_guild_id(raw: str) -> int:
 
 
 # The cross-guild target picker is shared with /manage_pool via
-# lib.autocomplete.bot_guilds_autocomplete — same "list every guild
+# lib.autocomplete.bot_guilds_autocomplete: same "list every guild
 # the bot is in, no default-to-current-guild" semantics. Keep both
 # admin commands using the same dropdown so a host doesn't have to
 # remember which one offers autocomplete and which doesn't.
+
+
+def _added_on(added_at: Optional[str]) -> str:
+    """SQLite CURRENT_TIMESTAMP (UTC) as a Discord date, which renders in
+    the reader's own time zone."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            when = datetime.strptime(added_at or "", fmt)
+        except ValueError:
+            continue
+        return f"<t:{int(when.replace(tzinfo=timezone.utc).timestamp())}:d>"
+    return ""
+
+
+def _guild_label(target_guild: Optional[discord.Guild], target_guild_id: int) -> str:
+    return target_guild.name if target_guild else f"Server {target_guild_id}"
 
 
 def _format_principal_line(
@@ -73,7 +93,7 @@ def _format_principal_line(
 ) -> str:
     """Render one entry for the `list` action.
 
-    Falls back gracefully when the bot can't resolve a user/role —
+    Falls back gracefully when the bot can't resolve a user/role,
     common when listing a guild the bot host isn't in, or for stale
     grants whose target left the server.
     """
@@ -81,11 +101,16 @@ def _format_principal_line(
         target = f"<@{principal_id}>"
     elif principal_type == "role":
         role = guild.get_role(principal_id) if guild else None
-        target = f"`@{role.name}` (role)" if role else f"`<role {principal_id}>`"
+        # The id stays visible for an unresolved role: it is what an operator
+        # needs to recognise and remove a stale grant.
+        target = f"@{inert_text(role.name, 60)} (role)" if role else f"Unknown role (id {principal_id})"
     else:
         target = f"`{principal_type}:{principal_id}`"
-    added_by = f"<@{added_by_user_id}>" if added_by_user_id else "unknown"
-    return f"- {target} · added by {added_by} · {added_at}"
+    bits = [target]
+    if added_by_user_id:
+        bits.append(f"added by <@{added_by_user_id}>")
+    bits.append(_added_on(added_at))
+    return style.SEP.join(b for b in bits if b)
 
 
 class AdminManagers(commands.Cog):
@@ -122,7 +147,7 @@ class AdminManagers(commands.Cog):
         try:
             # AUTHORIZED_USERS only. default_permissions above hides
             # the command from non-admins in Discord's UI but that's
-            # cosmetic — this is the actual gate.
+            # cosmetic; this is the actual gate.
             if interaction.user.id not in AUTHORIZED_USER_IDS:
                 raise ValidationError(
                     f"User {interaction.user.id} not in AUTHORIZED_USERS",
@@ -157,7 +182,7 @@ class AdminManagers(commands.Cog):
                     interaction, target_guild_id, target_guild, user, role,
                 )
             else:
-                # Shouldn't reach — Discord constrains action to the
+                # Shouldn't reach: Discord constrains action to the
                 # three Choices above.
                 raise ValidationError(
                     f"unknown action {action.value!r}",
@@ -183,7 +208,7 @@ class AdminManagers(commands.Cog):
         principal_type = "user" if user is not None else "role"
         principal_id = user.id if user is not None else role.id
 
-        # INSERT OR IGNORE — re-adding is a friendly no-op. To tell
+        # INSERT OR IGNORE: re-adding is a friendly no-op. To tell
         # the host whether the row was actually inserted, check the
         # table first.
         already = await self.bot.GET_ONE(
@@ -197,8 +222,8 @@ class AdminManagers(commands.Cog):
         )
 
         target_label = user.mention if user is not None else role.mention
-        guild_label = target_guild.name if target_guild else f"guild `{target_guild_id}`"
-        verb = "already a manager" if already else "added as manager"
+        guild_label = _guild_label(target_guild, target_guild_id)
+        verb = "is already a manager" if already else "added as a manager"
         _log.info(
             "manage_managers add: %s %s %s in guild %s by user %s%s",
             principal_type, principal_id, target_label,
@@ -206,7 +231,7 @@ class AdminManagers(commands.Cog):
             " (no-op, already present)" if already else "",
         )
         await interaction.followup.send(
-            f"✅ {target_label} {verb} in **{guild_label}**.",
+            style.ok(f"{target_label} {verb} in **{guild_label}**."),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -236,7 +261,7 @@ class AdminManagers(commands.Cog):
         )
 
         target_label = user.mention if user is not None else role.mention
-        guild_label = target_guild.name if target_guild else f"guild `{target_guild_id}`"
+        guild_label = _guild_label(target_guild, target_guild_id)
         if existed:
             _log.info(
                 "manage_managers remove: %s %s %s in guild %s by user %s",
@@ -244,13 +269,13 @@ class AdminManagers(commands.Cog):
                 target_guild_id, interaction.user.id,
             )
             await interaction.followup.send(
-                f"🗑 Removed {target_label} from managers of **{guild_label}**.",
+                style.ok(f"Removed {target_label} from the managers of **{guild_label}**."),
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         else:
             await interaction.followup.send(
-                f"ℹ️ {target_label} wasn't a manager in **{guild_label}** — nothing to do.",
+                style.info(f"{target_label} isn't a manager in **{guild_label}**. Nothing changed."),
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -264,11 +289,13 @@ class AdminManagers(commands.Cog):
         rows = await self.bot.GET(
             DatabaseQueries.LIST_GUILD_MANAGERS, (target_guild_id,),
         )
-        guild_label = target_guild.name if target_guild else f"guild `{target_guild_id}`"
+        guild_label = _guild_label(target_guild, target_guild_id)
         if not rows:
             await interaction.followup.send(
-                f"No managers configured for **{guild_label}**. "
-                f"Use `/manage_managers action:add` to grant the first one.",
+                style.info(
+                    f"**{guild_label}** has no managers yet. "
+                    "Add one with `/manage_managers action:add`."
+                ),
                 ephemeral=True,
             )
             return
@@ -279,9 +306,13 @@ class AdminManagers(commands.Cog):
             )
             for row in rows
         ]
-        body = "\n".join(lines)
+        embed = create_base_embed(
+            title=style.title("🛠️", "Managers", guild_label),
+            description="\n".join(lines),
+        )
+        embed.set_footer(text=style.footer(0, 1, style.plural(len(rows), "manager")))
         await interaction.followup.send(
-            f"**Managers for {guild_label}** ({len(rows)}):\n{body}",
+            embed=embed,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )

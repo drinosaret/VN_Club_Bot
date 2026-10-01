@@ -5,17 +5,18 @@ Shared embed builders for the VN Club Bot.
 import discord
 import logging
 from typing import Optional, List
+from lib import style
 from lib.utils import (
     create_base_embed,
-    format_points_display,
-    format_rating_display,
-    create_vndb_link,
+    inert_text,
+    link_label,
     truncate_text,
     MAX_EMBED_DESCRIPTION
 )
 from lib.monthly_banner import format_length_tier
 from lib.vndb_api import VN_Entry
 from lib.jiten_client import resolve_display_cover
+from lib.ratings import format_average
 
 _log = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ class EmbedBuilder:
         comment: str,
         current_points: int,
         new_points: int,
-        rating: int,
+        rating_text: str,
         log_id: int,
         jiten_data=None,
     ) -> discord.Embed:
@@ -96,7 +97,7 @@ class EmbedBuilder:
             comment: User's comment
             current_points: User's points before completion
             new_points: User's points after completion
-            rating: User's rating (1-5)
+            rating_text: The rating as displayed, on the author's scale
             log_id: Database log entry ID
             jiten_data: optional JitenInfo; lets an NSFW VNDB cover fall back
                 to the guaranteed-SFW jiten cover instead of being hidden.
@@ -108,8 +109,8 @@ class EmbedBuilder:
         points_earned = new_points - current_points
 
         embed = create_base_embed(
-            title=f"Finished reading **{display_title}**",
-            color=discord.Color.green(),
+            title=f"Finished reading {display_title}",
+            color=style.SUCCESS,
             author_name=user.name,
             author_icon=user.display_avatar.url
         )
@@ -121,7 +122,9 @@ class EmbedBuilder:
         header = "**Comment**\n"
         embed.description = header + truncate_text(comment, MAX_EMBED_DESCRIPTION - len(header))
 
-        embed.set_footer(text=f"⭐ {rating}/5 • +{points_earned:,} pts • Log #{log_id}")
+        embed.set_footer(text=style.SEP.join(
+            (f"⭐ {rating_text}", f"+{points_earned:,} pts", f"Log #{log_id}")
+        ))
         embed.timestamp = discord.utils.utcnow()
 
         return embed
@@ -139,7 +142,7 @@ class EmbedBuilder:
         voting phases. Reuses VN_Entry fields and optionally enriches with
         jiten char count when present.
 
-        footer_phase: 'nominations' | 'voting' | None — drives footer text.
+        footer_phase: 'nominations' | 'voting' | None; drives footer text.
         vote_count:  if not None, an inline "Votes" field is added (voting phase).
         nominator:   if provided, shown as the embed author so people can see
                      who put the nomination forward.
@@ -147,10 +150,8 @@ class EmbedBuilder:
         display_title = vn_info.title_ja or vn_info.title_en or vn_info.vndb_id
         vndb_link = await vn_info.get_vndb_link()
 
-        embed = create_base_embed(
-            title=display_title,
-            color=discord.Color.blurple(),
-        )
+        embed = create_base_embed(title=display_title, color=style.ACCENT)
+        # The title links to VNDB, so the card needs no separate VNDB field.
         embed.url = vndb_link
 
         if nominator is not None:
@@ -161,18 +162,16 @@ class EmbedBuilder:
         if not cover_is_nsfw and cover_url:
             embed.set_image(url=cover_url)
 
-        embed.add_field(name="VNDB", value=f"[{vn_info.vndb_id}]({vndb_link})", inline=True)
-
         if vn_info.length_minutes:
-            hours = round(vn_info.length_minutes / 60)
-            length_text = f"{hours} {'hr' if hours == 1 else 'hrs'}"
+            hours = max(1, round(vn_info.length_minutes / 60))
+            length_text = f"~{hours} h"
         elif vn_info.length_rating:
             # VNDB falls back to a 1-5 category code when no precise
             # minute count is available. Reuse the banner's tier helper
             # so embed and banner stay consistent.
             length_text = format_length_tier(vn_info.length_rating) or str(vn_info.length_rating)
         else:
-            length_text = "—"
+            length_text = "Unknown"
         embed.add_field(name="Length", value=length_text, inline=True)
 
         if jiten_data is not None and getattr(jiten_data, "character_count", 0) > 0:
@@ -180,18 +179,16 @@ class EmbedBuilder:
                             value=f"{jiten_data.character_count:,}", inline=True)
 
         if vote_count is not None:
-            embed.add_field(name="Votes", value=str(vote_count), inline=True)
+            embed.add_field(name="Votes", value=f"{vote_count:,}", inline=True)
 
         description = await vn_info.get_normalized_description(max_length=400)
         if description and description != "No description available.":
             embed.add_field(name="Description", value=description, inline=False)
 
         if footer_phase == "nominations":
-            embed.set_footer(text="VN Club · Nominations open")
+            embed.set_footer(text="Nominations open")
         elif footer_phase == "voting":
-            embed.set_footer(text="VN Club · Voting open")
-        else:
-            embed.set_footer(text="VN Club")
+            embed.set_footer(text="Voting open")
 
         return embed
 
@@ -202,7 +199,7 @@ class EmbedBuilder:
         end_month: str,
         points: int,
         title_prefix: str = "",
-        color: discord.Color = discord.Color.blue(),
+        color: discord.Color = style.ACCENT,
         pool_id: Optional[int] = None,
         jiten_data=None,
     ) -> discord.Embed:
@@ -216,7 +213,7 @@ class EmbedBuilder:
             points: Points awarded for monthly reading
             title_prefix: Prefix for embed title
             color: Embed color
-            pool_id: Pool entry ID. When provided, surfaced as a "Pool ID"
+            pool_id: Pool entry ID. When provided, surfaced as a "Pool entry"
                 field so users/admins can reference the row in chat or with
                 `/manage_pool action:remove`.
             jiten_data: optional JitenInfo; lets an NSFW VNDB cover fall back
@@ -230,14 +227,15 @@ class EmbedBuilder:
         display_title = vn_info.title_ja or vn_info.title_en or vn_info.vndb_id
         title = f"{title_prefix}{display_title}" if title_prefix else display_title
         embed = create_base_embed(title=title, color=color)
+        # The title links to VNDB in place of showing the raw VNDB id.
+        embed.url = await vn_info.get_vndb_link()
 
         if pool_id is not None:
-            embed.add_field(name="Pool ID", value=f"#{pool_id}", inline=True)
-        embed.add_field(name="VNDB ID", value=vn_info.vndb_id, inline=True)
-        embed.add_field(name="Start Month", value=start_month, inline=True)
-        embed.add_field(name="End Month", value=end_month, inline=True)
-        embed.add_field(name="Points (Monthly)", value=str(points), inline=True)
-        embed.add_field(name="Points (Not Monthly)", value=str(points_not_monthly), inline=True)
+            embed.add_field(name="Pool entry", value=f"#{pool_id}", inline=True)
+        embed.add_field(name="Start month", value=style.month_short(start_month), inline=True)
+        embed.add_field(name="End month", value=style.month_short(end_month), inline=True)
+        embed.add_field(name="Points as a pick", value=f"{points:,}", inline=True)
+        embed.add_field(name="Points otherwise", value=f"{points_not_monthly:,}", inline=True)
 
         description = await vn_info.get_normalized_description()
         embed.add_field(name="Description", value=description, inline=False)
@@ -246,7 +244,6 @@ class EmbedBuilder:
         if not cover_is_nsfw and cover_url:
             embed.set_thumbnail(url=cover_url)
 
-        embed.set_footer(text="Visual Novel Club")
         return embed
 
     @staticmethod
@@ -260,7 +257,8 @@ class EmbedBuilder:
         most_active_count: int,
         recent_activity: List = None,
         average_rating: float = 0.0,
-        rating_count: int = 0
+        rating_count: int = 0,
+        vndb_account: Optional[tuple[str, str]] = None,
     ) -> discord.Embed:
         """
         Create embed for user profile display.
@@ -274,147 +272,64 @@ class EmbedBuilder:
             most_active_server: Name of most active server
             most_active_count: Number of entries in most active server
             recent_activity: List of recent activity data
-            average_rating: User's average rating across all VNs
+            average_rating: User's average rating, normalized to 1-100
             rating_count: Number of VNs the user has rated
+            vndb_account: (vndb_uid, vndb_username) when linked
 
         Returns:
             Configured embed for user profile
         """
-        # display_name works for both User and Member
+        # display_name works for both User and Member. The name sits in the
+        # title only; the thumbnail carries the avatar.
         display_name = getattr(user, 'display_name', user.name)
-        embed = create_base_embed(
-            title=f"📊 User Profile: {user.name}",
-            color=discord.Color.blue(),
-            author_name=display_name,
-            author_icon=user.display_avatar.url
-        )
+        embed = create_base_embed(title=style.title("📊", "Profile", display_name))
 
         embed.set_thumbnail(url=user.display_avatar.url)
-        
+
         # Main statistics
+        embed.add_field(name="💰 Points", value=f"**{total_points or 0:,}**", inline=True)
+        embed.add_field(name="📚 Finished VNs", value=f"**{vn_entries:,}**", inline=True)
+        embed.add_field(name="🔥 Monthly VNs", value=f"**{monthly_entries:,}**", inline=True)
         embed.add_field(
-            name="💰 Total Points",
-            value=f"```\n{total_points or 0:,}\n```",
+            name="⭐ Average rating",
+            value=f"**{format_average(average_rating)}**" if rating_count > 0 else "No ratings yet",
             inline=True
         )
-        
         embed.add_field(
-            name="📚 VN Completions",
-            value=f"```\n{vn_entries}\n```",
+            name="🏠 Most active server",
+            value=f"{most_active_server}\n{style.plural(most_active_count, 'completion')}",
             inline=True
         )
-        
-        embed.add_field(
-            name="🔥 Monthly VNs",
-            value=f"```\n{monthly_entries}\n```",
-            inline=True
-        )
-        
-        # Average rating field
-        if rating_count > 0:
+
+        if vndb_account:
+            vndb_uid, vndb_username = vndb_account
             embed.add_field(
-                name="⭐ Average Rating",
-                value=f"```\n{average_rating:.1f}/5\n```",
+                name="🔗 VNDB",
+                value=f"[{link_label(vndb_username, 40)}](https://vndb.org/{vndb_uid})",
                 inline=True
             )
-        else:
-            embed.add_field(
-                name="⭐ Average Rating",
-                value=f"```\nNo ratings yet\n```",
-                inline=True
-            )
-        
-        # Server activity
-        embed.add_field(
-            name="🏠 Most Active Server",
-            value=f"{most_active_server}\n({most_active_count} completions)",
-            inline=True
-        )
-        
-        # Add spacer field
-        embed.add_field(name="\u200b", value="\u200b", inline=False)
-        
+
         # Recent activity chart if available
         if recent_activity:
             activity_text = []
             for month, count in recent_activity[:6]:  # Last 6 months
                 bar_length = min(20, max(1, count))  # Scale bar length
                 bar = "█" * bar_length
-                activity_text.append(f"`{month}` {bar} ({count})")
-            
+                activity_text.append(f"{style.month_short(month)} {bar} ({count:,})")
+
             if activity_text:
                 embed.add_field(
-                    name="📈 Recent Activity (Last 6 Months)",
+                    name="📈 Recent activity",
                     value="\n".join(activity_text),
                     inline=False
                 )
-        
-        # Footer with join date (only available for Members, not Users)
+
+        # Join date is only available for Members, not Users
         joined_at = getattr(user, 'joined_at', None)
         if joined_at:
-            join_date = joined_at.strftime('%B %Y')
-            embed.set_footer(text=f"Member since {join_date}")
-        else:
-            embed.set_footer(text="Visual Novel Club")
-        
+            embed.set_footer(text=f"Member since {joined_at.strftime('%B %Y')}")
+
         return embed
-
-    @staticmethod
-    def create_error_embed(
-        title: str = "Error",
-        description: str = "An error occurred",
-        color: discord.Color = discord.Color.red()
-    ) -> discord.Embed:
-        """
-        Create standardized error embed.
-        
-        Args:
-            title: Error title
-            description: Error description
-            color: Embed color
-            
-        Returns:
-            Configured error embed
-        """
-        return create_base_embed(title=title, description=description, color=color)
-
-    @staticmethod
-    def create_success_embed(
-        title: str = "Success",
-        description: str = "Operation completed successfully",
-        color: discord.Color = discord.Color.green()
-    ) -> discord.Embed:
-        """
-        Create standardized success embed.
-        
-        Args:
-            title: Success title
-            description: Success description
-            color: Embed color
-            
-        Returns:
-            Configured success embed
-        """
-        return create_base_embed(title=title, description=description, color=color)
-
-    @staticmethod
-    def create_info_embed(
-        title: str,
-        description: str = None,
-        color: discord.Color = discord.Color.blue()
-    ) -> discord.Embed:
-        """
-        Create standardized info embed.
-        
-        Args:
-            title: Info title
-            description: Info description
-            color: Embed color
-            
-        Returns:
-            Configured info embed
-        """
-        return create_base_embed(title=title, description=description, color=color)
 
     @staticmethod
     def create_leaderboard_embed(
@@ -422,7 +337,7 @@ class EmbedBuilder:
         leaderboard_data: List[dict],
         current_page: int,
         max_pages: int,
-        per_page: int = 20,
+        per_page: int = 10,
         *,
         period_label: Optional[str] = None,
         is_default_season: bool = False,
@@ -441,13 +356,13 @@ class EmbedBuilder:
                 rendered above the podium on page 0.
             is_default_season: True when the caller defaulted to current season
                 because the user didn't pass a timeframe. Currently unused for
-                visuals — kept on the signature so callers can consistently
-                signal intent and we can wire in a hint later if desired.
+                visuals; kept on the signature so callers can signal intent
+                consistently.
 
         Returns:
             Configured leaderboard embed
         """
-        embed = create_base_embed(title=title, color=discord.Color.gold())
+        embed = create_base_embed(title=title, color=style.LEADERBOARD)
 
         total_users = len(leaderboard_data)
         total_completions = sum(d.get("completions", 0) for d in leaderboard_data)
@@ -457,8 +372,14 @@ class EmbedBuilder:
         end_idx = min(start_idx + per_page, total_users)
         page_slice = leaderboard_data[start_idx:end_idx]
 
-        def _vn_word(n: int) -> str:
-            return "VN" if n == 1 else "VNs"
+        def _row(marker: str, d: dict) -> str:
+            # Podium and list rows share one shape so the page reads as one list.
+            username = inert_text(d.get("username"), 40) or "?"
+            points = int(d.get("points", 0))
+            completions = int(d.get("completions", 0))
+            return style.SEP.join(
+                (f"{marker} **{username}**", f"{points:,}点", style.plural(completions, "VN"))
+            )
 
         # Page 0 gets a top-3 podium block (only if we actually have 3+ rows on
         # this page from the top). For pages > 0, skip the podium and just
@@ -471,24 +392,15 @@ class EmbedBuilder:
             podium_emojis = ["🥇", "🥈", "🥉"]
             podium_count = min(3, len(page_slice))
             for i in range(podium_count):
-                d = page_slice[i]
-                username = d.get("username") or "?"
-                points = int(d.get("points", 0))
-                completions = int(d.get("completions", 0))
-                podium_lines.append(
-                    f"{podium_emojis[i]} **{username}** · "
-                    f"**{points:,}**点 · {completions} {_vn_word(completions)}"
-                )
+                podium_lines.append(_row(podium_emojis[i], page_slice[i]))
             list_entries = page_slice[podium_count:]
             list_start_rank = start_idx + podium_count + 1
         else:
             list_entries = page_slice
             list_start_rank = start_idx + 1
 
-        # Compose description: just the podium. The period label is already
-        # in the embed title (e.g. "VN Club Leaderboard — Spring 2026 ·
-        # Season 4"), so re-rendering it as `*— {period} —*` above the
-        # podium is purely redundant.
+        # Description holds only the podium; the period label is already in
+        # the embed title.
         if podium_lines:
             embed.description = "\n".join(podium_lines)
 
@@ -501,14 +413,7 @@ class EmbedBuilder:
             cur_len = 0
             truncated_remaining = 0
             for offset, d in enumerate(list_entries):
-                rank = list_start_rank + offset
-                username = d.get("username") or "?"
-                points = int(d.get("points", 0))
-                completions = int(d.get("completions", 0))
-                line = (
-                    f"`{rank}.` **{username}** — {points:,}点 · "
-                    f"{completions} {_vn_word(completions)}"
-                )
+                line = _row(f"`{list_start_rank + offset}.`", d)
                 # +1 for the join newline once we have at least one line.
                 added = len(line) + (1 if built_lines else 0)
                 # Reserve ~30 chars for a possible "…and N more" tail.
@@ -519,18 +424,16 @@ class EmbedBuilder:
                 cur_len += added
 
             if truncated_remaining:
-                built_lines.append(f"…and {truncated_remaining} more")
+                built_lines.append(f"…and {truncated_remaining:,} more")
 
-            field_value = "\n".join(built_lines) if built_lines else "—"
+            field_value = "\n".join(built_lines) if built_lines else "No readers"
             embed.add_field(name="Rankings", value=field_value, inline=False)
 
-        embed.set_footer(
-            text=(
-                f"Page {current_page + 1}/{max_pages} · "
-                f"{total_users:,} readers · "
-                f"{total_completions:,} completions · "
-                f"{total_points:,}点"
-            )
-        )
+        embed.set_footer(text=style.footer(
+            current_page, max_pages,
+            style.plural(total_users, "reader"),
+            style.plural(total_completions, "completion"),
+            f"{total_points:,}点",
+        ))
 
         return embed

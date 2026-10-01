@@ -23,6 +23,7 @@ from discord import app_commands
 from discord.ext import commands
 from PIL import Image
 
+from lib import style
 from lib.bot import VNClubBot
 from lib.utils import (
     DatabaseQueries,
@@ -54,6 +55,7 @@ from lib.theme_card import MAX_EXAMPLES, render_theme_card
 from lib.theme_service import load_period_theme
 from lib.vndb_api import search_vns
 from lib.vndb_search import VNDBClient
+from lib.visibility import PUBLIC_OPTION_HELP, defer_reply
 
 _log = logging.getLogger(__name__)
 
@@ -82,6 +84,9 @@ _KIND_CHOICES = [
     app_commands.Choice(name="Seasonal (3-month range)", value="seasonal"),
 ]
 
+# Tag rule buckets as managers read them.
+_BUCKET_NAMES = {"all_of": "Must have", "any_of": "Any of", "none_of": "Exclude"}
+
 
 def _resolve_period(kind: str, target_month: Optional[str]):
     """Mirror /nominate's window logic: returns (start_month, end_month).
@@ -89,7 +94,8 @@ def _resolve_period(kind: str, target_month: Optional[str]):
     if kind == "seasonal":
         if target_month:
             if not validate_month_format(target_month):
-                raise ValidationError("bad month", "target_month must be YYYY-MM.")
+                raise ValidationError(
+                    "bad month", "The month must be in YYYY-MM format, for example `2026-09`.")
             season_name = month_to_season_name(int(target_month[5:7]))
             year_int = int(target_month[:4])
         else:
@@ -99,7 +105,8 @@ def _resolve_period(kind: str, target_month: Optional[str]):
         return months[0], months[-1]
     target = target_month or next_month(get_current_month())
     if not validate_month_format(target):
-        raise ValidationError("bad month", "target_month must be YYYY-MM.")
+        raise ValidationError(
+            "bad month", "The month must be in YYYY-MM format, for example `2026-09`.")
     return target, target
 
 
@@ -138,8 +145,9 @@ class ThemeCog(commands.Cog):
         description="Show the nomination theme for an upcoming period.",
     )
     @app_commands.describe(
-        status="Which nomination lane to look at (default: monthly).",
+        status="Monthly or seasonal nominations (default: monthly).",
         target_month="YYYY-MM period (default: the one /nominate targets).",
+        public=PUBLIC_OPTION_HELP,
     )
     @app_commands.choices(status=_KIND_CHOICES)
     @app_commands.autocomplete(target_month=month_picker_future_autocomplete)
@@ -149,8 +157,9 @@ class ThemeCog(commands.Cog):
         interaction: discord.Interaction,
         status: Optional[app_commands.Choice[str]] = None,
         target_month: Optional[str] = None,
+        public: Optional[bool] = None,
     ):
-        await interaction.response.defer()
+        await defer_reply(interaction, public)
         kind = status.value if status else "monthly"
         try:
             start_month, end_month = _resolve_period(kind, (target_month or "").strip() or None)
@@ -163,19 +172,19 @@ class ThemeCog(commands.Cog):
             self.bot, interaction.guild.id, kind, start_month, end_month)
 
         if theme is None:
-            await interaction.followup.send(
+            await interaction.followup.send(style.info(
                 f"No theme is set for the {kind} nominations for **{period_label}**. "
-                "Anything goes: nominate whatever you like with `/nominate`."
-            )
+                "Any VN can be nominated with `/nominate`."
+            ))
             return
 
         theme_label, rules = theme
         if rules is None:
-            await interaction.followup.send(
-                f"⚠️ **{period_label}** has a theme (**{theme_label}**) but its rules "
-                "can't be read, so nominations for it are on hold. A manager needs to "
-                "re-save it with `/manage_theme`."
-            )
+            await interaction.followup.send(style.info(
+                f"**{period_label}** has a theme (**{theme_label}**), but its rules "
+                "can't be read, so nominations for it are on hold. A manager can "
+                "save it again with `/manage_theme`."
+            ))
             return
 
         rule_lines = rules_summary(rules).splitlines()
@@ -196,15 +205,14 @@ class ThemeCog(commands.Cog):
             # The rules are the point of the command; the picture is not.
             body = "\n".join(f"• {line}" for line in rule_lines)
             await interaction.followup.send(
-                f"🎯 **{theme_label}**: nominations for **{period_label}** must match:\n"
-                f"{body}\n{_NOMINATE_HINT}",
+                f"{_theme_caption(period_label, theme_label)}\n"
+                f"Nominations must match:\n{body}\n{_NOMINATE_HINT}",
                 view=view or discord.utils.MISSING,
             )
             return
 
         await interaction.followup.send(
-            content=(f"🎯 Nomination theme for **{period_label}**: **{theme_label}**\n"
-                     f"{_NOMINATE_HINT}"),
+            content=f"{_theme_caption(period_label, theme_label)}\n{_NOMINATE_HINT}",
             file=discord.File(buf, filename=f"theme_{start_month}.png"),
             view=view or discord.utils.MISSING,
         )
@@ -259,6 +267,10 @@ class ThemeCog(commands.Cog):
         return examples, caveat
 
 
+def _theme_caption(period_label: str, theme_label: str) -> str:
+    return style.title("🎯", "Nomination theme", period_label, f"**{theme_label}**")
+
+
 async def _fetch_theme_state(bot: VNClubBot, guild_id: int) -> dict:
     templates = await bot.GET(DatabaseQueries.LIST_THEME_TEMPLATES, (guild_id,))
     assignments = await bot.GET(DatabaseQueries.LIST_THEME_ASSIGNMENTS, (guild_id,))
@@ -276,7 +288,7 @@ def _summary_line(rules_json: str) -> str:
     try:
         summary = rules_summary(validate_rules(json.loads(rules_json)))
     except (ValueError, TypeError):
-        return "⚠️ unreadable rules"
+        return style.info("Rules unreadable")
     return _clip("; ".join(summary.splitlines()), _PANEL_ROW_CHARS)
 
 
@@ -301,32 +313,34 @@ def _build_panel_text(state: dict) -> str:
     # Discord message on its own.
     period_lines: list[str] = []
     if state["assignments"]:
-        period_lines.append("**Active / upcoming themed periods:**")
+        period_lines.append("**Active and upcoming themed periods**")
         for kind, start, end, label, rules_json, source_id in state["assignments"]:
-            window = start if start == end else f"{start} to {end}"
-            period_lines.append(f"• `{kind}` {window}: **{label}**")
+            period_lines.append(style.SEP.join((
+                f"• **{label}**", kind.capitalize(), style.month_range(start, end))))
             period_lines.append(f"  {_summary_line(rules_json)}")
             # A period holds a snapshot taken at assign time, so a later edit
             # to the template leaves the two out of step until it is reapplied.
             if source_id in by_id and _rules_diverged(rules_json, by_id[source_id]):
-                period_lines.append("  ⚠️ differs from its template now; re-assign to update it.")
+                period_lines.append("  " + style.info(
+                    "This period differs from its template now; assign it again to update it."))
     else:
-        period_lines.append("**No themed periods set.** Nominations are unrestricted.")
+        period_lines.append(style.info("No themed periods. Any VN can be nominated."))
 
-    head = "## Nomination themes\n\n"
+    head = "## 🎯 Nomination themes\n\n"
     periods = _clip("\n".join(period_lines), _PANEL_CHARS // 2)
     budget = _PANEL_CHARS - len(head) - len(periods) - 2
 
-    tpl_lines = [f"**Templates ({len(tpls)}):**" if tpls else "**Templates:** none yet"]
+    tpl_lines = [f"**Templates**{style.SEP}{len(tpls):,}" if tpls
+                 else f"**Templates**{style.SEP}none yet"]
     shown = 0
     for _tid, name, rules_json in tpls:
-        row = f"• **{name}**: {_summary_line(rules_json)}"
+        row = f"• **{name}**{style.SEP}{_summary_line(rules_json)}"
         if len("\n".join(tpl_lines)) + len(row) + 30 > budget:
             break
         tpl_lines.append(row)
         shown += 1
     if shown < len(tpls):
-        tpl_lines.append(f"• _and {len(tpls) - shown} more, not shown here._")
+        tpl_lines.append(f"…and {len(tpls) - shown:,} more, not shown here.")
 
     return head + "\n".join(tpl_lines) + "\n\n" + periods
 
@@ -409,7 +423,7 @@ class _ClearPeriodModal(discord.ui.Modal, title="Clear a period's theme"):
             )
             await self.panel.refresh(interaction)
         except ValidationError as e:
-            await interaction.response.send_message(f"❌ {e.user_message}", ephemeral=True)
+            await interaction.response.send_message(style.error(e.user_message), ephemeral=True)
 
 
 # ---------------- template editor (Task 9) ----------------
@@ -534,8 +548,7 @@ def _chip_entries(rules: dict) -> list[tuple[str, str, str]]:
     which list the chip lives in so removal needs no extra state."""
     out: list[tuple[str, str, str]] = []
     tags = rules.get("tags") or {}
-    bucket_names = {"all_of": "Must have", "any_of": "Any of", "none_of": "Exclude"}
-    for bucket, bucket_label in bucket_names.items():
+    for bucket, bucket_label in _BUCKET_NAMES.items():
         for entry in tags.get(bucket) or []:
             floor = entry.get("min_rating")
             if floor is not None:
@@ -617,11 +630,11 @@ class ThemeEditorView(discord.ui.View):
             preview = rules_summary(validate_rules(self.rules))
         except ValueError as e:
             preview = f"(invalid: {e})"
-        lines = [f"### Editing template: **{self.name or '(unnamed)'}**", preview]
+        lines = [f"### Editing template{style.SEP}{self.name or 'unnamed'}", preview]
         problems = self.conflicts()
         if problems:
             lines.append("")
-            lines.append("⚠️ **Problems with these rules:**")
+            lines.append(style.info("**Problems with these rules**"))
             lines += [f"• {p}" for p in problems]
         # A long developer list plus a per-tag floor on every chip can push
         # this past what an edit_message will accept, and a rejected edit
@@ -701,7 +714,7 @@ class _LengthModal(discord.ui.Modal, title="Length rating (1-5, blank = unset)")
         try:
             node = _int_range_from_inputs(self.min_f.value, self.max_f.value, "Length")
         except ValidationError as e:
-            await interaction.response.send_message(f"❌ {e.user_message}", ephemeral=True)
+            await interaction.response.send_message(style.error(e.user_message), ephemeral=True)
             return
         _set_or_clear(self.ed.rules, "length_rating", node)
         await self.ed.rerender(interaction)
@@ -732,7 +745,7 @@ class _CharsModal(discord.ui.Modal, title="Character count (blank = unset)"):
         try:
             node = _int_range_from_inputs(self.min_f.value, self.max_f.value, "Character count")
         except ValidationError as e:
-            await interaction.response.send_message(f"❌ {e.user_message}", ephemeral=True)
+            await interaction.response.send_message(style.error(e.user_message), ephemeral=True)
             return
         _set_or_clear(self.ed.rules, "character_count", node)
         await self.ed.rerender(interaction)
@@ -803,7 +816,7 @@ class _TagSearchModal(discord.ui.Modal, title="Search VNDB tags"):
         async with VNDBClient() as c:
             results = await c.search_tags(self.q.value, limit=_SEARCH_LIMIT)
         if not results:
-            await interaction.followup.send("No tags matched.", ephemeral=True)
+            await interaction.followup.send(style.info("No tags matched that search."), ephemeral=True)
             return
         view = discord.ui.View(timeout=300)
         view.add_item(_TagResultSelect(self.ed, results[:_SEARCH_LIMIT]))
@@ -884,7 +897,10 @@ class _TagFloorSelect(discord.ui.Select):
         floor = entry.get("min_rating")
         floor_txt = f" (rated {floor:g}+)" if floor is not None else ""
         await interaction.response.edit_message(
-            content=f"Added **{entry['name']}**{floor_txt} to {self.bucket}.", view=None)
+            content=style.ok(
+                f"Added **{entry['name']}**{floor_txt} to "
+                f"{_BUCKET_NAMES.get(self.bucket, self.bucket)}."),
+            view=None)
         await self.ed.rerender(interaction)  # updates the editor message too
 
 
@@ -909,7 +925,7 @@ class _DeveloperSearchModal(discord.ui.Modal, title="Search VNDB developers"):
         async with VNDBClient() as c:
             results = await c.search_producers(self.q.value, limit=_SEARCH_LIMIT)
         if not results:
-            await interaction.followup.send("No developers matched.", ephemeral=True)
+            await interaction.followup.send(style.info("No developers matched that search."), ephemeral=True)
             return
         view = discord.ui.View(timeout=300)
         view.add_item(_DeveloperResultSelect(self.ed, results[:_SEARCH_LIMIT]))
@@ -932,7 +948,7 @@ class _DeveloperResultSelect(discord.ui.Select):
         if not any(e["id"] == entry["id"] for e in lst):
             lst.append(entry)
         await interaction.response.edit_message(
-            content=f"Added developer **{entry['name']}**.", view=None)
+            content=style.ok(f"Added developer **{entry['name']}**."), view=None)
         await self.ed.rerender(interaction)  # updates the editor message too
 
 
@@ -973,7 +989,7 @@ class _TagOptionsModal(discord.ui.Modal, title="Tag matching options"):
             spoilers = _parse_bool_input(self.spoilers_f.value, "Spoiler tags count", True)
             children = _parse_bool_input(self.children_f.value, "Child tags count", True)
         except ValidationError as e:
-            await interaction.response.send_message(f"❌ {e.user_message}", ephemeral=True)
+            await interaction.response.send_message(style.error(e.user_message), ephemeral=True)
             return
         tags = _tags_node(self.ed.rules)
         if floor is None:
@@ -1002,7 +1018,7 @@ class _RemoveChipButton(discord.ui.Button):
         chips = _chip_entries(self.ed.rules)
         if not chips:
             await interaction.response.send_message(
-                "Nothing to remove yet.", ephemeral=True)
+                style.info("There's nothing to remove yet."), ephemeral=True)
             return
         view = discord.ui.View(timeout=300)
         view.add_item(_RemoveChipSelect(self.ed, chips))
@@ -1027,8 +1043,8 @@ class _RemoveChipSelect(discord.ui.Select):
     async def callback(self, interaction):
         removed = _remove_chip(self.ed.rules, self.values[0])
         await interaction.response.edit_message(
-            content=(f"Removed **{removed}**." if removed
-                     else "That entry is already gone."), view=None)
+            content=(style.ok(f"Removed **{removed}**.") if removed
+                     else style.info("That entry is already gone.")), view=None)
         await self.ed.rerender(interaction)  # updates the editor message too
 
 
@@ -1045,12 +1061,14 @@ class _SaveTemplateButton(discord.ui.Button):
 
     async def callback(self, interaction):
         if not self.ed.name:
-            await interaction.response.send_message("Give the template a name first.", ephemeral=True)
+            await interaction.response.send_message(
+                style.error("Give the template a name first."), ephemeral=True)
             return
         try:
             canonical = validate_rules(self.ed.rules)
         except ValueError as e:
-            await interaction.response.send_message(f"❌ Invalid rules: {e}", ephemeral=True)
+            await interaction.response.send_message(
+                style.error(f"These rules aren't valid: {e}"), ephemeral=True)
             return
         problems = rules_conflicts(canonical)
         if problems and not self._armed:
@@ -1078,7 +1096,8 @@ class _SaveTemplateButton(discord.ui.Button):
         except aiosqlite.IntegrityError:
             # The only expected failure: UNIQUE(guild_id, name) collision.
             await interaction.response.send_message(
-                f"❌ A template named **{self.ed.name}** already exists.", ephemeral=True)
+                style.error(f"A template named **{self.ed.name}** already exists."),
+                ephemeral=True)
             return
         except Exception:
             # A real failure (locked db, query bug, ...) must not masquerade as a
@@ -1087,7 +1106,8 @@ class _SaveTemplateButton(discord.ui.Button):
                 "theme template save failed (guild=%s name=%r)",
                 interaction.guild.id, self.ed.name)
             await interaction.response.send_message(
-                "❌ Couldn't save the template right now (an internal error occurred). Try again.",
+                style.error("Couldn't save the template. Try again, or check the bot "
+                            "logs for details."),
                 ephemeral=True)
             return
         if not changed:
@@ -1096,11 +1116,12 @@ class _SaveTemplateButton(discord.ui.Button):
             # rewrites it from the rules still open here.
             self.ed.template_id = None
             await interaction.response.send_message(
-                f"❌ Nothing was saved: **{self.ed.name}** no longer exists in this "
-                "server. Press Save again to recreate it.", ephemeral=True)
+                style.error(f"Nothing was saved: **{self.ed.name}** no longer exists in "
+                            "this server. Press Save again to recreate it."),
+                ephemeral=True)
             return
         await interaction.response.edit_message(
-            content=f"✅ Saved template **{self.ed.name}**.", view=None)
+            content=style.ok(f"Saved template **{self.ed.name}**."), view=None)
         await self.ed.panel.refresh(interaction)
 
 
@@ -1138,7 +1159,8 @@ class _TemplatePickSelect(discord.ui.Select):
         row = await self.panel.cog.bot.GET_ONE(
             DatabaseQueries.GET_THEME_TEMPLATE, (tid, interaction.guild.id))
         if not row:
-            await interaction.response.edit_message(content="Template not found.", view=None)
+            await interaction.response.edit_message(
+                content=style.error("That template no longer exists."), view=None)
             return
         _id, name, rules_json = row
         view = discord.ui.View(timeout=300)
@@ -1189,7 +1211,8 @@ class _DeleteTemplateButton(discord.ui.Button):
         # Deleting a template does not touch assignments: they hold a snapshot.
         await self.panel.cog.bot.RUN(
             DatabaseQueries.DELETE_THEME_TEMPLATE, (self.template_id, interaction.guild.id))
-        await interaction.response.edit_message(content=f"Deleted **{self.name}**.", view=None)
+        await interaction.response.edit_message(
+            content=style.ok(f"Deleted template **{self.name}**."), view=None)
         await self.panel.refresh(interaction)
 
 
@@ -1198,12 +1221,13 @@ class _DeleteTemplateButton(discord.ui.Button):
 
 class _AssignButton(discord.ui.Button):
     def __init__(self, panel):
-        super().__init__(style=discord.ButtonStyle.primary, label="Assign to period", emoji="📅")
+        super().__init__(style=discord.ButtonStyle.secondary, label="Assign to period", emoji="📅")
         self.panel = panel
 
     async def callback(self, interaction):
         if not self.panel.state["templates"]:
-            await interaction.response.send_message("Create a template first.", ephemeral=True)
+            await interaction.response.send_message(
+                style.error("Create a template first."), ephemeral=True)
             return
         view = discord.ui.View(timeout=300)
         view.add_item(_AssignTemplateSelect(self.panel))
@@ -1251,7 +1275,7 @@ class _AssignPeriodModal(discord.ui.Modal, title="Apply theme to a period"):
                  self.template_id, interaction.user.id))
             await self.panel.refresh(interaction)
         except ValidationError as e:
-            await interaction.response.send_message(f"❌ {e.user_message}", ephemeral=True)
+            await interaction.response.send_message(style.error(e.user_message), ephemeral=True)
 
 
 async def setup(bot: VNClubBot):
