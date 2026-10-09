@@ -1343,7 +1343,7 @@ async def _column_names(bot, table: str) -> list[str]:
 
 async def _create_reply_visibility_tables(bot) -> None:
     """Where command replies may be public. A server without a settings row
-    keeps replies private except in the channels listed for it."""
+    keeps replies private except in the channels and commands listed for it."""
     await bot.RUN(
         """
         CREATE TABLE IF NOT EXISTS guild_reply_settings (
@@ -1360,6 +1360,15 @@ async def _create_reply_visibility_tables(bot) -> None:
             guild_id INTEGER NOT NULL,
             channel_id INTEGER NOT NULL,
             PRIMARY KEY (guild_id, channel_id)
+        );
+        """
+    )
+    await bot.RUN(
+        """
+        CREATE TABLE IF NOT EXISTS guild_public_commands (
+            guild_id INTEGER NOT NULL,
+            command_name TEXT NOT NULL,
+            PRIMARY KEY (guild_id, command_name)
         );
         """
     )

@@ -839,7 +839,7 @@ async def log_already_exists(
         (user_id, vndb_id, reward_month),
     )
     if result:
-        await interaction.followup.send(_already_logged_message(reward_month))
+        await send_error(interaction, _already_logged_message(reward_month))
         return True
     return False
 
@@ -1038,7 +1038,7 @@ class VNUserCommands(commands.Cog):
                 # Race: a concurrent /finish for the same VN in the
                 # same month inserted first. Same message as the
                 # pre-check fast path so the UX is consistent.
-                await interaction.followup.send(_already_logged_message(current_month))
+                await send_error(interaction, _already_logged_message(current_month))
                 return
 
             new_total_points = current_total_points + reward_points
