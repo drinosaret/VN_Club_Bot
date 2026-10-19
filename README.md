@@ -65,6 +65,13 @@ On first boot the bot creates `data/db.sqlite3` and applies the full migration c
 
 Slash commands sync automatically on every startup (in `setup_hook`, which runs once per process), so shipping command changes is just a restart. Discord can take a short while to propagate global command updates to clients.
 
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ## Commands
 
 The slash commands below are organized into groups. `/help` inside Discord renders the same catalog with examples and parameter detail.

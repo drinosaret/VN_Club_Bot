@@ -62,11 +62,9 @@ async def fetch_image_bytes_capped(
     Logs warnings on rejections so an operator can spot a bad upstream
     without the bot just silently dropping fetches.
     """
-    # SSRF guard: only follow http(s) URLs. Some upstreams (e.g. jiten's
-    # cover_url) flow straight from a third-party API response into here,
-    # so a poisoned/misconfigured response containing a ``file://`` or a
-    # bare ``http://169.254.169.254/…`` cloud metadata URL would otherwise
-    # let the bot probe its own host. Cheap to enforce, no false-positives.
+    # Only http(s) URLs with a host are fetched. Some URLs (e.g. jiten's
+    # cover_url) come straight from a third-party API response, so any
+    # other scheme or a host-less value is rejected rather than followed.
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         logger.warning("image fetch rejected: unsafe URL %r", url)
